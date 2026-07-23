@@ -24,6 +24,14 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "stepover" || cmd == "next")
     {
+        // Upstream issue #52: Process::thread can be null (e.g. after thread
+        // exit events) and the engine's StepOver dereferences it unchecked.
+        if(!mProcess->thread)
+        {
+            printf("stepover unavailable (no current thread)\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
         // StepOver falls back to StepInto for non-call instructions; arm both
         // pause paths and let cbStep/cbBreakpoint disambiguate.
         mStepArmed = true;
