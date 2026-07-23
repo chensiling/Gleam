@@ -105,6 +105,7 @@ bool GleamDebugger::executeCommand(const std::string & cmdLine)
         { &GleamDebugger::tryBreakpointCommand },
         { &GleamDebugger::tryInspectCommand },
         { &GleamDebugger::trySymbolCommand },
+        { &GleamDebugger::tryScanCommand },
     };
     for(const auto & entry : handlers)
     {

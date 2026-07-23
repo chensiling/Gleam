@@ -145,6 +145,7 @@
     <ClCompile Include="GleamCommands.Control.cpp" />
     <ClCompile Include="GleamCommands.Symbols.cpp" />
     <ClCompile Include="GleamCommands.Hide.cpp" />
+    <ClCompile Include="GleamCommands.Scan.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GleamDebugger.h" />

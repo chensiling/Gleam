@@ -126,6 +126,23 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                    mDebugEvent.dwThreadId,
                    mSelectedThreadId ? std::to_string(mSelectedThreadId).c_str() : "(follow event)");
         }
+        else if((args.size() == 2 || args.size() == 3) &&
+                (args[args.size() - 1] == "suspend" || args[args.size() - 1] == "resume"))
+        {
+            // "thread suspend|resume"        -> event thread
+            // "thread <tid> suspend|resume"  -> specific thread
+            const std::string & op = args[args.size() - 1];
+            uint32_t tid = args.size() == 3 ? (uint32_t)strtoul(args[1].c_str(), nullptr, 0)
+                                            : mDebugEvent.dwThreadId;
+            auto found = mProcess->threads.find(tid);
+            if(found == mProcess->threads.end())
+                printf("no such thread: %u\n", tid);
+            else
+            {
+                bool ok = op == "suspend" ? found->second->Suspend() : found->second->Resume();
+                printf("%s thread %u: %s\n", op.c_str(), tid, ok ? "ok" : "failed");
+            }
+        }
         else
         {
             uint32_t tid = (uint32_t)strtoul(args[1].c_str(), nullptr, 0);
@@ -137,6 +154,81 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             else
                 printf("no such thread: %s\n", args[1].c_str());
         }
+        fflush(stdout);
+        return CmdResult::Handled;
+    }
+
+    if(cmd == "alloc" && args.size() >= 2 && args.size() <= 3)
+    {
+        uint64_t size = 0;
+        if(!parseHex(args[1], size) || size == 0)
+        {
+            printf("usage: alloc <hexsize> [rwx]\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        DWORD prot = PAGE_EXECUTE_READWRITE;
+        if(args.size() == 3)
+        {
+            if(args[2] == "rx") prot = PAGE_EXECUTE_READ;
+            else if(args[2] == "rw") prot = PAGE_READWRITE;
+            else if(args[2] == "r") prot = PAGE_READONLY;
+            else if(args[2] != "rwx")
+            {
+                printf("usage: alloc <hexsize> [rwx|rx|rw|r]\n");
+                fflush(stdout);
+                return CmdResult::Handled;
+            }
+        }
+        auto addr = VirtualAllocEx(mProcess->hProcess, nullptr, size, MEM_COMMIT | MEM_RESERVE, prot);
+        if(addr)
+            printf("allocated 0x%llX (%llu bytes)\n", (unsigned long long)(uintptr_t)addr, (unsigned long long)size);
+        else
+            printf("VirtualAllocEx failed (%lu)\n", GetLastError());
+        fflush(stdout);
+        return CmdResult::Handled;
+    }
+
+    if(cmd == "free" && args.size() == 2)
+    {
+        uint64_t a = 0;
+        if(!parseAddress(args[1], a))
+        {
+            printf("usage: free <addr>\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        printf(VirtualFreeEx(mProcess->hProcess, (LPVOID)a, 0, MEM_RELEASE) ? "freed 0x%llX\n" : "free failed at 0x%llX\n", a);
+        fflush(stdout);
+        return CmdResult::Handled;
+    }
+
+    if(cmd == "protect" && args.size() == 4)
+    {
+        uint64_t a = 0, b = 0;
+        DWORD prot = 0;
+        if(!parseAddress(args[1], a) || !parseHex(args[2], b) || b == 0)
+        {
+            printf("usage: protect <addr> <hexsize> <rwx|rx|rw|r>\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        if(args[3] == "rwx") prot = PAGE_EXECUTE_READWRITE;
+        else if(args[3] == "rx") prot = PAGE_EXECUTE_READ;
+        else if(args[3] == "rw") prot = PAGE_READWRITE;
+        else if(args[3] == "r") prot = PAGE_READONLY;
+        else if(args[3] == "x") prot = PAGE_EXECUTE;
+        else
+        {
+            printf("usage: protect <addr> <hexsize> <rwx|rx|rw|r|x>\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        DWORD oldProt = 0;
+        if(mProcess->MemProtect(a, b, prot, &oldProt))
+            printf("protected 0x%llX size 0x%llX (%s)\n", a, b, args[3].c_str());
+        else
+            printf("protect failed at 0x%llX\n", a);
         fflush(stdout);
         return CmdResult::Handled;
     }

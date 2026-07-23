@@ -86,6 +86,16 @@ gleam -a <pid>                 :: 附加到运行中的进程
   exinfo                  最近异常信息
   threads                 线程列表
   thread [tid]            查看/选择命令作用的线程
+  thread [tid] suspend|resume  挂起/恢复线程（省略 tid 为事件线程）
+
+内存管理:
+  alloc <hexsize> [rwx]   在目标中分配内存
+  free <addr>             释放内存
+  protect <addr> <size> <prot>  修改页保护属性
+
+代码扫描:
+  xref <addr>             查找指向地址的引用（call/jmp）
+  findasm <text>          按指令文本搜索代码
 
 符号:
   imports [module]        模块导入表（默认主模块，含延迟导入）

@@ -79,6 +79,7 @@ private:
     CmdResult tryBreakpointCommand(const std::vector<std::string> & args);   // Breakpoints.cpp
     CmdResult tryInspectCommand(const std::vector<std::string> & args);      // Inspect.cpp
     CmdResult trySymbolCommand(const std::vector<std::string> & args);       // Symbols.cpp
+    CmdResult tryScanCommand(const std::vector<std::string> & args);         // Scan.cpp
 
     // Returns true when the debuggee should resume.
     bool executeCommand(const std::string & cmdLine);
@@ -128,6 +129,10 @@ private:
     // Hide.cpp: anti-anti-debug.
     void cmdHide(bool on);
     void applyHides();
+
+    // Scan.cpp: code scanning (xref, findasm).
+    void cmdXref(uint64_t target);
+    void cmdFindAsm(const std::string & text);
 
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();

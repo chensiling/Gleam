@@ -261,5 +261,36 @@ chk "N4: list empty after restore" /tmp/gleam_N4.txt "no patches"
 chk "N4: until hits"             /tmp/gleam_N4.txt "stop reason=breakpoint type=software address=0x140076B70"
 chk "N4: restore kept data"      /tmp/gleam_N4.txt "GDATA_AFTER=584C45414D2D544553542D4441544121"
 
+# --- O1: alloc/protect ---
+run O1 "" <<'EOF'
+alloc 1000
+protect 140190000 100 rw
+g
+EOF
+chk "O1: allocated"              /tmp/gleam_O1.txt "allocated 0x"
+chk "O1: protected"              /tmp/gleam_O1.txt "protected 0x140190000"
+
+# --- O2: xref / findasm ---
+run O2 "" <<'EOF'
+xref 1400708AC
+findasm call
+g
+EOF
+chk "O2: xref finds call site"   /tmp/gleam_O2.txt "0x0000000140076B9F  call 0x00000001400708AC"
+chk "O2: xref count"             /tmp/gleam_O2.txt "1 references to 0x1400708AC"
+chk "O2: findasm indirect call"  /tmp/gleam_O2.txt "call [0x000000014019F008]"
+
+# --- O3: thread suspend/resume (event thread, no tid needed) ---
+run O3 "" <<'EOF'
+bp 140070EC9
+g
+thread suspend
+thread resume
+g
+g
+EOF
+chkre "O3: suspend ok"           /tmp/gleam_O3.txt "suspend thread [0-9]+: ok"
+chkre "O3: resume ok"            /tmp/gleam_O3.txt "resume thread [0-9]+: ok"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
