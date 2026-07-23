@@ -1,0 +1,136 @@
+#ifndef GLEAM_DEBUGGER_H
+#define GLEAM_DEBUGGER_H
+
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <queue>
+#include <map>
+#include <set>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+
+#include <GleeBug/Debugger.h>
+#include <GleeBug/Debugger.Thread.Registers.h>
+
+// Shared parsing helper (GleamCommands.cpp).
+bool parseHex(const std::string & s, uint64_t & out);
+
+// Command-driven headless debugger based on GleeBug.
+//
+// The debug loop (Init/Attach + Start) runs on the caller's thread. A REPL
+// thread feeds commands via pushCommand(). Whenever the debuggee is suspended
+// by an interesting event (system breakpoint, breakpoint hit, single step,
+// unhandled exception), the debugger thread enters a command loop and executes
+// queued commands; "g"/"step"/"stepover"/"ret"/"detach"/"quit" leave the
+// command loop and resume the debuggee.
+//
+// Command implementations are split by functional area:
+//   GleamCommands.cpp             command dispatch, parsing helpers, help
+//   GleamCommands.Breakpoints.cpp software/hardware/memory breakpoints, ignore counts
+//   GleamCommands.Inspect.cpp     registers, memory, disassembly, maps, modules, find, bt
+//   GleamCommands.Control.cpp     execution control (g/step/over/ret/detach/quit), thread selection
+class GleamDebugger : public GleeBug::Debugger
+{
+public:
+    // Called from the REPL thread. Returns true if the queue was empty before
+    // this push (i.e. the debugger is likely running free).
+    bool pushCommand(const std::string & cmd);
+
+    // Called from the REPL thread: interrupt a running debuggee.
+    void requestPause();
+
+    // True while the debugger thread sits in the command loop.
+    bool isPaused() const;
+
+    // Called from the REPL thread: break in right after the next resume.
+    void pauseAfterResume();
+
+protected:
+    void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;
+    void cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const GleeBug::Process & process) override;
+    void cbSystemBreakpoint() override;
+    void cbAttachBreakpoint() override;
+    void cbBreakpoint(const GleeBug::BreakpointInfo & info) override;
+    void cbStep() override;
+    void cbUnhandledException(const EXCEPTION_RECORD & exceptionRecord, bool firstChance) override;
+    void cbInternalError(const std::string & error) override;
+    void cbPostDebugEvent(const DEBUG_EVENT & debugEvent) override;
+
+private:
+    // Note: R is a member enum of GleeBug::Registers (declared inside the class).
+    using RegId = GleeBug::Registers::R;
+
+    // Result of a try*Command handler.
+    enum class CmdResult
+    {
+        NotMine,    // command not handled by this handler
+        Handled,    // handled, debuggee stays suspended
+        Resume      // handled, resume the debuggee
+    };
+
+    // Command handlers by functional area. Called in order from executeCommand.
+    CmdResult tryControlCommand(const std::vector<std::string> & args);      // Control.cpp
+    CmdResult tryBreakpointCommand(const std::vector<std::string> & args);   // Breakpoints.cpp
+    CmdResult tryInspectCommand(const std::vector<std::string> & args);      // Inspect.cpp
+    CmdResult trySymbolCommand(const std::vector<std::string> & args);       // Symbols.cpp
+
+    // Returns true when the debuggee should resume.
+    bool executeCommand(const std::string & cmdLine);
+
+    // Runs on the debugger thread while the debuggee is suspended.
+    void commandLoop();
+
+    // The thread register/memory-inspection commands operate on: the thread
+    // selected with "thread <tid>", or the thread of the current debug event.
+    GleeBug::Thread* currentThread();
+
+    // Breakpoints.cpp
+    void cmdBreakpointList();
+    static const char* hwTypeText(GleeBug::HardwareType type);
+    static const char* memTypeText(GleeBug::MemoryType type);
+
+    // Inspect.cpp
+    static bool registerByName(const std::string & name, RegId & reg);
+    void cmdRegs();
+    void cmdRead(uint64_t addr, uint64_t size);
+    void cmdWrite(uint64_t addr, const std::vector<uint8_t> & bytes);
+    void cmdThreads();
+    void cmdDisasm(uint64_t addr, uint64_t count);
+    void cmdMaps();
+    void cmdModules();
+    void cmdFind(uint64_t addr, uint64_t size, const std::string & pattern);
+    void cmdExceptionInfo();
+    void cmdBacktrace();
+
+    // Symbols.cpp (dbghelp-backed)
+    bool ensureSymSession();
+    void closeSymSession();
+    void cmdImports(const std::string & moduleName);
+    void cmdExports(const std::string & moduleName, const std::string & filter);
+
+    // GleamCommands.cpp
+    static void cmdHelp();
+
+    std::queue<std::string> mCmdQueue;
+    std::mutex mCmdMutex;
+    std::condition_variable mCmdCv;
+    std::atomic<bool> mIsPaused{ false };
+    std::atomic<bool> mBreakInExpected{ false };  // "pause" break-in is on its way
+    std::atomic<bool> mPauseAfterResume{ false }; // "pause" arrived while paused
+    bool mWantsPause = false;
+    bool mStepArmed = false;      // a user-requested step is in flight
+    bool mStepOverArmed = false;  // a user-requested step-over is in flight
+    bool mQuitting = false;
+
+    std::map<GleeBug::ptr, uint32_t> mIgnoreHits;  // breakpoint address -> remaining ignores
+    std::set<uint32_t> mIgnoredExceptions;         // exception codes to pass to the debuggee
+    EXCEPTION_RECORD mLastException{};
+    bool mLastExceptionValid = false;
+    bool mLastExceptionFirstChance = false;
+    uint32_t mSelectedThreadId = 0;                // 0 = follow the event thread
+    bool mSymInitialized = false;                  // dbghelp session is up
+};
+
+#endif //GLEAM_DEBUGGER_H
