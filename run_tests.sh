@@ -27,7 +27,7 @@ chkcount() { # chkcount <desc> <file> <pattern> <expected-count>
 run() { # run <name> <target-args> < commands
   local name=$1; shift
   local args=$1; shift
-  "$GLEAM" $TARGET $args > /tmp/gleam_$name.txt 2>&1
+  timeout 60 "$GLEAM" $TARGET $args > /tmp/gleam_$name.txt 2>&1
   echo "== $name =="
 }
 
@@ -52,7 +52,7 @@ regs
 g
 g
 EOF
-chk "A: bp hit at marker"        /tmp/gleam_A.txt "breakpoint hit at 0x0000000140070EC9"
+chk "A: bp hit at marker"        /tmp/gleam_A.txt "stop reason=breakpoint type=software address=0x140070EC9"
 chk "A: disasm at rip"           /tmp/gleam_A.txt "0000000140070EC9"
 chkre "A: maps regions"          /tmp/gleam_A.txt "[0-9]+ committed regions"
 chk "A: modules has TestTarget"  /tmp/gleam_A.txt "TestTarget.exe"
@@ -65,7 +65,7 @@ chk "A: write ok"                /tmp/gleam_A.txt "wrote 16 bytes"
 chk "A: result1 modified by rcx" /tmp/gleam_A.txt "MARKER_RESULT_1=106"
 chk "A: result2 normal"          /tmp/gleam_A.txt "MARKER_RESULT_2=13"
 chk "A: gdata self-write wins b0" /tmp/gleam_A.txt "GDATA_AFTER=58ADBEEF0102030408090A0B0C0D0E0F"
-chk "A: exit code 0"             /tmp/gleam_A.txt "exited, code=0x00000000"
+chk "A: exit code 0"             /tmp/gleam_A.txt "stop reason=exit code=0x00000000"
 
 # --- B: one-shot breakpoint ---
 run B "" <<'EOF'
@@ -74,7 +74,7 @@ g
 bl
 g
 EOF
-chkcount "B: hit exactly once"   /tmp/gleam_B.txt "breakpoint hit" 1
+chkcount "B: hit exactly once"   /tmp/gleam_B.txt "stop reason=breakpoint" 1
 chk "B: bp auto-deleted"         /tmp/gleam_B.txt "no breakpoints"
 chk "B: both calls ran"          /tmp/gleam_B.txt "MARKER_RESULT_2=13"
 
@@ -85,9 +85,9 @@ ignore 140070EC9 1
 g
 g
 EOF
-chk "C: first hit ignored"       /tmp/gleam_C.txt "ignored (0 left)"
-chkcount "C: paused once"        /tmp/gleam_C.txt "[gleam] paused" 2
-chk "C: exit 0"                  /tmp/gleam_C.txt "exited, code=0x00000000"
+chk "C: first hit ignored"       /tmp/gleam_C.txt "event ignored address=0x140070EC9 left=0"
+chkcount "C: bp stop once"       /tmp/gleam_C.txt "stop reason=breakpoint" 1
+chk "C: exit 0"                  /tmp/gleam_C.txt "stop reason=exit code=0x00000000"
 
 # --- D: hardware write breakpoint ---
 run D "" <<'EOF'
@@ -99,7 +99,7 @@ g
 g
 EOF
 chk "D: hbp set"                 /tmp/gleam_D.txt "hardware breakpoint set at 0x140190000 (w)"
-chkcount "D: hbp hit once"       /tmp/gleam_D.txt "hardware breakpoint hit" 1
+chkcount "D: hbp hit once"       /tmp/gleam_D.txt "stop reason=breakpoint type=hardware" 1
 chk "D: self write done"         /tmp/gleam_D.txt "GDATA_AFTER=584C45414D2D544553542D4441544121"
 
 # --- E: memory write breakpoint ---
@@ -109,7 +109,7 @@ g
 g
 EOF
 chk "E: mbp set"                 /tmp/gleam_E.txt "memory breakpoint set at 0x140190000"
-chkcount "E: mbp hit once"       /tmp/gleam_E.txt "memory breakpoint hit" 1
+chkcount "E: mbp hit once"       /tmp/gleam_E.txt "stop reason=breakpoint type=memory" 1
 
 # --- F: unhandled exception + exinfo ---
 run F "exc" <<'EOF'
@@ -117,7 +117,7 @@ g
 exinfo
 quit
 EOF
-chk "F: unhandled exception"     /tmp/gleam_F.txt "unhandled exception (first chance) code=0xE0DEAD00"
+chk "F: unhandled exception"     /tmp/gleam_F.txt "stop reason=exception code=0xE0DEAD00"
 chk "F: exinfo code"             /tmp/gleam_F.txt "code=0xE0DEAD00"
 
 # --- G: exception filter ---
@@ -125,9 +125,9 @@ run G "exc" <<'EOF'
 ignoreexc E0DEAD00
 g
 EOF
-chk "G: exception ignored"       /tmp/gleam_G.txt "exception 0xE0DEAD00"
+chk "G: exception ignored"       /tmp/gleam_G.txt "action=ignored"
 chk "G: survived"                /tmp/gleam_G.txt "SURVIVED_EXCEPTION"
-chk "G: exit 0"                  /tmp/gleam_G.txt "exited, code=0x00000000"
+chk "G: exit 0"                  /tmp/gleam_G.txt "stop reason=exit code=0x00000000"
 
 # --- H: ret (step out) ---
 run H "" <<EOF
@@ -139,7 +139,7 @@ regs
 g
 g
 EOF
-chk "H: bp inner hit"            /tmp/gleam_H.txt "breakpoint hit at 0x00000001400708AC"
+chk "H: bp inner hit"            /tmp/gleam_H.txt "stop reason=breakpoint type=software address=0x1400708AC"
 chk "H: stepping out"            /tmp/gleam_H.txt "stepping out to 0x"
 chk "H: result1 normal"          /tmp/gleam_H.txt "MARKER_RESULT_1=47"
 
@@ -159,7 +159,7 @@ regs
 g
 g
 EOF
-chk "I: stepped over the call"   /tmp/gleam_I.txt "stepped over to 0x0000000140076B8F"
+chk "I: stepped over the call"   /tmp/gleam_I.txt "stop reason=step rip=0x140076B8F"
 chk "I: result1 normal"          /tmp/gleam_I.txt "MARKER_RESULT_1=47"
 
 # --- J: detach ---
@@ -182,6 +182,84 @@ chk "K: imports kernel32 group"  /tmp/gleam_K.txt "KERNEL32.dll:"
 chk "K: import names resolved"   /tmp/gleam_K.txt "CreateThread"
 chk "K: exports wildcard filter" /tmp/gleam_K.txt "CreateFileW"
 chk "K: exports summary"         /tmp/gleam_K.txt "symbols"
+
+# --- L: symbol breakpoint + breakon switches ---
+run L "" <<'EOF'
+breakon
+breakon entry on
+breakon thread on
+breakon dll on
+bp TestTarget!marker
+g
+g
+g
+g
+g
+g
+quit
+EOF
+chk "L: default exception on"    /tmp/gleam_L.txt "breakon exception=on"
+chk "L: OEP entry stop"          /tmp/gleam_L.txt "stop reason=entry address=0x1400720EE"
+chk "L: thread create stop"      /tmp/gleam_L.txt "stop reason=thread op=create"
+chk "L: thread start named"      /tmp/gleam_L.txt "name=worker"
+chk "L: dll load stop"           /tmp/gleam_L.txt "stop reason=dll op=load"
+chk "L: symbol bp hit (real body)" /tmp/gleam_L.txt "stop reason=breakpoint type=software address=0x140076B70"
+
+# --- M: breakon exception off ---
+run M "exc" <<'EOF'
+breakon exception off
+g
+EOF
+chk "M: no exception stop"       /tmp/gleam_M.txt "SURVIVED_EXCEPTION"
+chk "M: exit 0"                  /tmp/gleam_M.txt "stop reason=exit code=0x00000000"
+chkcount "M: only 2 stops"       /tmp/gleam_M.txt "stop reason=" 2
+
+# --- N1: hide (anti-anti-debug) ---
+run N1 "" <<'EOF'
+hide
+g
+EOF
+chk "N1: hidden from IsDebuggerPresent" /tmp/gleam_N1.txt "ISDEBUGGERPRESENT=0"
+
+# --- N2: tracepoint ---
+run N2 "" <<'EOF'
+trace 140070EC9
+g
+EOF
+chkcount "N2: two trace lines"   /tmp/gleam_N2.txt "trace address=0x140070EC9" 2
+chkcount "N2: no bp pause"       /tmp/gleam_N2.txt "stop reason=breakpoint" 0
+
+# --- N3: conditional breakpoint ---
+run N3 "" <<'EOF'
+bp 140070EC9 if rcx==7
+g
+g
+EOF
+chkcount "N3: only rcx==7 pauses" /tmp/gleam_N3.txt "stop reason=breakpoint" 1
+
+# --- N4: sym / stackscan / find-ascii / patch / until ---
+run N4 "" <<'EOF'
+bp 140070EC9
+g
+sym 140076B70
+stackscan 10
+find 140190000 100 ascii GLEAM
+patch 140190000 AA BB
+patches
+restore 140190000
+patches
+until 140076B70
+g
+g
+EOF
+chk "N4: sym resolves marker"    /tmp/gleam_N4.txt "marker"
+chk "N4: stackscan finds main"   /tmp/gleam_N4.txt "main"
+chk "N4: find ascii"             /tmp/gleam_N4.txt "found at 0x140190000"
+chk "N4: patched"                /tmp/gleam_N4.txt "patched 0x140190000 (2 bytes)"
+chk "N4: restored"               /tmp/gleam_N4.txt "restored 0x140190000"
+chk "N4: list empty after restore" /tmp/gleam_N4.txt "no patches"
+chk "N4: until hits"             /tmp/gleam_N4.txt "stop reason=breakpoint type=software address=0x140076B70"
+chk "N4: restore kept data"      /tmp/gleam_N4.txt "GDATA_AFTER=584C45414D2D544553542D4441544121"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

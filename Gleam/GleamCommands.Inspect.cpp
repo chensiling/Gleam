@@ -212,6 +212,124 @@ void GleamDebugger::cmdFind(uint64_t addr, uint64_t size, const std::string & pa
     fflush(stdout);
 }
 
+void GleamDebugger::cmdFindString(uint64_t addr, uint64_t size, const std::string & text, bool utf16)
+{
+    if(text.empty())
+    {
+        printf("empty string\n");
+        fflush(stdout);
+        return;
+    }
+    std::vector<uint8_t> bytes;
+    bytes.reserve(text.size() * (utf16 ? 2 : 1));
+    for(char c : text)
+    {
+        bytes.push_back((uint8_t)c);
+        if(utf16)
+            bytes.push_back(0);
+    }
+    auto found = mProcess->MemFindPattern(addr, (size_t)size, bytes.data(), bytes.size());
+    if(found)
+        printf("found at 0x%llX\n", (unsigned long long)found);
+    else
+        printf("not found\n");
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdStackScan(uint64_t count)
+{
+    // x64dbg-style stack view: scan qwords from rsp, annotate values that
+    // point into executable committed memory (likely return addresses).
+    if(count == 0 || count > 0x1000)
+        count = 32;
+    Registers r(currentThread()->hThread);
+    uint64_t rsp = r.Gsp();
+    ensureSymSession();
+    for(uint64_t i = 0; i < count; i++)
+    {
+        uint64_t value = 0;
+        if(!mProcess->MemReadSafe(rsp + i * sizeof(value), &value, sizeof(value)))
+            break;
+        MEMORY_BASIC_INFORMATION mbi;
+        if(!VirtualQueryEx(mProcess->hProcess, (LPCVOID)value, &mbi, sizeof(mbi)))
+            continue;
+        if(mbi.State != MEM_COMMIT)
+            continue;
+        const DWORD exec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        if(!(mbi.Protect & exec))
+            continue;
+        auto name = symNameByAddr(value);
+        printf("rsp+0x%02llX  0x%016llX  %s\n",
+               (unsigned long long)(i * sizeof(value)),
+               value,
+               name.empty() ? "" : name.c_str());
+    }
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes)
+{
+    if(bytes.empty())
+    {
+        printf("nothing to patch\n");
+        fflush(stdout);
+        return;
+    }
+    std::vector<uint8_t> original(bytes.size());
+    if(!mProcess->MemReadSafe(addr, original.data(), original.size()))
+    {
+        printf("read failed at 0x%llX (cannot record original bytes)\n", addr);
+        fflush(stdout);
+        return;
+    }
+    if(!mProcess->MemWriteSafe(addr, bytes.data(), bytes.size()))
+    {
+        printf("write failed at 0x%llX\n", addr);
+        fflush(stdout);
+        return;
+    }
+    mPatches[addr] = original;
+    printf("patched 0x%llX (%zu bytes)\n", addr, bytes.size());
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdPatchList()
+{
+    if(mPatches.empty())
+    {
+        printf("no patches\n");
+        fflush(stdout);
+        return;
+    }
+    for(const auto & kv : mPatches)
+    {
+        printf("0x%llX  %zu bytes, original:", kv.first, kv.second.size());
+        for(auto b : kv.second)
+            printf(" %02X", b);
+        printf("\n");
+    }
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdRestore(uint64_t addr)
+{
+    auto it = mPatches.find(addr);
+    if(it == mPatches.end())
+    {
+        printf("no patch recorded at 0x%llX\n", addr);
+        fflush(stdout);
+        return;
+    }
+    if(mProcess->MemWriteSafe(addr, it->second.data(), it->second.size()))
+    {
+        printf("restored 0x%llX\n", addr);
+        mPatches.erase(it);
+    }
+    else
+        printf("restore failed at 0x%llX\n", addr);
+    fflush(stdout);
+}
+
 void GleamDebugger::cmdExceptionInfo()
 {
     if(!mLastExceptionValid)
@@ -274,12 +392,12 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
         fflush(stdout);
         return CmdResult::Handled;
     }
-    if(cmd == "read" && args.size() == 3 && parseHex(args[1], a) && parseHex(args[2], b))
+    if(cmd == "read" && args.size() == 3 && parseAddress(args[1], a) && parseHex(args[2], b))
     {
         cmdRead(a, b);
         return CmdResult::Handled;
     }
-    if(cmd == "write" && args.size() >= 3 && parseHex(args[1], a))
+    if(cmd == "write" && args.size() >= 3 && parseAddress(args[1], a))
     {
         std::vector<uint8_t> bytes;
         bool ok = true;
@@ -304,7 +422,7 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
         uint64_t addr = 0, count = 8;
         bool ok = true;
         if(args.size() >= 2)
-            ok = parseHex(args[1], addr);
+            ok = parseAddress(args[1], addr);
         else
         {
             Registers r(currentThread()->hThread);
@@ -331,16 +449,72 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
         cmdModules();
         return CmdResult::Handled;
     }
-    if(cmd == "find" && args.size() >= 4 && parseHex(args[1], a) && parseHex(args[2], b))
+    if(cmd == "find" && args.size() >= 4 && parseAddress(args[1], a) && parseHex(args[2], b))
     {
-        std::string pattern;
-        for(size_t i = 3; i < args.size(); i++)
+        if(args[3] == "ascii" || args[3] == "utf16")
         {
-            if(!pattern.empty())
-                pattern += ' ';
-            pattern += args[i];
+            std::string text;
+            for(size_t i = 4; i < args.size(); i++)
+            {
+                if(!text.empty())
+                    text += ' ';
+                text += args[i];
+            }
+            cmdFindString(a, b, text, args[3] == "utf16");
         }
-        cmdFind(a, b, pattern);
+        else
+        {
+            std::string pattern;
+            for(size_t i = 3; i < args.size(); i++)
+            {
+                if(!pattern.empty())
+                    pattern += ' ';
+                pattern += args[i];
+            }
+            cmdFind(a, b, pattern);
+        }
+        return CmdResult::Handled;
+    }
+    if(cmd == "stackscan" && args.size() <= 2)
+    {
+        uint64_t count = 32;
+        if(args.size() == 2 && !parseHex(args[1], count))
+        {
+            printf("usage: stackscan [count]\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        cmdStackScan(count);
+        return CmdResult::Handled;
+    }
+    if(cmd == "patch" && args.size() >= 3 && parseAddress(args[1], a))
+    {
+        std::vector<uint8_t> bytes;
+        bool ok = true;
+        for(size_t i = 2; i < args.size() && ok; i++)
+        {
+            uint64_t byte = 0;
+            ok = parseHex(args[i], byte) && byte <= 0xFF;
+            if(ok)
+                bytes.push_back((uint8_t)byte);
+        }
+        if(ok)
+            cmdPatch(a, bytes);
+        else
+        {
+            printf("invalid byte value\n");
+            fflush(stdout);
+        }
+        return CmdResult::Handled;
+    }
+    if(cmd == "patches")
+    {
+        cmdPatchList();
+        return CmdResult::Handled;
+    }
+    if(cmd == "restore" && args.size() == 2 && parseAddress(args[1], a))
+    {
+        cmdRestore(a);
         return CmdResult::Handled;
     }
     if(cmd == "exinfo")

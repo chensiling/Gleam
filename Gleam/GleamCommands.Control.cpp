@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using namespace GleeBug;
 
@@ -14,6 +15,25 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "g" || cmd == "continue")
         return CmdResult::Resume;
+
+    if(cmd == "until" && args.size() == 2)
+    {
+        // Sugar for "bp <addr> once" + continue.
+        uint64_t a = 0;
+        if(!parseAddress(args[1], a))
+        {
+            printf("usage: until <addr|module!symbol>\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        if(!mProcess->SetBreakpoint(a, true))
+        {
+            printf("failed to set breakpoint at 0x%llX\n", a);
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        return CmdResult::Resume;
+    }
 
     if(cmd == "step")
     {
@@ -84,6 +104,13 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         return CmdResult::Resume;
     }
 
+    if(cmd == "hide")
+    {
+        bool on = args.size() == 1 || args[1] == "on";
+        cmdHide(on);
+        return CmdResult::Handled;
+    }
+
     if(cmd == "pause")
     {
         printf("already paused\n");
@@ -124,6 +151,54 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         }
         else
             printf("usage: ignoreexc <hexcode>\n");
+        fflush(stdout);
+        return CmdResult::Handled;
+    }
+
+    if(cmd == "breakon" && args.size() <= 3)
+    {
+        struct SwitchDef { const char* name; bool* flag; };
+        SwitchDef switches[] = {
+            { "entry", &mBreakOnEntry },
+            { "dll", &mBreakOnDll },
+            { "thread", &mBreakOnThread },
+            { "exception", &mBreakOnException },
+        };
+        if(args.size() == 1)
+        {
+            for(const auto & sw : switches)
+                printf("breakon %s=%s\n", sw.name, *sw.flag ? "on" : "off");
+        }
+        else
+        {
+            bool found = false;
+            for(auto & sw : switches)
+            {
+                if(_stricmp(args[1].c_str(), sw.name) != 0)
+                    continue;
+                found = true;
+                if(args.size() == 2)
+                    printf("breakon %s=%s\n", sw.name, *sw.flag ? "on" : "off");
+                else if(args[2] == "on")
+                {
+                    *sw.flag = true;
+                    printf("breakon %s=on\n", sw.name);
+                    // The entry switch may be enabled after process creation
+                    // (e.g. at the system breakpoint): arm the OEP breakpoint now.
+                    if(sw.flag == &mBreakOnEntry)
+                        applyEntryBreakpoint();
+                }
+                else if(args[2] == "off")
+                {
+                    *sw.flag = false;
+                    printf("breakon %s=off\n", sw.name);
+                }
+                else
+                    printf("usage: breakon <entry|dll|thread|exception> [on|off]\n");
+            }
+            if(!found)
+                printf("unknown switch '%s' (entry|dll|thread|exception)\n", args[1].c_str());
+        }
         fflush(stdout);
         return CmdResult::Handled;
     }

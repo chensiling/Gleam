@@ -103,6 +103,7 @@ namespace
     {
         bool valid = false;
         bool pe64 = true;
+        uint32_t entryPointRva = 0;
         IMAGE_DATA_DIRECTORY importDir{};
         IMAGE_DATA_DIRECTORY delayImportDir{};
     };
@@ -129,6 +130,7 @@ namespace
             if(!readAt(process, optAddr, opt))
                 return info;
             info.pe64 = true;
+            info.entryPointRva = opt.AddressOfEntryPoint;
             info.importDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         }
@@ -138,6 +140,7 @@ namespace
             if(!readAt(process, optAddr, opt))
                 return info;
             info.pe64 = false;
+            info.entryPointRva = opt.AddressOfEntryPoint;
             info.importDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         }
@@ -184,6 +187,51 @@ namespace
         ctx->shown++;
         return TRUE;
     }
+}
+
+uint64_t GleamDebugger::moduleEntryPoint(uint64_t base)
+{
+    if(!mProcess)
+        return 0;
+    auto pe = readPeDirectories(mProcess, base);
+    if(!pe.valid || !pe.entryPointRva)
+        return 0;
+    return base + pe.entryPointRva;
+}
+
+std::string GleamDebugger::symNameByAddr(uint64_t addr)
+{
+    if(!addr || !ensureSymSession())
+        return std::string();
+    char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+    memset(buf, 0, sizeof(buf));
+    auto si = (SYMBOL_INFO*)buf;
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = MAX_SYM_NAME;
+    uint64_t disp = 0;
+    if(SymFromAddr(mProcess->hProcess, addr, &disp, si))
+        return std::string(si->Name);
+    return std::string();
+}
+
+bool GleamDebugger::parseAddress(const std::string & s, uint64_t & out)
+{
+    if(parseHex(s, out))
+        return true;
+    // "module!symbol" form, resolved through the dbghelp session.
+    if(s.find('!') == std::string::npos || !mProcess || !ensureSymSession())
+        return false;
+    char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+    memset(buf, 0, sizeof(buf));
+    auto si = (SYMBOL_INFO*)buf;
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = MAX_SYM_NAME;
+    if(SymFromName(mProcess->hProcess, s.c_str(), si))
+    {
+        out = si->Address;
+        return true;
+    }
+    return false;
 }
 
 bool GleamDebugger::ensureSymSession()
@@ -371,9 +419,31 @@ void GleamDebugger::cmdExports(const std::string & moduleName, const std::string
     fflush(stdout);
 }
 
+void GleamDebugger::cmdSym(uint64_t addr)
+{
+    if(!ensureSymSession())
+    {
+        printf("dbghelp SymInitialize failed\n");
+        fflush(stdout);
+        return;
+    }
+    char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+    memset(buf, 0, sizeof(buf));
+    auto si = (SYMBOL_INFO*)buf;
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = MAX_SYM_NAME;
+    uint64_t disp = 0;
+    if(SymFromAddr(mProcess->hProcess, addr, &disp, si))
+        printf("0x%llX  %s+0x%llX\n", addr, si->Name, disp);
+    else
+        printf("no symbol for 0x%llX\n", addr);
+    fflush(stdout);
+}
+
 GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::string> & args)
 {
     const std::string & cmd = args[0];
+    uint64_t a = 0;
 
     if(cmd == "imports" && args.size() <= 2)
     {
@@ -383,6 +453,11 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
     if(cmd == "exports" && (args.size() == 2 || args.size() == 3))
     {
         cmdExports(args[1], args.size() == 3 ? args[2] : std::string());
+        return CmdResult::Handled;
+    }
+    if(cmd == "sym" && args.size() == 2 && parseAddress(args[1], a))
+    {
+        cmdSym(a);
         return CmdResult::Handled;
     }
     return CmdResult::NotMine;

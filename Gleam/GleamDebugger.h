@@ -50,6 +50,10 @@ public:
 protected:
     void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;
     void cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const GleeBug::Process & process) override;
+    void cbCreateThreadEvent(const CREATE_THREAD_DEBUG_INFO & createThread, const GleeBug::Thread & thread) override;
+    void cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread, const GleeBug::Thread & thread) override;
+    void cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll) override;
+    void cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll) override;
     void cbSystemBreakpoint() override;
     void cbAttachBreakpoint() override;
     void cbBreakpoint(const GleeBug::BreakpointInfo & info) override;
@@ -101,14 +105,48 @@ private:
     void cmdMaps();
     void cmdModules();
     void cmdFind(uint64_t addr, uint64_t size, const std::string & pattern);
+    void cmdFindString(uint64_t addr, uint64_t size, const std::string & text, bool utf16);
     void cmdExceptionInfo();
     void cmdBacktrace();
+    void cmdStackScan(uint64_t count);
+    void cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes);
+    void cmdPatchList();
+    void cmdRestore(uint64_t addr);
+
+    // Breakpoints.cpp: conditional breakpoints and tracepoints.
+    // Hit-time rule evaluated in the debugger thread before pausing.
+    struct BpRule
+    {
+        RegId condReg = RegId::Invalid;  // Invalid = unconditional
+        int condOp = 0;                  // 0:==, 1:!=, 2:<, 3:>
+        uint64_t condValue = 0;
+        bool trace = false;              // tracepoint: log and auto-continue
+    };
+    std::map<GleeBug::ptr, BpRule> mBpRules;
+    bool evalBpRule(const GleeBug::BreakpointInfo & info); // true = pause normally
+
+    // Hide.cpp: anti-anti-debug.
+    void cmdHide(bool on);
+    void applyHides();
 
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();
     void closeSymSession();
     void cmdImports(const std::string & moduleName);
     void cmdExports(const std::string & moduleName, const std::string & filter);
+    void cmdSym(uint64_t addr);
+    // Resolve an address argument: hex literal or "module!symbol".
+    bool parseAddress(const std::string & s, uint64_t & out);
+    // Best-effort symbol name for an address (empty on failure).
+    std::string symNameByAddr(uint64_t addr);
+    // OEP (AddressOfEntryPoint) of a loaded module, 0 on failure.
+    uint64_t moduleEntryPoint(uint64_t base);
+
+    // GleamDebugger.cpp: unified machine-readable stop record.
+    // Format: "stop reason=<r> ... rip=0x... tid=<id>" (one line, key=value).
+    void emitStop(const char* reason, const char* details) const;
+    // Arm the one-shot OEP breakpoint (no-op if already armed or unavailable).
+    void applyEntryBreakpoint();
 
     // GleamCommands.cpp
     static void cmdHelp();
@@ -124,6 +162,13 @@ private:
     bool mStepOverArmed = false;  // a user-requested step-over is in flight
     bool mQuitting = false;
 
+    // "breakon" switches: which event kinds may trigger a pause.
+    bool mBreakOnEntry = false;
+    bool mBreakOnDll = false;
+    bool mBreakOnThread = false;
+    bool mBreakOnException = true;   // matches the historic default
+    GleeBug::ptr mOepBreakpoint = 0; // one-shot OEP breakpoint address (0 = none)
+
     std::map<GleeBug::ptr, uint32_t> mIgnoreHits;  // breakpoint address -> remaining ignores
     std::set<uint32_t> mIgnoredExceptions;         // exception codes to pass to the debuggee
     EXCEPTION_RECORD mLastException{};
@@ -131,6 +176,8 @@ private:
     bool mLastExceptionFirstChance = false;
     uint32_t mSelectedThreadId = 0;                // 0 = follow the event thread
     bool mSymInitialized = false;                  // dbghelp session is up
+    bool mHideOn = false;                          // anti-anti-debug enabled
+    std::map<uint64_t, std::vector<uint8_t>> mPatches; // patch addr -> original bytes
 };
 
 #endif //GLEAM_DEBUGGER_H

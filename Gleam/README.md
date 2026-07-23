@@ -58,6 +58,8 @@ gleam -a <pid>                 :: 附加到运行中的进程
 
 断点:
   bp <hexaddr> [once]     软件断点（once 为一次性）
+  bp <addr> if <r><op><v> 条件断点（op: == != < >，寄存器条件）
+  trace <addr>            追踪点（命中记录 trace 行并自动继续）
   rbp <hexaddr>           删除软件断点
   hbp <hexaddr> [x|w|rw] [1|2|4|8]  硬件断点
   hbpd <hexaddr>          删除硬件断点
@@ -75,6 +77,11 @@ gleam -a <pid>                 :: 附加到运行中的进程
   maps                    已提交内存区域
   modules                 已加载模块
   find <addr> <size> <pat>  内存搜索（支持 ?? 通配）
+  find <addr> <size> ascii|utf16 <text>  字符串搜索
+  patch <addr> <b...>     补丁（自动记录原始字节）
+  patches                 补丁列表
+  restore <addr>          还原补丁
+  stackscan [n]           栈扫描（标注疑似返回地址并解析符号）
   bt                      栈回溯（RBP 链）
   exinfo                  最近异常信息
   threads                 线程列表
@@ -83,6 +90,15 @@ gleam -a <pid>                 :: 附加到运行中的进程
 符号:
   imports [module]        模块导入表（默认主模块，含延迟导入）
   exports <module> [pat]  模块导出表，可选通配过滤
+  sym <addr>              地址反查符号
+  until <addr>            运行到指定地址（一次性断点语法糖）
+
+反反调试:
+  hide [on|off]           隐藏调试器（PEB 标志、堆标志、
+                          IsDebuggerPresent 等 API 补丁）
+
+事件暂停:
+  breakon [sw] [on|off]   暂停开关：entry/dll/thread/exception
 
 异常:
   ignoreexc <hexcode>     将指定异常码交还目标处理

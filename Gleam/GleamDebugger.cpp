@@ -49,36 +49,118 @@ Thread* GleamDebugger::currentThread()
     return mThread;
 }
 
+// Unified machine-readable stop record:
+//   stop reason=<reason> [details...] rip=0x... tid=<id>
+// key=value, single line, trivially convertible to JSON by the MCP layer.
+void GleamDebugger::emitStop(const char* reason, const char* details) const
+{
+    uint64_t rip = 0;
+    if(mThread)
+    {
+        Registers r(mThread->hThread);
+        rip = r.Gip();
+    }
+    printf("stop reason=%s%s%s rip=0x%llX tid=%u\n",
+           reason,
+           details ? " " : "",
+           details ? details : "",
+           (unsigned long long)rip,
+           mDebugEvent.dwThreadId);
+    fflush(stdout);
+}
+
+void GleamDebugger::applyEntryBreakpoint()
+{
+    if(mOepBreakpoint || !mProcess)
+        return;
+    // OEP = image base + AddressOfEntryPoint. NOTE: lpStartAddress is the
+    // thread start thunk, NOT the OEP.
+    auto oep = moduleEntryPoint((uint64_t)mProcess->createProcessInfo.lpBaseOfImage);
+    if(oep && mProcess->SetBreakpoint(oep, true))
+        mOepBreakpoint = oep;
+    else
+    {
+        printf("event error msg=\"failed to set OEP breakpoint\"\n");
+        fflush(stdout);
+    }
+}
+
 void GleamDebugger::cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const Process & process)
 {
-    printf("[event] process %u created, entry=0x%p base=0x%p\n",
+    printf("event process op=create pid=%u base=0x%p start=0x%p\n",
            mDebugEvent.dwProcessId,
-           createProcess.lpStartAddress,
-           createProcess.lpBaseOfImage);
+           createProcess.lpBaseOfImage,
+           createProcess.lpStartAddress);
     fflush(stdout);
+
+    if(mBreakOnEntry)
+        applyEntryBreakpoint();
 }
 
 void GleamDebugger::cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const Process & process)
 {
-    printf("[event] process %u exited, code=0x%08X\n",
-           mDebugEvent.dwProcessId,
-           exitProcess.dwExitCode);
-    fflush(stdout);
+    char details[64];
+    sprintf_s(details, "code=0x%08X", exitProcess.dwExitCode);
+    emitStop("exit", details);
     closeSymSession();
+}
+
+void GleamDebugger::cbCreateThreadEvent(const CREATE_THREAD_DEBUG_INFO & createThread, const Thread & thread)
+{
+    if(!mBreakOnThread)
+        return;
+    auto name = symNameByAddr((uint64_t)createThread.lpStartAddress);
+    char details[320];
+    sprintf_s(details, "op=create start=0x%p name=%s",
+              createThread.lpStartAddress,
+              name.empty() ? "?" : name.c_str());
+    emitStop("thread", details);
+    mWantsPause = true;
+}
+
+void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread, const Thread & thread)
+{
+    if(!mBreakOnThread)
+        return;
+    char details[64];
+    sprintf_s(details, "op=exit code=0x%08X", exitThread.dwExitCode);
+    emitStop("thread", details);
+    mWantsPause = true;
+}
+
+void GleamDebugger::cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
+{
+    if(!mBreakOnDll)
+        return;
+    char details[80];
+    sprintf_s(details, "op=load base=0x%p", loadDll.lpBaseOfDll);
+    emitStop("dll", details);
+    mWantsPause = true;
+}
+
+void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
+{
+    if(!mBreakOnDll)
+        return;
+    char details[80];
+    sprintf_s(details, "op=unload base=0x%p", unloadDll.lpBaseOfDll);
+    emitStop("dll", details);
+    mWantsPause = true;
 }
 
 void GleamDebugger::cbSystemBreakpoint()
 {
-    printf("[event] system breakpoint\n");
-    fflush(stdout);
+    emitStop("system", nullptr);
+    // Best moment to hide: no target code has run yet.
+    if(mHideOn)
+        applyHides();
     mWantsPause = true;
 }
 
 void GleamDebugger::cbAttachBreakpoint()
 {
     // Fired (instead of the system breakpoint) when attached to a process.
-    printf("[event] attach breakpoint\n");
-    fflush(stdout);
+    emitStop("attach", nullptr);
     mWantsPause = true;
 }
 
@@ -89,25 +171,36 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
     if(ignore != mIgnoreHits.end() && ignore->second > 0)
     {
         ignore->second--;
-        printf("[event] breakpoint at 0x%p ignored (%u left)\n",
-               (void*)info.address, ignore->second);
+        printf("event ignored address=0x%llX left=%u\n",
+               (unsigned long long)info.address, ignore->second);
         fflush(stdout);
         return;
     }
 
-    if(mStepOverArmed && info.singleshoot)
+    // Conditional breakpoints and tracepoints: rule says "don't pause".
+    if(!evalBpRule(info))
+        return;
+
+    char details[96];
+    if(mOepBreakpoint && info.address == mOepBreakpoint && info.singleshoot)
+    {
+        mOepBreakpoint = 0;
+        sprintf_s(details, "address=0x%llX", (unsigned long long)info.address);
+        emitStop("entry", details);
+    }
+    else if(mStepOverArmed && info.singleshoot)
     {
         mStepOverArmed = false;
-        printf("[event] stepped over to 0x%p\n", (void*)info.address);
+        emitStop("step", nullptr);
     }
     else
     {
         const char* typeText =
             info.type == BreakpointType::Software ? "software" :
             info.type == BreakpointType::Hardware ? "hardware" : "memory";
-        printf("[event] %s breakpoint hit at 0x%p\n", typeText, (void*)info.address);
+        sprintf_s(details, "type=%s address=0x%llX", typeText, (unsigned long long)info.address);
+        emitStop("breakpoint", details);
     }
-    fflush(stdout);
     mWantsPause = true;
 }
 
@@ -119,8 +212,7 @@ void GleamDebugger::cbStep()
     {
         mStepArmed = false;
         mStepOverArmed = false;
-        printf("[event] single step\n");
-        fflush(stdout);
+        emitStop("step", nullptr);
         mWantsPause = true;
     }
 }
@@ -134,9 +226,8 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     // Our own DebugBreakProcess break-in (triggered by "pause").
     if(exceptionRecord.ExceptionCode == STATUS_BREAKPOINT && mBreakInExpected.exchange(false))
     {
-        printf("[event] paused (break-in)\n");
-        fflush(stdout);
         mContinueStatus = DBG_CONTINUE;
+        emitStop("pause", nullptr);
         mWantsPause = true;
         return;
     }
@@ -144,25 +235,29 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     // Filtered exception codes are passed back to the debuggee without pausing.
     if(mIgnoredExceptions.count(exceptionRecord.ExceptionCode))
     {
-        printf("[event] exception 0x%08X at 0x%p ignored\n",
-               exceptionRecord.ExceptionCode,
-               exceptionRecord.ExceptionAddress);
+        printf("event exception code=0x%08lX action=ignored\n", exceptionRecord.ExceptionCode);
         fflush(stdout);
         mContinueStatus = DBG_CONTINUE;
         return;
     }
 
-    printf("[event] unhandled exception (%s) code=0x%08X at 0x%p\n",
-           firstChance ? "first chance" : "second chance",
-           exceptionRecord.ExceptionCode,
-           exceptionRecord.ExceptionAddress);
-    fflush(stdout);
-    mWantsPause = true;
+    // Second chance always pauses (last chance before the process dies);
+    // first chance follows the "breakon exception" switch.
+    if(!firstChance || mBreakOnException)
+    {
+        char details[128];
+        sprintf_s(details, "code=0x%08lX address=0x%p chance=%s",
+                  exceptionRecord.ExceptionCode,
+                  exceptionRecord.ExceptionAddress,
+                  firstChance ? "first" : "second");
+        emitStop("exception", details);
+        mWantsPause = true;
+    }
 }
 
 void GleamDebugger::cbInternalError(const std::string & error)
 {
-    printf("[error] %s\n", error.c_str());
+    printf("event error msg=\"%s\"\n", error.c_str());
     fflush(stdout);
 }
 
@@ -177,14 +272,9 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
 
 void GleamDebugger::commandLoop()
 {
+    // The stop record was already emitted by the triggering event; it is the
+    // pause notification. Here we only consume commands.
     mIsPaused.store(true);
-    {
-        Registers r(mThread->hThread);
-        printf("[gleam] paused, RIP=0x%llX TID=%u\n",
-               (unsigned long long)r.Gip(),
-               mDebugEvent.dwThreadId);
-        fflush(stdout);
-    }
     for(;;)
     {
         std::string cmd;

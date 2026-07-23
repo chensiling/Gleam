@@ -32,14 +32,24 @@ int main(int argc, char** argv)
 {
     if(argc > 1 && !strcmp(argv[1], "exc"))
     {
-        // One continuable custom exception, then clean exit.
-        RaiseException(0xE0DEAD00, 0, 0, nullptr);
+        // One custom exception, handled in-process; survives unless the
+        // debugger terminates us first.
+        __try
+        {
+            RaiseException(0xE0DEAD00, 0, 0, nullptr);
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
         printf("SURVIVED_EXCEPTION\n");
         fflush(stdout);
         return 0;
     }
 
     CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+
+    printf("ISDEBUGGERPRESENT=%d\n", IsDebuggerPresent() ? 1 : 0);
+    fflush(stdout);
 
     // Fixed base (no ASLR) makes these addresses stable across runs.
     printf("MARKER=%p\n", (void*)&marker);
