@@ -104,16 +104,18 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "ret" || cmd == "stepout")
     {
-        // Return address resolution:
-        // - inside a framed function, it lives at [rbp+8]
-        // - otherwise (function entry, or FPO/optimized code mid-function),
-        //   scan the stack for a value that looks like a return address:
-        //   executable memory preceded by a call instruction.
+        // Return address resolution, three tiers:
+        // 1) [rsp] itself is exec+call-preceded -> function entry or the ret
+        //    instruction itself (the only cases where [rsp] is the answer).
+        // 2) valid rbp frame link -> [rbp+8] (exact for framed functions;
+        //    avoids stale return addresses in reused stack memory).
+        // 3) upward stack scan (FPO/optimized code; heuristic).
         Registers r(currentThread()->hThread);
         ptr rsp = r.Gsp();
         ptr rbp = r.Gbp();
         ptr retAddr = 0;
         bool viaFrame = false;
+        bool viaScan = false;
 
         auto isExecutable = [this](ptr a)
         {
@@ -128,19 +130,22 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             uint8_t b[8];
             if(retva < 8 || !mProcess->MemReadSafe(retva - 8, b, sizeof(b)))
                 return false;
-            // E8 <rel32>         call rel32      (5 bytes, ends at retva-5+5)
-            if(b[3] == 0xE8)
+            if(b[3] == 0xE8)                                                  // call rel32
                 return true;
-            // FF /2 <disp32>     call [rip+disp] (6 bytes, modrm mod=00 rm=101 reg=2)
-            if(b[2] == 0xFF && ((b[3] >> 3) & 7) == 2 && (b[3] >> 6) == 0 && (b[3] & 7) == 5)
+            if(b[2] == 0xFF && ((b[3] >> 3) & 7) == 2 && (b[3] >> 6) == 0 && (b[3] & 7) == 5) // call [rip+disp]
                 return true;
-            // FF /2              call r/m        (2 bytes, e.g. call rax)
-            if(b[6] == 0xFF && ((b[7] >> 3) & 7) == 2)
+            if(b[6] == 0xFF && ((b[7] >> 3) & 7) == 2)                        // call r/m
                 return true;
             return false;
         };
 
-        if(rbp > rsp && rbp - rsp < 0x10000)
+        ptr top = 0;
+        if(mProcess->MemReadSafe(rsp, &top, sizeof(top)) && isExecutable(top) && precededByCall(top))
+        {
+            retAddr = top;
+            viaScan = true;
+        }
+        if(!retAddr && rbp > rsp && rbp - rsp < 0x10000)
         {
             ptr callerRbp = 0, candidate = 0;
             if(mProcess->MemReadSafe(rbp, &callerRbp, sizeof(callerRbp)) &&
@@ -151,17 +156,18 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                 viaFrame = true;
             }
         }
-        if(!viaFrame)
+        if(!retAddr)
         {
-            // Stack scan (FPO-friendly): first value on the stack that is an
-            // executable address immediately preceded by a call.
             for(ptr sp = rsp; sp < rsp + 0x400 && !retAddr; sp += sizeof(ptr))
             {
                 ptr candidate = 0;
                 if(!mProcess->MemReadSafe(sp, &candidate, sizeof(candidate)))
                     break;
                 if(isExecutable(candidate) && precededByCall(candidate))
+                {
                     retAddr = candidate;
+                    viaScan = true;
+                }
             }
         }
         if(!retAddr)
@@ -176,7 +182,8 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             fflush(stdout);
             return CmdResult::Handled;
         }
-        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr, viaFrame ? " (frame)" : " (stack scan)");
+        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr,
+               viaFrame ? " (frame)" : viaScan ? " (stack scan)" : "");
         fflush(stdout);
         return CmdResult::Resume;
     }

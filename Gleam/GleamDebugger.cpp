@@ -42,29 +42,61 @@ void GleamDebugger::forceBreakIn()
 
     // NOTE: DebugBreakProcess checks PEB.BeingDebugged and refuses to inject
     // when it is cleared (our "hide" does exactly that), so inject our own
-    // int3 stub thread instead: int3; jmp $ (loops until we kill it at the
-    // resulting pause).
-    static const uint8_t stub[] = { 0xCC, 0xEB, 0xFE };
+    // stub thread instead: int3, then ExitThread(0) so it cleans itself up.
+    // Race-free bookkeeping: the page is stored BEFORE the thread starts,
+    // and the break-in is identified by the exception address.
+    uint8_t stub[] = {
+        0xCC,                         // int3
+        0xB9, 0, 0, 0, 0,             // mov ecx, 0
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, ExitThread
+        0xFF, 0xD0                    // call rax
+    };
+    const uint64_t exitThread = mExitThreadAddr.load();
+    if(!exitThread)
+    {
+        printf("event breakin fallback=dbg addr=0\n");
+        fflush(stdout);
+        mBreakInExpected.store(true);
+        DebugBreakProcess(process->hProcess);
+        return;
+    }
+    memcpy(stub + 8, &exitThread, 8);
+
     auto page = VirtualAllocEx(process->hProcess, nullptr, 0x1000,
                                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if(page && WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
+    if(!page)
     {
-        HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
-                                            (LPTHREAD_START_ROUTINE)page, nullptr, 0, nullptr);
-        if(hThread)
-        {
-            // The stub is identified by its exception address (not by a
-            // flag), so the event can never outrun our bookkeeping.
-            mBreakInStubPage.store(page);
-            mBreakInStubThread.store(hThread);
-            return;
-        }
-        VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
+        printf("event breakin fallback=dbg alloc_fail=%lu\n", GetLastError());
+        fflush(stdout);
+        mBreakInExpected.store(true);
+        DebugBreakProcess(process->hProcess);
+        return;
     }
-
-    // Fallback (broken when BeingDebugged is hidden, but better than nothing).
-    mBreakInExpected.store(true);
-    DebugBreakProcess(process->hProcess);
+    // The page IS the break-in identity: publish it before the thread exists.
+    mBreakInStubPage.store(page);
+    if(!WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
+    {
+        printf("event breakin fallback=dbg write_fail=%lu\n", GetLastError());
+        fflush(stdout);
+        mBreakInStubPage.store(nullptr);
+        VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
+        mBreakInExpected.store(true);
+        DebugBreakProcess(process->hProcess);
+        return;
+    }
+    HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
+                                        (LPTHREAD_START_ROUTINE)page, nullptr, 0, nullptr);
+    if(!hThread)
+    {
+        printf("event breakin fallback=dbg thread_fail=%lu\n", GetLastError());
+        fflush(stdout);
+        mBreakInStubPage.store(nullptr);
+        VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
+        mBreakInExpected.store(true);
+        DebugBreakProcess(process->hProcess);
+        return;
+    }
+    mBreakInStubThread.store(hThread);
 }
 
 bool GleamDebugger::isPaused() const
@@ -134,6 +166,15 @@ void GleamDebugger::cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & creat
 
     if(mBreakOnEntry)
         applyEntryBreakpoint();
+
+    // Cache kernel32!ExitThread for the break-in stub (resolved here on the
+    // debugger thread; dbghelp is not thread-safe).
+    if(!mExitThreadAddr.load())
+    {
+        uint64_t addr = 0;
+        if(parseAddress("kernel32!ExitThread", addr))
+            mExitThreadAddr.store(addr);
+    }
 }
 
 void GleamDebugger::cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const Process & process)
@@ -200,6 +241,12 @@ void GleamDebugger::cbAttachBreakpoint()
 {
     // Fired (instead of the system breakpoint) when attached to a process.
     emitStop("attach", nullptr);
+    if(!mExitThreadAddr.load())
+    {
+        uint64_t addr = 0;
+        if(parseAddress("kernel32!ExitThread", addr))
+            mExitThreadAddr.store(addr);
+    }
     mWantsPause = true;
 }
 

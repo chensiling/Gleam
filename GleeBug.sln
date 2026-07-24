@@ -24,6 +24,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Gleam", "Gleam\Gleam.vcxpro
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TestTarget", "TestTarget\TestTarget.vcxproj", "{5F1A2B3C-4D5E-4F6A-9B8C-7D6E5F4A3B2C}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ArgvTarget", "ArgvTarget\ArgvTarget.vcxproj", "{CD3F96C4-C552-43D3-ADEC-9CE05FE4DF29}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "BoundaryTarget", "BoundaryTarget\BoundaryTarget.vcxproj", "{1C26501A-2AC1-4C75-9F72-992552374D0F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -54,6 +58,14 @@ Global
 		{5F1A2B3C-4D5E-4F6A-9B8C-7D6E5F4A3B2C}.Debug|x64.Build.0 = Debug|x64
 		{5F1A2B3C-4D5E-4F6A-9B8C-7D6E5F4A3B2C}.Release|x64.ActiveCfg = Release|x64
 		{5F1A2B3C-4D5E-4F6A-9B8C-7D6E5F4A3B2C}.Release|x64.Build.0 = Release|x64
+		{CD3F96C4-C552-43D3-ADEC-9CE05FE4DF29}.Debug|x64.ActiveCfg = Debug|x64
+		{CD3F96C4-C552-43D3-ADEC-9CE05FE4DF29}.Debug|x64.Build.0 = Debug|x64
+		{CD3F96C4-C552-43D3-ADEC-9CE05FE4DF29}.Release|x64.ActiveCfg = Release|x64
+		{CD3F96C4-C552-43D3-ADEC-9CE05FE4DF29}.Release|x64.Build.0 = Release|x64
+		{1C26501A-2AC1-4C75-9F72-992552374D0F}.Debug|x64.ActiveCfg = Debug|x64
+		{1C26501A-2AC1-4C75-9F72-992552374D0F}.Debug|x64.Build.0 = Debug|x64
+		{1C26501A-2AC1-4C75-9F72-992552374D0F}.Release|x64.ActiveCfg = Release|x64
+		{1C26501A-2AC1-4C75-9F72-992552374D0F}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

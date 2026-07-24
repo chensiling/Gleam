@@ -185,6 +185,7 @@ private:
     std::atomic<bool> mPauseAfterResume{ false }; // "pause" arrived while paused
     std::atomic<HANDLE> mBreakInStubThread{ nullptr }; // injected int3-stub thread
     std::atomic<void*> mBreakInStubPage{ nullptr };    // page backing the stub
+    std::atomic<uint64_t> mExitThreadAddr{ 0 };        // kernel32!ExitThread in the debuggee
     bool mWantsPause = false;
     bool mStepArmed = false;      // a user-requested step is in flight
     bool mStepOverArmed = false;  // a user-requested step-over is in flight

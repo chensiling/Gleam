@@ -453,6 +453,118 @@ for i in $(seq 1 25); do
 done
 if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK/25 pause injections"; fi
 
+# --- T1: argv quoting matrix ---
+echo "== T1 =="
+timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe "" "a b" "$(printf 'x\ty')" "quote\"in" 'trail\' > /tmp/gleam_T1.txt 2>&1 <<'EOF'
+g
+EOF
+chk "T1: argc"                   /tmp/gleam_T1.txt "ARGC=6"
+chk "T1: empty arg kept"         /tmp/gleam_T1.txt "ARGV[1]=[]"
+chk "T1: space arg"              /tmp/gleam_T1.txt "ARGV[2]=[a b]"
+chk "T1: tab arg"                /tmp/gleam_T1.txt "$(printf 'ARGV[3]=[x\ty]')"
+chk "T1: embedded quote"         /tmp/gleam_T1.txt 'ARGV[4]=[quote"in]'
+chk "T1: trailing backslash"     /tmp/gleam_T1.txt 'ARGV[5]=[trail\]'
+
+# --- T2: cross-chunk instruction scan ---
+echo "== T2 =="
+timeout 30 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/BoundaryTarget.exe > /tmp/gleam_T2.txt 2>&1 <<'EOF'
+g
+xref 60000000
+quit
+EOF
+chk "T2: straddler found"        /tmp/gleam_T2.txt "0x00000000600FFFFD  call 0x0000000060000000"
+chk "T2: both calls found"       /tmp/gleam_T2.txt "2 references to 0x60000000"
+
+# --- T3: patch matrix (containment / adjacent / extend-right / left-overlap) ---
+run T3 "" <<'EOF'
+bp 140070EC9
+g
+patch 140190000 AA AA AA AA
+patch 140190002 BB
+restore 140190000
+read 140190000 4
+patch 140190000 CC
+patch 140190002 DD
+restore 140190002
+restore 140190000
+read 140190000 4
+patch 140190004 EE EE
+patch 140190004 FF FF FF FF
+restore 140190004
+read 140190004 6
+patch 140190006 11 22
+patch 140190004 33 33 33 33
+restore 140190004
+read 140190004 6
+g
+g
+EOF
+chk "T3: containment restored"   /tmp/gleam_T3.txt "47 4C 45 41"
+chkcount "T3: gdata restored 2x" /tmp/gleam_T3.txt "47 4C 45 41" 2
+chkcount "T3: tail restored 2x"  /tmp/gleam_T3.txt "4D 2D 54 45" 2
+
+# --- T4a: one-shot + ignore (hit ignored, bp still deleted) ---
+run T4a "" <<'EOF'
+bp 1400708AC once
+ignore 1400708AC 1
+g
+g
+EOF
+chk "T4a: one-shot ignored once" /tmp/gleam_T4a.txt "event ignored address=0x1400708AC left=0"
+chkcount "T4a: no bp pause"      /tmp/gleam_T4a.txt "stop reason=breakpoint" 0
+chk "T4a: results correct"       /tmp/gleam_T4a.txt "MARKER_RESULT_2=13"
+
+# --- T4b: one-shot + do g (hit auto-continues, bp deleted, second call no hit) ---
+run T4b "" <<'EOF'
+bp 1400708AC once do g
+g
+g
+EOF
+chkcount "T4b: no bp pause"      /tmp/gleam_T4b.txt "stop reason=breakpoint" 0
+chk "T4b: results correct"       /tmp/gleam_T4b.txt "MARKER_RESULT_2=13"
+
+# --- T5: ret at function entry and at the ret instruction ---
+run T5 "" <<'EOF'
+bp 140070EC9
+g
+ret
+regs
+g
+g
+EOF
+chk "T5: ret at entry"           /tmp/gleam_T5.txt "stepping out to 0x140076E94 (stack scan)"
+run T5b "" <<'EOF'
+bp 140070EC9
+g
+until 140076BAE
+ret
+regs
+g
+g
+EOF
+chk "T5: ret at ret insn"        /tmp/gleam_T5b.txt "stepping out to 0x140076E94 (stack scan)"
+
+# --- S2: 100 pause injections (reviewer-standard stress) ---
+echo "== S2 =="
+S2OK=0
+for i in $(seq 1 100); do
+  out=$(printf 'g\npause\ndetach\n' | timeout 30 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
+  [ "$n" -eq 1 ] && S2OK=$((S2OK+1))
+  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  sleep 0.3  # let the previous notepad fully exit before the next launch
+done
+if [ "$S2OK" -eq 100 ]; then ok "S2: 100/100 pause injections"; else bad "S2: $S2OK/100 pause injections"; fi
+
+# --- S3: 100 quick sessions (REPL lifecycle) ---
+echo "== S3 =="
+S3OK=0
+for i in $(seq 1 100); do
+  printf 'quit\n' | timeout 10 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe > /dev/null 2>&1
+  [ $? -eq 0 ] && S3OK=$((S3OK+1))
+done
+if [ "$S3OK" -eq 100 ]; then ok "S3: 100/100 sessions exited"; else bad "S3: $S3OK/100 sessions exited"; fi
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
