@@ -68,6 +68,15 @@ namespace
             return 0;
         return peb;
     }
+    // Write bytes and record the originals for a later "hide off" restore.
+    void recordAndWrite(GleeBug::Process* process, uint64_t addr, const void* data, size_t size,
+                        std::vector<std::pair<uint64_t, std::vector<uint8_t>>> & originals)
+    {
+        std::vector<uint8_t> before(size);
+        if(process->MemReadSafe(addr, before.data(), size) &&
+           process->MemWriteSafe(addr, data, size))
+            originals.emplace_back(addr, std::move(before));
+    }
 }
 
 void GleamDebugger::applyHides()
@@ -78,6 +87,7 @@ void GleamDebugger::applyHides()
         fflush(stdout);
         return;
     }
+    mHideOriginals.clear();
 
     // 1) PEB flags.
     auto peb = pebAddress(mProcess, mThread->hThread);
@@ -89,8 +99,8 @@ void GleamDebugger::applyHides()
     }
     uint8_t zero8 = 0;
     uint32_t zero32 = 0;
-    mProcess->MemWriteSafe(peb + kPebBeingDebugged, &zero8, sizeof(zero8));
-    mProcess->MemWriteSafe(peb + kPebNtGlobalFlag, &zero32, sizeof(zero32));
+    recordAndWrite(mProcess, peb + kPebBeingDebugged, &zero8, sizeof(zero8), mHideOriginals);
+    recordAndWrite(mProcess, peb + kPebNtGlobalFlag, &zero32, sizeof(zero32), mHideOriginals);
     printf("hide: PEB.BeingDebugged=0, PEB.NtGlobalFlag=0\n");
 
     // 2) Process heap debug bits.
@@ -100,13 +110,13 @@ void GleamDebugger::applyHides()
         uint32_t flags = 0, forceFlags = 0;
         if(mProcess->MemReadSafe(heap + kHeapFlags, &flags, sizeof(flags)))
         {
-            flags &= ~kHeapDebugBits;
-            mProcess->MemWriteSafe(heap + kHeapFlags, &flags, sizeof(flags));
+            uint32_t cleaned = flags & ~kHeapDebugBits;
+            recordAndWrite(mProcess, heap + kHeapFlags, &cleaned, sizeof(cleaned), mHideOriginals);
         }
         if(mProcess->MemReadSafe(heap + kHeapForceFlags, &forceFlags, sizeof(forceFlags)))
         {
-            forceFlags &= ~kHeapDebugBits;
-            mProcess->MemWriteSafe(heap + kHeapForceFlags, &forceFlags, sizeof(forceFlags));
+            uint32_t cleaned = forceFlags & ~kHeapDebugBits;
+            recordAndWrite(mProcess, heap + kHeapForceFlags, &cleaned, sizeof(cleaned), mHideOriginals);
         }
         printf("hide: ProcessHeap Flags/ForceFlags cleaned\n");
     }
@@ -128,7 +138,9 @@ void GleamDebugger::applyHides()
         uint64_t addr = 0;
         if(!parseAddress(p.sym, addr) || !addr)
             continue;
-        if(mProcess->MemWriteSafe(addr, p.code, p.size))
+        size_t before = mHideOriginals.size();
+        recordAndWrite(mProcess, addr, p.code, p.size, mHideOriginals);
+        if(mHideOriginals.size() > before)
             patchedApis++;
     }
     printf("hide: patched %d API(s); NOTE: NtQueryInformationProcess checks are NOT hidden\n", patchedApis);
@@ -141,5 +153,14 @@ void GleamDebugger::cmdHide(bool on)
     printf("hide=%s\n", on ? "on" : "off");
     fflush(stdout);
     if(on)
+    {
         applyHides();
+        return;
+    }
+    // Restore everything applyHides changed, in reverse order.
+    for(auto it = mHideOriginals.rbegin(); it != mHideOriginals.rend(); ++it)
+        mProcess->MemWriteSafe(it->first, it->second.data(), it->second.size());
+    printf("hide: restored %zu modification(s)\n", mHideOriginals.size());
+    mHideOriginals.clear();
+    fflush(stdout);
 }

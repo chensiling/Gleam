@@ -43,6 +43,11 @@ gleam -a <pid>                 :: 附加到运行中的进程
 - 只有 `pause` 能在目标运行时生效（`DebugBreakProcess` 断入）
 - `detach`/`quit` 对运行中的目标不立即生效，先 `pause` 再执行
 - 目标与调试器共享控制台输出，便于脚本断言
+- `pause` 通过注入远程 int3 stub 线程实现（不用 `DebugBreakProcess`——它会检查 PEB.BeingDebugged，与 `hide` 冲突）
+
+### 平台
+
+仅 x64。Win32 构建配置已移除（GleeBug 引擎源码仍支持 x86，本项目暂未启用）。
 
 ### 命令一览
 
@@ -130,7 +135,7 @@ echo bp 140070EC9 & echo g & echo regs & echo read 140190000 10 & echo g | gleam
 bash run_tests.sh
 ```
 
-11 个场景 42 项断言，覆盖断点、执行控制、内存/寄存器读写、反汇编、符号枚举、异常过滤、脱离等。`TestTarget` 工程是被调试目标，固定基址（无 ASLR）保证地址稳定可断言。
+27 个场景 80 项断言，覆盖断点、执行控制、内存/寄存器读写、反汇编、符号枚举、异常过滤、脱离、跟踪、补丁等。`TestTarget` 工程是被调试目标，固定基址（无 ASLR）保证地址稳定可断言。
 
 ## 架构
 

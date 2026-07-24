@@ -237,7 +237,11 @@ bool GleamDebugger::parseAddress(const std::string & s, uint64_t & out)
 bool GleamDebugger::ensureSymSession()
 {
     if(mSymInitialized)
+    {
+        // Keep dbghelp's module list in sync with runtime DLL loads/unloads.
+        SymRefreshModuleList(mProcess->hProcess);
         return true;
+    }
     if(!mProcess)
         return false;
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
@@ -307,7 +311,7 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     // Bound imports.
     if(pe.importDir.VirtualAddress)
     {
-        for(uint32_t i = 0;; i++)
+        for(uint32_t i = 0; i < 1024; i++)
         {
             IMAGE_IMPORT_DESCRIPTOR desc;
             if(!readAt(mProcess, mod.base + pe.importDir.VirtualAddress + i * sizeof(desc), desc))
@@ -317,7 +321,7 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
             auto dllName = readCString(mProcess, mod.base + desc.Name);
             printf("%s:\n", dllName.c_str());
             groups++;
-            for(uint32_t t = 0;; t++)
+            for(uint32_t t = 0; t < 65536; t++)
             {
                 uint64_t slotAddr = mod.base + desc.FirstThunk + t * thunkSize;
                 uint64_t value = 0;
@@ -349,7 +353,7 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     // Delay-loaded imports.
     if(pe.delayImportDir.VirtualAddress)
     {
-        for(uint32_t i = 0;; i++)
+        for(uint32_t i = 0; i < 1024; i++)
         {
             ImgDelayDescr desc{};
             if(!readAt(mProcess, mod.base + pe.delayImportDir.VirtualAddress + i * sizeof(desc), desc))
@@ -363,7 +367,7 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
             auto dllName = readCString(mProcess, nameAddr);
             printf("%s (delay):\n", dllName.c_str());
             groups++;
-            for(uint32_t t = 0;; t++)
+            for(uint32_t t = 0; t < 65536; t++)
             {
                 uint64_t slotAddr = iatAddr + t * thunkSize;
                 uint64_t value = 0;

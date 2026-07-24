@@ -104,14 +104,41 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "ret" || cmd == "stepout")
     {
-        // No frame analysis: the return address sits at [rsp] when stopped
-        // inside a function. One-shot breakpoint there, then continue.
+        // Return address resolution:
+        // - inside a framed function, it lives at [rbp+8]
+        // - right after a call (before the prologue), it lives at [rsp]
+        // Prefer the frame pointer when rbp looks like a valid frame link.
         Registers r(currentThread()->hThread);
         ptr rsp = r.Gsp();
+        ptr rbp = r.Gbp();
         ptr retAddr = 0;
-        if(!mProcess->MemReadSafe(rsp, &retAddr, sizeof(retAddr)))
+        bool viaFrame = false;
+        if(rbp > rsp && rbp - rsp < 0x10000)
+        {
+            ptr callerRbp = 0, candidate = 0;
+            if(mProcess->MemReadSafe(rbp, &callerRbp, sizeof(callerRbp)) &&
+               mProcess->MemReadSafe(rbp + sizeof(rbp), &candidate, sizeof(candidate)) &&
+               callerRbp >= rbp && candidate != 0)
+            {
+                MEMORY_BASIC_INFORMATION mbi;
+                if(VirtualQueryEx(mProcess->hProcess, (LPCVOID)candidate, &mbi, sizeof(mbi)) &&
+                   mbi.State == MEM_COMMIT &&
+                   (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                {
+                    retAddr = candidate;
+                    viaFrame = true;
+                }
+            }
+        }
+        if(!viaFrame && !mProcess->MemReadSafe(rsp, &retAddr, sizeof(retAddr)))
         {
             printf("failed to read the stack at 0x%llX\n", (unsigned long long)rsp);
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        if(!retAddr)
+        {
+            printf("no plausible return address on the stack\n");
             fflush(stdout);
             return CmdResult::Handled;
         }
@@ -121,7 +148,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             fflush(stdout);
             return CmdResult::Handled;
         }
-        printf("stepping out to 0x%llX\n", (unsigned long long)retAddr);
+        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr, viaFrame ? " (frame)" : "");
         fflush(stdout);
         return CmdResult::Resume;
     }
@@ -322,6 +349,12 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                 {
                     *sw.flag = false;
                     printf("breakon %s=off\n", sw.name);
+                    // Disarm a pending OEP breakpoint when entry breaks are off.
+                    if(sw.flag == &mBreakOnEntry && mOepBreakpoint)
+                    {
+                        mProcess->DeleteBreakpoint(mOepBreakpoint);
+                        mOepBreakpoint = 0;
+                    }
                 }
                 else
                     printf("usage: breakon <entry|dll|thread|exception> [on|off]\n");

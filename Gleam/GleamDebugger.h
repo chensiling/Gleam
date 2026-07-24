@@ -206,6 +206,7 @@ private:
     bool mSymInitialized = false;                  // dbghelp session is up
     bool mHideOn = false;                          // anti-anti-debug enabled
     std::map<uint64_t, std::vector<uint8_t>> mPatches; // patch addr -> original bytes
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> mHideOriginals; // hide writes, for restore
 };
 
 #endif //GLEAM_DEBUGGER_H

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <thread>
 
@@ -33,12 +34,11 @@ static std::string toUtf8(const wchar_t* wide)
 
 static void replThread(GleamDebugger* dbg)
 {
+    // std::getline handles arbitrarily long commands (no fixed buffer).
     std::string line;
-    char buf[1024];
-    while(fgets(buf, sizeof(buf), stdin))
+    while(std::getline(std::cin, line))
     {
-        line = buf;
-        while(!line.empty() && (line.back() == '\n' || line.back() == '\r'))
+        while(!line.empty() && line.back() == '\r')
             line.pop_back();
         if(!line.empty())
         {
@@ -47,7 +47,7 @@ static void replThread(GleamDebugger* dbg)
             // suspended state - to detach/quit a running debuggee, issue
             // "pause" first. This keeps scripted command order deterministic.
             if(line == "pause")
-            dbg->requestPause(); // deferral handled internally
+                dbg->requestPause(); // deferral handled internally
             else
                 dbg->pushCommand(line);
         }
@@ -95,7 +95,12 @@ int wmain(int argc, wchar_t* argv[])
         {
             if(!commandLine.empty())
                 commandLine += L' ';
-            commandLine += argv[i];
+            // Quote arguments containing whitespace so the target's own
+            // command-line parser sees them as a single argument.
+            if(wcscspn(argv[i], L" \t\"") != wcslen(argv[i]))
+                commandLine += L'"' + std::wstring(argv[i]) + L'"';
+            else
+                commandLine += argv[i];
         }
         // newConsole=false: the debuggee shares our console so its output is captured too.
         if(!dbg.Init(filePath.c_str(), commandLine.empty() ? nullptr : commandLine.c_str(), nullptr, false))
@@ -108,8 +113,8 @@ int wmain(int argc, wchar_t* argv[])
     fflush(stdout);
 
     std::thread repl(replThread, &dbg);
+    repl.detach(); // blocked on stdin; dies with the process
     dbg.Start();
-    repl.join();
 
     printf("[gleam] session finished%s\n", attached ? " (detached or target exited)" : "");
     fflush(stdout);

@@ -125,7 +125,7 @@ run G "exc" <<'EOF'
 ignoreexc E0DEAD00
 g
 EOF
-chk "G: exception ignored"       /tmp/gleam_G.txt "action=ignored"
+chk "G: exception passed"        /tmp/gleam_G.txt "action=passed-to-debuggee"
 chk "G: survived"                /tmp/gleam_G.txt "SURVIVED_EXCEPTION"
 chk "G: exit 0"                  /tmp/gleam_G.txt "stop reason=exit code=0x00000000"
 
@@ -320,6 +320,57 @@ g
 EOF
 chkcount "P3: no bp pause"       /tmp/gleam_P3.txt "stop reason=breakpoint" 0
 chk "P3: results correct"        /tmp/gleam_P3.txt "MARKER_RESULT_2=13"
+
+# --- Q1: one-shot bp rule not inherited (re-arm at same addr refires once, expected) ---
+run Q1 "" <<'EOF'
+bp 1400708AC once do regs
+g
+bp 1400708AC
+g
+g
+g
+EOF
+chkcount "Q1: 1 one-shot + 1 refire + 1 call-2" /tmp/gleam_Q1.txt "stop reason=breakpoint" 3
+chk "Q1: results correct"        /tmp/gleam_Q1.txt "MARKER_RESULT_2=13"
+
+# --- Q2: breakon entry off disarms OEP breakpoint ---
+run Q2 "" <<'EOF'
+breakon entry on
+breakon entry off
+g
+EOF
+chkcount "Q2: no entry stop"     /tmp/gleam_Q2.txt "stop reason=entry" 0
+
+# --- Q3: double patch restores the true original ---
+run Q3 "" <<'EOF'
+bp 140070EC9
+g
+patch 140190000 AA BB
+patch 140190000 CC DD
+restore 140190000
+read 140190000 4
+g
+g
+EOF
+chk "Q3: restored to original"   /tmp/gleam_Q3.txt "47 4C 45 41"
+
+# --- Q4: ret via frame pointer ---
+run Q4 "" <<'EOF'
+bp 140070EC9
+g
+step
+stepover
+stepover
+stepover
+stepover
+stepover
+stepover
+stepover
+ret
+g
+g
+EOF
+chk "Q4: frame-based return"     /tmp/gleam_Q4.txt "(frame)"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

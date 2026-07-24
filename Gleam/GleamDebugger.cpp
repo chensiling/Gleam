@@ -35,6 +35,11 @@ void GleamDebugger::forceBreakIn()
     if(!process)
         return;
 
+    // A stub break-in is already in flight: don't inject another one (the
+    // pending event will arrive and clean itself up).
+    if(mBreakInStubThread || mBreakInStubPage)
+        return;
+
     // NOTE: DebugBreakProcess checks PEB.BeingDebugged and refuses to inject
     // when it is cleared (our "hide" does exactly that), so inject our own
     // int3 stub thread instead: int3; jmp $ (loops until we kill it at the
@@ -234,6 +239,14 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
         sprintf_s(details, "type=%s address=0x%llX", typeText, (unsigned long long)info.address);
         emitStop("breakpoint", details);
     }
+    // One-shot breakpoints are deleted by the engine on hit; drop the
+    // associated rule/ignore state so a later breakpoint at the same
+    // address does not inherit them.
+    if(info.singleshoot)
+    {
+        mBpRules.erase(info.address);
+        mIgnoreHits.erase(info.address);
+    }
     mWantsPause = true;
 }
 
@@ -307,12 +320,13 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
         return;
     }
 
-    // Filtered exception codes are passed back to the debuggee without pausing.
+    // Filtered exception codes are passed to the debuggee's own handlers
+    // (DBG_EXCEPTION_NOT_HANDLED) without pausing - NOT DBG_CONTINUE, which
+    // would swallow the exception entirely.
     if(mIgnoredExceptions.count(exceptionRecord.ExceptionCode))
     {
-        printf("event exception code=0x%08lX action=ignored\n", exceptionRecord.ExceptionCode);
+        printf("event exception code=0x%08lX action=passed-to-debuggee\n", exceptionRecord.ExceptionCode);
         fflush(stdout);
-        mContinueStatus = DBG_CONTINUE;
         return;
     }
 

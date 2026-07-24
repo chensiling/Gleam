@@ -215,6 +215,12 @@ void GleamDebugger::cmdModules()
 
 void GleamDebugger::cmdFind(uint64_t addr, uint64_t size, const std::string & pattern)
 {
+    if(size == 0 || size > 0x10000000)
+    {
+        printf("invalid size (1..256MB)\n");
+        fflush(stdout);
+        return;
+    }
     auto found = mProcess->MemFindPattern(addr, (size_t)size, pattern);
     if(found)
         printf("found at 0x%llX\n", (unsigned long long)found);
@@ -228,6 +234,12 @@ void GleamDebugger::cmdFindString(uint64_t addr, uint64_t size, const std::strin
     if(text.empty())
     {
         printf("empty string\n");
+        fflush(stdout);
+        return;
+    }
+    if(size == 0 || size > 0x10000000)
+    {
+        printf("invalid size (1..256MB)\n");
         fflush(stdout);
         return;
     }
@@ -299,7 +311,10 @@ void GleamDebugger::cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes)
         fflush(stdout);
         return;
     }
-    mPatches[addr] = original;
+    // Keep the FIRST original: re-patching an already patched address must not
+    // clobber the bytes we would restore to.
+    if(mPatches.find(addr) == mPatches.end())
+        mPatches[addr] = original;
     printf("patched 0x%llX (%zu bytes)\n", addr, bytes.size());
     fflush(stdout);
 }

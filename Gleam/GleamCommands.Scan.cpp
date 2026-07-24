@@ -50,10 +50,14 @@ namespace
         }
     }
 
-    // Decode one instruction at addr from buf (up to 16 bytes).
-    bool decodeAt(const uint8_t* buf, uint64_t addr, ZydisDisassembledInstruction & out)
+    // Decode one instruction at addr from buf (up to avail bytes, max 16).
+    bool decodeAt(const uint8_t* buf, size_t avail, uint64_t addr, ZydisDisassembledInstruction & out)
     {
-        return ZYAN_SUCCESS(ZydisDisassembleIntel(kScanMode, addr, buf, 16, &out));
+        if(avail > 16)
+            avail = 16;
+        if(avail == 0)
+            return false;
+        return ZYAN_SUCCESS(ZydisDisassembleIntel(kScanMode, addr, buf, avail, &out));
     }
 
     // If the instruction transfers control to a computed target, return it.
@@ -126,7 +130,7 @@ void GleamDebugger::cmdXref(uint64_t target)
             {
                 uint64_t ia = base + off + i;
                 ZydisDisassembledInstruction insn;
-                if(!decodeAt(buf.data() + i, ia, insn) || insn.info.length == 0)
+                if(!decodeAt(buf.data() + i, chunk - i, ia, insn) || insn.info.length == 0)
                 {
                     i++;
                     continue;
@@ -182,7 +186,7 @@ void GleamDebugger::cmdFindAsm(const std::string & text)
             {
                 uint64_t ia = base + off + i;
                 ZydisDisassembledInstruction insn;
-                if(!decodeAt(buf.data() + i, ia, insn) || insn.info.length == 0)
+                if(!decodeAt(buf.data() + i, chunk - i, ia, insn) || insn.info.length == 0)
                 {
                     i++;
                     continue;
