@@ -126,6 +126,17 @@ void GleamDebugger::cmdDisasm(uint64_t addr, uint64_t count)
     fflush(stdout);
 }
 
+std::string GleamDebugger::disasmOne(uint64_t addr)
+{
+    uint8_t data[16];
+    if(!mProcess->MemReadSafe(addr, data, sizeof(data)))
+        return std::string();
+    ZydisDisassembledInstruction instruction;
+    if(!ZYAN_SUCCESS(ZydisDisassembleIntel(kMachineMode, addr, data, sizeof(data), &instruction)))
+        return std::string();
+    return std::string(instruction.text);
+}
+
 static const char* protectText(DWORD protect)
 {
     switch(protect & 0xFF)

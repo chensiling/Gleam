@@ -292,5 +292,34 @@ EOF
 chkre "O3: suspend ok"           /tmp/gleam_O3.txt "suspend thread [0-9]+: ok"
 chkre "O3: resume ok"            /tmp/gleam_O3.txt "resume thread [0-9]+: ok"
 
+# --- P1: conditional tracing ---
+run P1 "" <<'EOF'
+bp 140070EC9
+g
+tgo rcx==29 100
+regs
+g
+g
+EOF
+chk "P1: trace stops on condition" /tmp/gleam_P1.txt "stop reason=trace condition steps=1"
+chk "P1: rip at real body"       /tmp/gleam_P1.txt "RIP=0000000140076B70"
+
+# --- P2: bp do <command> (non-resume) ---
+run P2 "" <<'EOF'
+bp 140070EC9 do regs
+g
+g
+g
+EOF
+chkcount "P2: regs dumped twice" /tmp/gleam_P2.txt "RAX=" 2
+
+# --- P3: bp do g (resume-type, no pause) ---
+run P3 "" <<'EOF'
+bp 1400708AC do g
+g
+EOF
+chkcount "P3: no bp pause"       /tmp/gleam_P3.txt "stop reason=breakpoint" 0
+chk "P3: results correct"        /tmp/gleam_P3.txt "MARKER_RESULT_2=13"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"

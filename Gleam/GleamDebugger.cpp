@@ -206,6 +206,36 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
 
 void GleamDebugger::cbStep()
 {
+    // Conditional tracing ("tgo"): keep stepping in the core until the
+    // condition holds or the step cap is reached.
+    if(mTraceActive)
+    {
+        mTraceCount++;
+        Registers r(mThread->hThread);
+        auto rip = r.Gip();
+        if(mTraceLog)
+        {
+            auto text = disasmOne(rip);
+            printf("trace rip=0x%llX %s\n", (unsigned long long)rip, text.c_str());
+            fflush(stdout);
+        }
+        bool done = evalCondition(mTraceCondReg, mTraceCondOp, mTraceCondValue);
+        bool capped = mTraceCount >= mTraceMax;
+        if(done || capped)
+        {
+            mTraceActive = false;
+            mStepArmed = false;
+            char details[96];
+            sprintf_s(details, "%s steps=%llu", capped && !done ? "maxreached" : "condition",
+                      (unsigned long long)mTraceCount);
+            emitStop("trace", details);
+            mWantsPause = true;
+            return;
+        }
+        currentThread()->StepInto(); // mStepArmed stays armed
+        return;
+    }
+
     // Only pause for user-requested steps; GleeBug also steps internally
     // (e.g. to restore software breakpoints).
     if(mStepArmed)

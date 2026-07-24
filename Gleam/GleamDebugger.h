@@ -122,9 +122,12 @@ private:
         int condOp = 0;                  // 0:==, 1:!=, 2:<, 3:>
         uint64_t condValue = 0;
         bool trace = false;              // tracepoint: log and auto-continue
+        std::string command;             // bp do <command>: run on hit
     };
     std::map<GleeBug::ptr, BpRule> mBpRules;
     bool evalBpRule(const GleeBug::BreakpointInfo & info); // true = pause normally
+    bool evalCondition(RegId reg, int op, uint64_t value); // current thread registers
+    static bool parseCondition(const std::string & text, RegId & reg, int & op, uint64_t & value);
 
     // Hide.cpp: anti-anti-debug.
     void cmdHide(bool on);
@@ -133,6 +136,18 @@ private:
     // Scan.cpp: code scanning (xref, findasm).
     void cmdXref(uint64_t target);
     void cmdFindAsm(const std::string & text);
+
+    // Inspect.cpp
+    std::string disasmOne(uint64_t addr);
+
+    // Control.cpp: conditional tracing ("tgo").
+    bool mTraceActive = false;
+    RegId mTraceCondReg = RegId::Invalid;
+    int mTraceCondOp = 0;
+    uint64_t mTraceCondValue = 0;
+    uint64_t mTraceMax = 0;
+    uint64_t mTraceCount = 0;
+    bool mTraceLog = false;
 
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();

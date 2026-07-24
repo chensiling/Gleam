@@ -82,9 +82,38 @@ void GleamDebugger::cmdBreakpointList()
     fflush(stdout);
 }
 
+// Evaluate a register condition against the current thread's registers.
+bool GleamDebugger::evalCondition(RegId reg, int op, uint64_t value)
+{
+    Registers r(mThread->hThread);
+    auto v = r.Get(reg);
+    switch(op)
+    {
+    case 0: return v == value;
+    case 1: return v != value;
+    case 2: return v < value;
+    case 3: return v > value;
+    default: return false;
+    }
+}
+
+// Parse "<reg><op><hexval>" (op: == != < >).
+bool GleamDebugger::parseCondition(const std::string & text, RegId & reg, int & op, uint64_t & value)
+{
+    size_t pos = text.find("==");
+    op = 0;
+    if(pos == std::string::npos) { pos = text.find("!="); op = 1; }
+    if(pos == std::string::npos) { pos = text.find('<'); op = 2; }
+    if(pos == std::string::npos) { pos = text.find('>'); op = 3; }
+    if(pos == std::string::npos || pos == 0)
+        return false;
+    return registerByName(text.substr(0, pos), reg) &&
+           parseHex(text.substr(pos + (op <= 1 ? 2 : 1)), value);
+}
+
 // Evaluate the hit-time rule for a breakpoint. Returns true when the hit
 // should pause normally; false when it should auto-continue (condition not
-// met, or tracepoint logged).
+// met, tracepoint logged, or a resume-type "do" command ran).
 bool GleamDebugger::evalBpRule(const BreakpointInfo & info)
 {
     auto it = mBpRules.find(info.address);
@@ -92,21 +121,8 @@ bool GleamDebugger::evalBpRule(const BreakpointInfo & info)
         return true;
     const auto & rule = it->second;
 
-    if(rule.condReg != RegId::Invalid)
-    {
-        Registers r(mThread->hThread);
-        auto value = r.Get(rule.condReg);
-        bool pass = false;
-        switch(rule.condOp)
-        {
-        case 0: pass = value == rule.condValue; break;
-        case 1: pass = value != rule.condValue; break;
-        case 2: pass = value < rule.condValue; break;
-        case 3: pass = value > rule.condValue; break;
-        }
-        if(!pass)
-            return false;
-    }
+    if(rule.condReg != RegId::Invalid && !evalCondition(rule.condReg, rule.condOp, rule.condValue))
+        return false;
 
     if(rule.trace)
     {
@@ -118,6 +134,12 @@ bool GleamDebugger::evalBpRule(const BreakpointInfo & info)
         fflush(stdout);
         return false;
     }
+
+    // "bp <addr> do <command>": run the command in the suspended context.
+    // Resume-type commands (g/step/...) mean: don't pause.
+    if(!rule.command.empty())
+        return !executeCommand(rule.command);
+
     return true;
 }
 
@@ -126,7 +148,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
     const std::string & cmd = args[0];
     uint64_t a = 0, b = 0;
 
-    // bp <addr> [once] [if <reg><op><hexval>]   (op: == != < >)
+    // bp <addr> [once] [if <reg><op><hexval>] [do <command...>]
     if(cmd == "bp" && args.size() >= 2 && parseAddress(args[1], a))
     {
         bool once = false;
@@ -138,24 +160,32 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
                 once = true;
             else if(args[i] == "if" && i + 1 < args.size())
             {
-                const std::string & cond = args[i + 1];
-                size_t op = cond.find("==");
-                rule.condOp = 0;
-                if(op == std::string::npos) { op = cond.find("!="); rule.condOp = 1; }
-                if(op == std::string::npos) { op = cond.find('<'); rule.condOp = 2; }
-                if(op == std::string::npos) { op = cond.find('>'); rule.condOp = 3; }
-                if(op == std::string::npos || op == 0 ||
-                   !registerByName(cond.substr(0, op), rule.condReg) ||
-                   !parseHex(cond.substr(op + (rule.condOp <= 1 ? 2 : 1)), rule.condValue))
+                if(!parseCondition(args[i + 1], rule.condReg, rule.condOp, rule.condValue))
                     badArgs = true;
                 i++;
+            }
+            else if(args[i] == "do" && i + 1 < args.size())
+            {
+                for(size_t j = i + 1; j < args.size(); j++)
+                {
+                    if(!rule.command.empty())
+                        rule.command += ' ';
+                    rule.command += args[j];
+                }
+                break;
             }
             else
                 badArgs = true;
         }
         if(badArgs)
         {
-            printf("usage: bp <addr> [once] [if <reg><==|!=|<|>><hexval>]\n");
+            printf("usage: bp <addr> [once] [if <reg><==|!=|<|>><hexval>] [do <command...>]\n");
+        }
+        else if(mProcess->SetBreakpoint(a, once))
+        {
+            if(rule.condReg != RegId::Invalid || rule.trace || !rule.command.empty())
+                mBpRules[a] = rule;
+            printf("%sbreakpoint set at 0x%llX\n", once ? "one-shot " : "", a);
         }
         else if(mProcess->SetBreakpoint(a, once))
         {

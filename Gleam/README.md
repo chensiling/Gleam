@@ -51,6 +51,7 @@ gleam -a <pid>                 :: 附加到运行中的进程
   g                       继续
   step                    单步（进入）
   stepover                步过调用
+  tgo <reg><op><v> [max] [log]  条件跟踪（单步循环直到条件满足）
   ret                     执行到当前函数返回
   pause                   中断运行中的目标
   detach                  脱离调试（先 pause）
@@ -59,6 +60,7 @@ gleam -a <pid>                 :: 附加到运行中的进程
 断点:
   bp <hexaddr> [once]     软件断点（once 为一次性）
   bp <addr> if <r><op><v> 条件断点（op: == != < >，寄存器条件）
+  bp <addr> do <命令>     命中时执行命令（恢复类命令则不暂停）
   trace <addr>            追踪点（命中记录 trace 行并自动继续）
   rbp <hexaddr>           删除软件断点
   hbp <hexaddr> [x|w|rw] [1|2|4|8]  硬件断点

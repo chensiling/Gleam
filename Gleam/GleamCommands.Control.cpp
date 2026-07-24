@@ -42,6 +42,44 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         return CmdResult::Resume;
     }
 
+    if(cmd == "tgo" && args.size() >= 2 && args.size() <= 4)
+    {
+        // tgo <reg><op><hexval> [maxsteps] [log]
+        // Conditional tracing: single-step in the core until the condition
+        // holds (default cap 0x10000 steps). "log" prints every instruction.
+        RegId reg = RegId::Invalid;
+        int op = 0;
+        uint64_t value = 0, maxSteps = 0x10000;
+        bool log = false, badArgs = false;
+        if(!parseCondition(args[1], reg, op, value))
+            badArgs = true;
+        for(size_t i = 2; i < args.size() && !badArgs; i++)
+        {
+            if(args[i] == "log")
+                log = true;
+            else if(!parseHex(args[i], maxSteps))
+                badArgs = true;
+        }
+        if(badArgs)
+        {
+            printf("usage: tgo <reg><==|!=|<|>><hexval> [maxsteps] [log]\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        mTraceCondReg = reg;
+        mTraceCondOp = op;
+        mTraceCondValue = value;
+        mTraceMax = maxSteps;
+        mTraceCount = 0;
+        mTraceLog = log;
+        mTraceActive = true;
+        mStepArmed = true;
+        currentThread()->StepInto();
+        printf("tracing until %s (max 0x%llX steps)\n", args[1].c_str(), maxSteps);
+        fflush(stdout);
+        return CmdResult::Resume;
+    }
+
     if(cmd == "stepover" || cmd == "next")
     {
         // Upstream issue #52: Process::thread can be null (e.g. after thread
