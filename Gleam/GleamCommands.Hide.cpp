@@ -124,8 +124,9 @@ void GleamDebugger::applyHides()
     // 3) Patch the user-mode detection APIs.
     // IsDebuggerPresent: mov eax, 0; ret
     static const uint8_t patchReturnFalse[] = { 0xB8, 0, 0, 0, 0, 0xC3 };
-    // CheckRemoteDebuggerPresent(h, pbool): xor eax, eax; mov [rdx], eax; ret
-    static const uint8_t patchRemoteFalse[] = { 0x33, 0xC0, 0x89, 0x02, 0xC3 };
+    // CheckRemoteDebuggerPresent(h, pbool): *pbool = FALSE, return TRUE:
+    // xor eax, eax; mov [rdx], eax; mov eax, 1; ret
+    static const uint8_t patchRemoteFalse[] = { 0x33, 0xC0, 0x89, 0x02, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
     struct { const char* sym; const uint8_t* code; size_t size; const char* what; } apiPatches[] = {
         { "kernelbase!IsDebuggerPresent", patchReturnFalse, sizeof(patchReturnFalse), "IsDebuggerPresent" },
         { "kernel32!IsDebuggerPresent", patchReturnFalse, sizeof(patchReturnFalse), "IsDebuggerPresent" },
@@ -149,14 +150,26 @@ void GleamDebugger::applyHides()
 
 void GleamDebugger::cmdHide(bool on)
 {
-    mHideOn = on;
-    printf("hide=%s\n", on ? "on" : "off");
-    fflush(stdout);
     if(on)
     {
+        // Re-applying while already hidden would lose the original bytes of
+        // the first pass; keep the first set of originals instead.
+        if(!mHideOriginals.empty())
+        {
+            mHideOn = true;
+            printf("hide already applied (%zu modification(s) held)\n", mHideOriginals.size());
+            fflush(stdout);
+            return;
+        }
+        mHideOn = true;
+        printf("hide=on\n");
+        fflush(stdout);
         applyHides();
         return;
     }
+    mHideOn = false;
+    printf("hide=off\n");
+    fflush(stdout);
     // Restore everything applyHides changed, in reverse order.
     for(auto it = mHideOriginals.rbegin(); it != mHideOriginals.rend(); ++it)
         mProcess->MemWriteSafe(it->first, it->second.data(), it->second.size());

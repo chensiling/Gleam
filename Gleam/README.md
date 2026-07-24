@@ -40,7 +40,7 @@ gleam -a <pid>                 :: 附加到运行中的进程
 命令从标准输入读取（可交互、可管道脚本化）。命令协议要点：
 
 - 目标程序因事件挂起时（断点命中、单步完成、异常等）进入暂停态，此时逐条执行队列中的命令
-- 只有 `pause` 能在目标运行时生效（`DebugBreakProcess` 断入）
+- 只有 `pause` 能在目标运行时生效（注入远程 int3 stub 线程断入）
 - `detach`/`quit` 对运行中的目标不立即生效，先 `pause` 再执行
 - 目标与调试器共享控制台输出，便于脚本断言
 - `pause` 通过注入远程 int3 stub 线程实现（不用 `DebugBreakProcess`——它会检查 PEB.BeingDebugged，与 `hide` 冲突）

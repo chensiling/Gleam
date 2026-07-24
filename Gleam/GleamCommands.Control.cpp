@@ -130,11 +130,18 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                 }
             }
         }
-        if(!viaFrame && !mProcess->MemReadSafe(rsp, &retAddr, sizeof(retAddr)))
+        if(!viaFrame)
         {
-            printf("failed to read the stack at 0x%llX\n", (unsigned long long)rsp);
-            fflush(stdout);
-            return CmdResult::Handled;
+            // Fall back to [rsp], but only accept a plausible code address.
+            ptr candidate = 0;
+            if(mProcess->MemReadSafe(rsp, &candidate, sizeof(candidate)) && candidate)
+            {
+                MEMORY_BASIC_INFORMATION mbi;
+                if(VirtualQueryEx(mProcess->hProcess, (LPCVOID)candidate, &mbi, sizeof(mbi)) &&
+                   mbi.State == MEM_COMMIT &&
+                   (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                    retAddr = candidate;
+            }
         }
         if(!retAddr)
         {

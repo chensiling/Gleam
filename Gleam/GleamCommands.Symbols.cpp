@@ -308,10 +308,14 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     const size_t thunkSize = pe.pe64 ? 8 : 4;
     size_t groups = 0, slots = 0;
 
-    // Bound imports.
+    // Bound imports. Walk bounded by the data directory size (with a hard cap
+    // as a backstop for malformed sizes).
     if(pe.importDir.VirtualAddress)
     {
-        for(uint32_t i = 0; i < 1024; i++)
+        uint32_t maxDesc = pe.importDir.Size ? pe.importDir.Size / (uint32_t)sizeof(IMAGE_IMPORT_DESCRIPTOR) : 1024;
+        if(maxDesc > 4096)
+            maxDesc = 4096;
+        for(uint32_t i = 0; i < maxDesc; i++)
         {
             IMAGE_IMPORT_DESCRIPTOR desc;
             if(!readAt(mProcess, mod.base + pe.importDir.VirtualAddress + i * sizeof(desc), desc))
@@ -353,7 +357,10 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     // Delay-loaded imports.
     if(pe.delayImportDir.VirtualAddress)
     {
-        for(uint32_t i = 0; i < 1024; i++)
+        uint32_t maxDesc = pe.delayImportDir.Size ? pe.delayImportDir.Size / (uint32_t)sizeof(ImgDelayDescr) : 1024;
+        if(maxDesc > 4096)
+            maxDesc = 4096;
+        for(uint32_t i = 0; i < maxDesc; i++)
         {
             ImgDelayDescr desc{};
             if(!readAt(mProcess, mod.base + pe.delayImportDir.VirtualAddress + i * sizeof(desc), desc))

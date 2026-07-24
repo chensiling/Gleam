@@ -372,5 +372,41 @@ g
 EOF
 chk "Q4: frame-based return"     /tmp/gleam_Q4.txt "(frame)"
 
+# --- R1: one-shot 'do g' rule fully cleaned ---
+run R1 "" <<'EOF'
+bp 140070EC9
+bp 1400708AC once do g
+g
+g
+bp 1400708AC
+g
+g
+EOF
+chkcount "R1: 2 marker + 1 inner stops" /tmp/gleam_R1.txt "stop reason=breakpoint" 3
+chk "R1: results correct"        /tmp/gleam_R1.txt "MARKER_RESULT_2=13"
+
+# --- R2: overlapping patches restore fully ---
+run R2 "" <<'EOF'
+bp 140070EC9
+g
+patch 140190000 AA
+patch 140190000 BB CC
+restore 140190000
+read 140190000 4
+g
+g
+EOF
+chk "R2: both bytes restored"    /tmp/gleam_R2.txt "47 4C 45 41"
+
+# --- R3: double hide then off restores detection ---
+run R3 "" <<'EOF'
+hide
+hide
+hide off
+g
+EOF
+chk "R3: detection restored"     /tmp/gleam_R3.txt "ISDEBUGGERPRESENT=1"
+chk "R3: skip re-apply"          /tmp/gleam_R3.txt "hide already applied"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"

@@ -130,7 +130,7 @@ private:
         std::string command;             // bp do <command>: run on hit
     };
     std::map<GleeBug::ptr, BpRule> mBpRules;
-    bool evalBpRule(const GleeBug::BreakpointInfo & info); // true = pause normally
+    bool evalBpRule(const GleeBug::BreakpointInfo & info, const BpRule* rule); // true = pause normally
     bool evalCondition(RegId reg, int op, uint64_t value); // current thread registers
     static bool parseCondition(const std::string & text, RegId & reg, int & op, uint64_t & value);
 

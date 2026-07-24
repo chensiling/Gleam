@@ -32,6 +32,44 @@ static std::string toUtf8(const wchar_t* wide)
     return result;
 }
 
+// Quote one argument following the Windows command-line rules
+// (the ones CommandLineToArgvW parses):
+//   - empty arguments and arguments containing space/tab/quote are quoted
+//   - backslashes are doubled only before a quote or at the end
+static std::wstring quoteArg(const wchar_t* arg)
+{
+    const bool needsQuotes = !*arg || wcscspn(arg, L" \t\"") != wcslen(arg);
+    if(!needsQuotes)
+        return arg;
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for(const wchar_t* p = arg; ; p++)
+    {
+        if(*p == L'\\')
+        {
+            backslashes++;
+            continue;
+        }
+        if(*p == L'"')
+        {
+            out.append(backslashes * 2 + 1, L'\\');
+            out += L'"';
+            backslashes = 0;
+            continue;
+        }
+        if(*p == L'\0')
+        {
+            out.append(backslashes * 2, L'\\'); // trailing backslashes double before the closing quote
+            break;
+        }
+        out.append(backslashes, L'\\');
+        backslashes = 0;
+        out += *p;
+    }
+    out += L'"';
+    return out;
+}
+
 static void replThread(GleamDebugger* dbg)
 {
     // std::getline handles arbitrarily long commands (no fixed buffer).
@@ -69,7 +107,9 @@ int wmain(int argc, wchar_t* argv[])
         return 1;
     }
 
-    GleamDebugger dbg;
+    // Heap-allocated and intentionally leaked: the detached REPL thread may
+    // still reference the debugger while the process is exiting.
+    auto dbg = new GleamDebugger();
     bool attached = false;
     if(!wcscmp(argv[1], L"-a") || !wcscmp(argv[1], L"attach"))
     {
@@ -79,7 +119,7 @@ int wmain(int argc, wchar_t* argv[])
             return 1;
         }
         DWORD pid = (DWORD)wcstoul(argv[2], nullptr, 0);
-        if(!dbg.Attach(pid))
+        if(!dbg->Attach(pid))
         {
             printf("failed to attach to process %lu\n", pid);
             return 1;
@@ -95,15 +135,10 @@ int wmain(int argc, wchar_t* argv[])
         {
             if(!commandLine.empty())
                 commandLine += L' ';
-            // Quote arguments containing whitespace so the target's own
-            // command-line parser sees them as a single argument.
-            if(wcscspn(argv[i], L" \t\"") != wcslen(argv[i]))
-                commandLine += L'"' + std::wstring(argv[i]) + L'"';
-            else
-                commandLine += argv[i];
+            commandLine += quoteArg(argv[i]);
         }
         // newConsole=false: the debuggee shares our console so its output is captured too.
-        if(!dbg.Init(filePath.c_str(), commandLine.empty() ? nullptr : commandLine.c_str(), nullptr, false))
+        if(!dbg->Init(filePath.c_str(), commandLine.empty() ? nullptr : commandLine.c_str(), nullptr, false))
         {
             printf("failed to start debuggee '%s'\n", toUtf8(argv[1]).c_str());
             return 1;
@@ -112,9 +147,9 @@ int wmain(int argc, wchar_t* argv[])
     }
     fflush(stdout);
 
-    std::thread repl(replThread, &dbg);
+    std::thread repl(replThread, dbg);
     repl.detach(); // blocked on stdin; dies with the process
-    dbg.Start();
+    dbg->Start();
 
     printf("[gleam] session finished%s\n", attached ? " (detached or target exited)" : "");
     fflush(stdout);

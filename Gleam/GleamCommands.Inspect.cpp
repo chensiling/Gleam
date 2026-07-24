@@ -298,8 +298,9 @@ void GleamDebugger::cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes)
         fflush(stdout);
         return;
     }
-    std::vector<uint8_t> original(bytes.size());
-    if(!mProcess->MemReadSafe(addr, original.data(), original.size()))
+    // Original bytes of the whole new range.
+    std::vector<uint8_t> fresh(bytes.size());
+    if(!mProcess->MemReadSafe(addr, fresh.data(), fresh.size()))
     {
         printf("read failed at 0x%llX (cannot record original bytes)\n", addr);
         fflush(stdout);
@@ -311,10 +312,37 @@ void GleamDebugger::cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes)
         fflush(stdout);
         return;
     }
-    // Keep the FIRST original: re-patching an already patched address must not
-    // clobber the bytes we would restore to.
-    if(mPatches.find(addr) == mPatches.end())
-        mPatches[addr] = original;
+
+    // Merge the new range into any overlapping records. Existing records
+    // hold the EARLIER original bytes and always win; fresh bytes only fill
+    // the parts no previous record covers.
+    uint64_t start = addr, end = addr + bytes.size();
+    std::vector<uint8_t> merged(fresh);
+    for(auto it = mPatches.begin(); it != mPatches.end();)
+    {
+        uint64_t s = it->first, e = s + it->second.size();
+        if(e <= start || s >= end)
+        {
+            ++it;
+            continue;
+        }
+        uint64_t ns = (std::min)(start, s), ne = (std::max)(end, e);
+        std::vector<uint8_t> u(ne - ns);
+        // Earlier original bytes win.
+        memcpy(u.data() + (s - ns), it->second.data(), it->second.size());
+        // Fresh original bytes fill the uncovered remainder.
+        for(size_t i = 0; i < fresh.size(); i++)
+        {
+            uint64_t p = addr + i;
+            if(p < s || p >= e)
+                u[p - ns] = fresh[i];
+        }
+        start = ns;
+        end = ne;
+        merged = std::move(u);
+        it = mPatches.erase(it);
+    }
+    mPatches[start] = std::move(merged);
     printf("patched 0x%llX (%zu bytes)\n", addr, bytes.size());
     fflush(stdout);
 }

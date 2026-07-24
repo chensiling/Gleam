@@ -122,22 +122,24 @@ void GleamDebugger::cmdXref(uint64_t target)
         for(uint64_t off = 0; off < size; off += kChunkSize)
         {
             size_t chunk = (size_t)(std::min)((uint64_t)kChunkSize, size - off);
-            std::vector<uint8_t> buf(chunk);
-            if(!mProcess->MemReadSafe(base + off, buf.data(), chunk))
+            // Read up to 15 bytes beyond the chunk so instructions crossing
+            // the boundary decode fully; instruction STARTS beyond the chunk
+            // belong to the next chunk.
+            size_t avail = (size_t)(std::min)(chunk + 15, size - off);
+            std::vector<uint8_t> buf(avail);
+            if(!mProcess->MemReadSafe(base + off, buf.data(), avail))
                 continue;
             size_t i = 0;
             while(i < chunk)
             {
                 uint64_t ia = base + off + i;
                 ZydisDisassembledInstruction insn;
-                if(!decodeAt(buf.data() + i, chunk - i, ia, insn) || insn.info.length == 0)
+                if(!decodeAt(buf.data() + i, avail - i, ia, insn) || insn.info.length == 0)
                 {
                     i++;
                     continue;
                 }
                 uint8_t len = insn.info.length;
-                if(i + len > chunk) // instruction crosses the chunk boundary
-                    break;
                 uint64_t t = 0;
                 auto kind = transferTarget(buf.data() + i, ia, len, t);
                 if(kind == TargetKind::Direct && t == target)
@@ -178,21 +180,20 @@ void GleamDebugger::cmdFindAsm(const std::string & text)
         for(uint64_t off = 0; off < size && !capped; off += kChunkSize)
         {
             size_t chunk = (size_t)(std::min)((uint64_t)kChunkSize, size - off);
-            std::vector<uint8_t> buf(chunk);
-            if(!mProcess->MemReadSafe(base + off, buf.data(), chunk))
+            size_t avail = (size_t)(std::min)(chunk + 15, size - off);
+            std::vector<uint8_t> buf(avail);
+            if(!mProcess->MemReadSafe(base + off, buf.data(), avail))
                 continue;
             size_t i = 0;
             while(i < chunk)
             {
                 uint64_t ia = base + off + i;
                 ZydisDisassembledInstruction insn;
-                if(!decodeAt(buf.data() + i, chunk - i, ia, insn) || insn.info.length == 0)
+                if(!decodeAt(buf.data() + i, avail - i, ia, insn) || insn.info.length == 0)
                 {
                     i++;
                     continue;
                 }
-                if(i + insn.info.length > chunk)
-                    break;
                 auto hay = normalizeText(insn.text);
                 if(hay.find(needle) != std::string::npos)
                 {

@@ -204,19 +204,44 @@ void GleamDebugger::cbAttachBreakpoint()
 
 void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
 {
-    // Ignore-count: auto-continue without pausing.
-    auto ignore = mIgnoreHits.find(info.address);
-    if(ignore != mIgnoreHits.end() && ignore->second > 0)
+    // Snapshot per-breakpoint state up front. One-shot hits must not leak
+    // rules or ignore counts into a later breakpoint at the same address,
+    // regardless of which exit path this callback takes.
+    BpRule rule;
+    const BpRule* rulePtr = nullptr;
+    auto ruleIt = mBpRules.find(info.address);
+    if(ruleIt != mBpRules.end())
     {
-        ignore->second--;
+        rule = ruleIt->second;
+        rulePtr = &rule;
+        if(info.singleshoot)
+            mBpRules.erase(ruleIt);
+    }
+    uint32_t ignoreLeft = 0;
+    bool hasIgnore = false;
+    auto ignoreIt = mIgnoreHits.find(info.address);
+    if(ignoreIt != mIgnoreHits.end())
+    {
+        hasIgnore = true;
+        ignoreLeft = ignoreIt->second;
+        if(info.singleshoot)
+            mIgnoreHits.erase(ignoreIt);
+    }
+
+    // Ignore-count: auto-continue without pausing.
+    if(hasIgnore && ignoreLeft > 0)
+    {
+        if(!info.singleshoot)
+            mIgnoreHits[info.address] = ignoreLeft - 1;
         printf("event ignored address=0x%llX left=%u\n",
-               (unsigned long long)info.address, ignore->second);
+               (unsigned long long)info.address, ignoreLeft - 1);
         fflush(stdout);
         return;
     }
 
-    // Conditional breakpoints and tracepoints: rule says "don't pause".
-    if(!evalBpRule(info))
+    // Conditional breakpoints, tracepoints and "do" commands may suppress
+    // the pause entirely.
+    if(!evalBpRule(info, rulePtr))
         return;
 
     char details[96];
@@ -238,14 +263,6 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
             info.type == BreakpointType::Hardware ? "hardware" : "memory";
         sprintf_s(details, "type=%s address=0x%llX", typeText, (unsigned long long)info.address);
         emitStop("breakpoint", details);
-    }
-    // One-shot breakpoints are deleted by the engine on hit; drop the
-    // associated rule/ignore state so a later breakpoint at the same
-    // address does not inherit them.
-    if(info.singleshoot)
-    {
-        mBpRules.erase(info.address);
-        mIgnoreHits.erase(info.address);
     }
     mWantsPause = true;
 }

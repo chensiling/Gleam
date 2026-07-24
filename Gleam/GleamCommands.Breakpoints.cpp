@@ -114,17 +114,15 @@ bool GleamDebugger::parseCondition(const std::string & text, RegId & reg, int & 
 // Evaluate the hit-time rule for a breakpoint. Returns true when the hit
 // should pause normally; false when it should auto-continue (condition not
 // met, tracepoint logged, or a resume-type "do" command ran).
-bool GleamDebugger::evalBpRule(const BreakpointInfo & info)
+bool GleamDebugger::evalBpRule(const BreakpointInfo & info, const BpRule* rule)
 {
-    auto it = mBpRules.find(info.address);
-    if(it == mBpRules.end())
+    if(!rule)
         return true;
-    const auto & rule = it->second;
 
-    if(rule.condReg != RegId::Invalid && !evalCondition(rule.condReg, rule.condOp, rule.condValue))
+    if(rule->condReg != RegId::Invalid && !evalCondition(rule->condReg, rule->condOp, rule->condValue))
         return false;
 
-    if(rule.trace)
+    if(rule->trace)
     {
         Registers r(mThread->hThread);
         printf("trace address=0x%llX rip=0x%llX tid=%u\n",
@@ -137,8 +135,8 @@ bool GleamDebugger::evalBpRule(const BreakpointInfo & info)
 
     // "bp <addr> do <command>": run the command in the suspended context.
     // Resume-type commands (g/step/...) mean: don't pause.
-    if(!rule.command.empty())
-        return !executeCommand(rule.command);
+    if(!rule->command.empty())
+        return !executeCommand(rule->command);
 
     return true;
 }
@@ -215,6 +213,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
     if(cmd == "rbp" && args.size() == 2 && parseAddress(args[1], a))
     {
         mBpRules.erase(a);
+        mIgnoreHits.erase(a);
         printf(mProcess->DeleteBreakpoint(a) ? "breakpoint removed at 0x%llX\n" : "failed to remove breakpoint at 0x%llX\n", a);
         fflush(stdout);
         return CmdResult::Handled;
