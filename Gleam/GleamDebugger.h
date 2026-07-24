@@ -183,8 +183,8 @@ private:
     std::atomic<bool> mInDebugEvent{ false };     // between event delivery and ContinueDebugEvent
     std::atomic<bool> mBreakInExpected{ false };  // "pause" break-in is on its way
     std::atomic<bool> mPauseAfterResume{ false }; // "pause" arrived while paused
-    HANDLE mBreakInStubThread = nullptr;          // injected int3-stub thread
-    void* mBreakInStubPage = nullptr;             // page backing the stub
+    std::atomic<HANDLE> mBreakInStubThread{ nullptr }; // injected int3-stub thread
+    std::atomic<void*> mBreakInStubPage{ nullptr };    // page backing the stub
     bool mWantsPause = false;
     bool mStepArmed = false;      // a user-requested step is in flight
     bool mStepOverArmed = false;  // a user-requested step-over is in flight

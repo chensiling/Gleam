@@ -37,7 +37,7 @@ void GleamDebugger::forceBreakIn()
 
     // A stub break-in is already in flight: don't inject another one (the
     // pending event will arrive and clean itself up).
-    if(mBreakInStubThread || mBreakInStubPage)
+    if(mBreakInStubThread.load() || mBreakInStubPage.load())
         return;
 
     // NOTE: DebugBreakProcess checks PEB.BeingDebugged and refuses to inject
@@ -49,13 +49,14 @@ void GleamDebugger::forceBreakIn()
                                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if(page && WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
     {
-        mBreakInExpected.store(true);
         HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
                                             (LPTHREAD_START_ROUTINE)page, nullptr, 0, nullptr);
         if(hThread)
         {
-            mBreakInStubPage = page;
-            mBreakInStubThread = hThread;
+            // The stub is identified by its exception address (not by a
+            // flag), so the event can never outrun our bookkeeping.
+            mBreakInStubPage.store(page);
+            mBreakInStubThread.store(hThread);
             return;
         }
         VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
@@ -316,22 +317,23 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     mLastExceptionValid = true;
     mLastExceptionFirstChance = firstChance;
 
-    // Our own break-in (triggered by "pause").
-    if(exceptionRecord.ExceptionCode == STATUS_BREAKPOINT && mBreakInExpected.exchange(false))
+    // Our own break-in (triggered by "pause"). Two identification paths:
+    // the stub's exception address (race-free), or the fallback flag.
+    const bool isStubBreakIn = exceptionRecord.ExceptionCode == STATUS_BREAKPOINT &&
+                               mBreakInStubPage.load() != nullptr &&
+                               exceptionRecord.ExceptionAddress == mBreakInStubPage.load();
+    const bool isFallbackBreakIn = exceptionRecord.ExceptionCode == STATUS_BREAKPOINT &&
+                                   mBreakInExpected.exchange(false);
+    if(isStubBreakIn || isFallbackBreakIn)
     {
         mContinueStatus = DBG_CONTINUE;
-        // Clean up the injected stub thread if this was our stub break-in.
-        if(mBreakInStubThread)
+        if(auto hThread = mBreakInStubThread.exchange(nullptr))
         {
-            TerminateThread(mBreakInStubThread, 0);
-            CloseHandle(mBreakInStubThread);
-            mBreakInStubThread = nullptr;
+            TerminateThread(hThread, 0);
+            CloseHandle(hThread);
         }
-        if(mBreakInStubPage)
-        {
-            VirtualFreeEx(mProcess->hProcess, mBreakInStubPage, 0, MEM_RELEASE);
-            mBreakInStubPage = nullptr;
-        }
+        if(auto page = mBreakInStubPage.exchange(nullptr))
+            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
         emitStop("pause", nullptr);
         mWantsPause = true;
         return;

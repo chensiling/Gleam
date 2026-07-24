@@ -148,10 +148,12 @@ int wmain(int argc, wchar_t* argv[])
     fflush(stdout);
 
     std::thread repl(replThread, dbg);
-    repl.detach(); // blocked on stdin; dies with the process
+    repl.detach(); // blocked on stdin; killed by ExitProcess below
     dbg->Start();
 
     printf("[gleam] session finished%s\n", attached ? " (detached or target exited)" : "");
     fflush(stdout);
-    return 0;
+    // ExitProcess terminates all threads (including the stdin-blocked REPL)
+    // before DLL/CRT teardown - no racing stdio cleanup.
+    ExitProcess(0);
 }

@@ -325,7 +325,13 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
             auto dllName = readCString(mProcess, mod.base + desc.Name);
             printf("%s:\n", dllName.c_str());
             groups++;
-            for(uint32_t t = 0; t < 65536; t++)
+            // Thunk walk bounded by the module image (with a hard cap).
+            uint64_t maxT = 65536;
+            if(mod.size && desc.FirstThunk < mod.size)
+                maxT = (std::min)(maxT, (mod.size - desc.FirstThunk) / thunkSize + 1);
+            else if(mod.size && desc.FirstThunk >= mod.size)
+                continue; // bogus thunk RVA
+            for(uint32_t t = 0; t < maxT; t++)
             {
                 uint64_t slotAddr = mod.base + desc.FirstThunk + t * thunkSize;
                 uint64_t value = 0;
@@ -374,7 +380,14 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
             auto dllName = readCString(mProcess, nameAddr);
             printf("%s (delay):\n", dllName.c_str());
             groups++;
-            for(uint32_t t = 0; t < 65536; t++)
+            // Thunk walk bounded by the module image (with a hard cap).
+            uint64_t maxT = 65536;
+            uint64_t iatRva = iatAddr - mod.base;
+            if(mod.size && iatRva < mod.size)
+                maxT = (std::min)(maxT, (mod.size - iatRva) / thunkSize + 1);
+            else if(mod.size)
+                continue; // bogus IAT address
+            for(uint32_t t = 0; t < maxT; t++)
             {
                 uint64_t slotAddr = iatAddr + t * thunkSize;
                 uint64_t value = 0;

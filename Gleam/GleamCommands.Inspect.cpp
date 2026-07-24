@@ -314,8 +314,9 @@ void GleamDebugger::cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes)
     }
 
     // Merge the new range into any overlapping records. Existing records
-    // hold the EARLIER original bytes and always win; fresh bytes only fill
-    // the parts no previous record covers.
+    // hold the EARLIER original bytes and always win in their range; fresh
+    // bytes only fill the parts no previous record covers. `merged` carries
+    // the running union so bridging several old records keeps every byte.
     uint64_t start = addr, end = addr + bytes.size();
     std::vector<uint8_t> merged(fresh);
     for(auto it = mPatches.begin(); it != mPatches.end();)
@@ -328,15 +329,10 @@ void GleamDebugger::cmdPatch(uint64_t addr, const std::vector<uint8_t> & bytes)
         }
         uint64_t ns = (std::min)(start, s), ne = (std::max)(end, e);
         std::vector<uint8_t> u(ne - ns);
-        // Earlier original bytes win.
+        // Current union covers its own range...
+        memcpy(u.data() + (start - ns), merged.data(), merged.size());
+        // ...and the earlier record's original bytes win in its range.
         memcpy(u.data() + (s - ns), it->second.data(), it->second.size());
-        // Fresh original bytes fill the uncovered remainder.
-        for(size_t i = 0; i < fresh.size(); i++)
-        {
-            uint64_t p = addr + i;
-            if(p < s || p >= e)
-                u[p - ns] = fresh[i];
-        }
         start = ns;
         end = ne;
         merged = std::move(u);

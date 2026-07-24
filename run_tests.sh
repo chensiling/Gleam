@@ -408,5 +408,51 @@ EOF
 chk "R3: detection restored"     /tmp/gleam_R3.txt "ISDEBUGGERPRESENT=1"
 chk "R3: skip re-apply"          /tmp/gleam_R3.txt "hide already applied"
 
+# --- R4: ret in Release/FPO function (guarded: needs Release binaries) ---
+REL=bin/Release/x64
+if [ -f "$REL/Gleam.exe" ] && [ -f "$REL/TestTarget.exe" ]; then
+  echo "== R4 =="
+  timeout 30 "$REL/Gleam.exe" "$REL/TestTarget.exe" > /tmp/gleam_R4.txt 2>&1 <<'EOF'
+bp TestTarget!marker
+g
+step
+stepover
+stepover
+ret
+g
+g
+EOF
+  chk "R4: stack-scan ret"       /tmp/gleam_R4.txt "(stack scan)"
+  chk "R4: caller resume"        /tmp/gleam_R4.txt "MARKER_RESULT_1=47"
+else
+  echo "== R4 == (skipped: no Release binaries)"
+fi
+
+# --- R5: new patch bridging two old records ---
+run R5 "" <<'EOF'
+bp 140070EC9
+g
+patch 140190000 AA
+patch 140190002 CC
+patch 140190000 EE EE EE
+restore 140190000
+read 140190000 4
+g
+g
+EOF
+chk "R5: bridged originals kept" /tmp/gleam_R5.txt "47 4C 45 41"
+
+# --- S1: pause injection stress (25 fresh sessions, each exactly one stop) ---
+echo "== S1 =="
+S1OK=0
+for i in $(seq 1 25); do
+  out=$(printf 'g\npause\ndetach\n' | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
+  [ "$n" -eq 1 ] && S1OK=$((S1OK+1))
+  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+done
+if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK/25 pause injections"; fi
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" -eq 0 ]

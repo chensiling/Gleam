@@ -106,40 +106,61 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     {
         // Return address resolution:
         // - inside a framed function, it lives at [rbp+8]
-        // - right after a call (before the prologue), it lives at [rsp]
-        // Prefer the frame pointer when rbp looks like a valid frame link.
+        // - otherwise (function entry, or FPO/optimized code mid-function),
+        //   scan the stack for a value that looks like a return address:
+        //   executable memory preceded by a call instruction.
         Registers r(currentThread()->hThread);
         ptr rsp = r.Gsp();
         ptr rbp = r.Gbp();
         ptr retAddr = 0;
         bool viaFrame = false;
+
+        auto isExecutable = [this](ptr a)
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            return a && VirtualQueryEx(mProcess->hProcess, (LPCVOID)a, &mbi, sizeof(mbi)) &&
+                   mbi.State == MEM_COMMIT &&
+                   (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        };
+        // Is there a call instruction ending exactly at 'retAddrCandidate'?
+        auto precededByCall = [this](ptr retva)
+        {
+            uint8_t b[8];
+            if(retva < 8 || !mProcess->MemReadSafe(retva - 8, b, sizeof(b)))
+                return false;
+            // E8 <rel32>         call rel32      (5 bytes, ends at retva-5+5)
+            if(b[3] == 0xE8)
+                return true;
+            // FF /2 <disp32>     call [rip+disp] (6 bytes, modrm mod=00 rm=101 reg=2)
+            if(b[2] == 0xFF && ((b[3] >> 3) & 7) == 2 && (b[3] >> 6) == 0 && (b[3] & 7) == 5)
+                return true;
+            // FF /2              call r/m        (2 bytes, e.g. call rax)
+            if(b[6] == 0xFF && ((b[7] >> 3) & 7) == 2)
+                return true;
+            return false;
+        };
+
         if(rbp > rsp && rbp - rsp < 0x10000)
         {
             ptr callerRbp = 0, candidate = 0;
             if(mProcess->MemReadSafe(rbp, &callerRbp, sizeof(callerRbp)) &&
                mProcess->MemReadSafe(rbp + sizeof(rbp), &candidate, sizeof(candidate)) &&
-               callerRbp >= rbp && candidate != 0)
+               callerRbp >= rbp && isExecutable(candidate))
             {
-                MEMORY_BASIC_INFORMATION mbi;
-                if(VirtualQueryEx(mProcess->hProcess, (LPCVOID)candidate, &mbi, sizeof(mbi)) &&
-                   mbi.State == MEM_COMMIT &&
-                   (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-                {
-                    retAddr = candidate;
-                    viaFrame = true;
-                }
+                retAddr = candidate;
+                viaFrame = true;
             }
         }
         if(!viaFrame)
         {
-            // Fall back to [rsp], but only accept a plausible code address.
-            ptr candidate = 0;
-            if(mProcess->MemReadSafe(rsp, &candidate, sizeof(candidate)) && candidate)
+            // Stack scan (FPO-friendly): first value on the stack that is an
+            // executable address immediately preceded by a call.
+            for(ptr sp = rsp; sp < rsp + 0x400 && !retAddr; sp += sizeof(ptr))
             {
-                MEMORY_BASIC_INFORMATION mbi;
-                if(VirtualQueryEx(mProcess->hProcess, (LPCVOID)candidate, &mbi, sizeof(mbi)) &&
-                   mbi.State == MEM_COMMIT &&
-                   (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                ptr candidate = 0;
+                if(!mProcess->MemReadSafe(sp, &candidate, sizeof(candidate)))
+                    break;
+                if(isExecutable(candidate) && precededByCall(candidate))
                     retAddr = candidate;
             }
         }
@@ -155,7 +176,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             fflush(stdout);
             return CmdResult::Handled;
         }
-        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr, viaFrame ? " (frame)" : "");
+        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr, viaFrame ? " (frame)" : " (stack scan)");
         fflush(stdout);
         return CmdResult::Resume;
     }
