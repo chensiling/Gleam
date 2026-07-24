@@ -18,14 +18,47 @@ bool GleamDebugger::pushCommand(const std::string & cmd)
 
 void GleamDebugger::requestPause()
 {
-    if(mIsPaused.load())
+    // Only safe to inject while the debuggee is running free (debugger
+    // blocked in WaitForDebugEvent). During event/command processing the
+    // request is deferred to just before ContinueDebugEvent instead.
+    if(mIsPaused.load() || mInDebugEvent.load())
+    {
+        mPauseAfterResume.store(true);
         return;
+    }
+    forceBreakIn();
+}
+
+void GleamDebugger::forceBreakIn()
+{
     auto process = mProcess;
-    if(process)
+    if(!process)
+        return;
+
+    // NOTE: DebugBreakProcess checks PEB.BeingDebugged and refuses to inject
+    // when it is cleared (our "hide" does exactly that), so inject our own
+    // int3 stub thread instead: int3; jmp $ (loops until we kill it at the
+    // resulting pause).
+    static const uint8_t stub[] = { 0xCC, 0xEB, 0xFE };
+    auto page = VirtualAllocEx(process->hProcess, nullptr, 0x1000,
+                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if(page && WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
     {
         mBreakInExpected.store(true);
-        DebugBreakProcess(process->hProcess);
+        HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
+                                            (LPTHREAD_START_ROUTINE)page, nullptr, 0, nullptr);
+        if(hThread)
+        {
+            mBreakInStubPage = page;
+            mBreakInStubThread = hThread;
+            return;
+        }
+        VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
     }
+
+    // Fallback (broken when BeingDebugged is hidden, but better than nothing).
+    mBreakInExpected.store(true);
+    DebugBreakProcess(process->hProcess);
 }
 
 bool GleamDebugger::isPaused() const
@@ -253,10 +286,22 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     mLastExceptionValid = true;
     mLastExceptionFirstChance = firstChance;
 
-    // Our own DebugBreakProcess break-in (triggered by "pause").
+    // Our own break-in (triggered by "pause").
     if(exceptionRecord.ExceptionCode == STATUS_BREAKPOINT && mBreakInExpected.exchange(false))
     {
         mContinueStatus = DBG_CONTINUE;
+        // Clean up the injected stub thread if this was our stub break-in.
+        if(mBreakInStubThread)
+        {
+            TerminateThread(mBreakInStubThread, 0);
+            CloseHandle(mBreakInStubThread);
+            mBreakInStubThread = nullptr;
+        }
+        if(mBreakInStubPage)
+        {
+            VirtualFreeEx(mProcess->hProcess, mBreakInStubPage, 0, MEM_RELEASE);
+            mBreakInStubPage = nullptr;
+        }
         emitStop("pause", nullptr);
         mWantsPause = true;
         return;
@@ -291,6 +336,11 @@ void GleamDebugger::cbInternalError(const std::string & error)
     fflush(stdout);
 }
 
+void GleamDebugger::cbPreDebugEvent(const DEBUG_EVENT & debugEvent)
+{
+    mInDebugEvent.store(true);
+}
+
 void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
 {
     if(mWantsPause && !mQuitting && mProcess && mThread)
@@ -298,6 +348,7 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         mWantsPause = false;
         commandLoop();
     }
+    mInDebugEvent.store(false);
 }
 
 void GleamDebugger::commandLoop()
@@ -318,8 +369,8 @@ void GleamDebugger::commandLoop()
             break;
     }
     mIsPaused.store(false);
-    // A "pause" that arrived while we were paused takes effect right after
-    // the resume, so the request is never silently dropped.
+    // A "pause" that arrived while we were paused takes effect right before
+    // the resume - the only deterministic injection point.
     if(mPauseAfterResume.exchange(false))
-        requestPause();
+        forceBreakIn();
 }

@@ -47,14 +47,7 @@ static void replThread(GleamDebugger* dbg)
             // suspended state - to detach/quit a running debuggee, issue
             // "pause" first. This keeps scripted command order deterministic.
             if(line == "pause")
-            {
-                // Already suspended: defer the break-in to right after the
-                // resume instead of dropping the request.
-                if(dbg->isPaused())
-                    dbg->pauseAfterResume();
-                else
-                    dbg->requestPause();
-            }
+            dbg->requestPause(); // deferral handled internally
             else
                 dbg->pushCommand(line);
         }

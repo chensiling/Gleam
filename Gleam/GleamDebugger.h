@@ -47,6 +47,10 @@ public:
     // Called from the REPL thread: break in right after the next resume.
     void pauseAfterResume();
 
+private:
+    // Unguarded break-in, only valid at the just-before-continue point.
+    void forceBreakIn();
+
 protected:
     void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;
     void cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const GleeBug::Process & process) override;
@@ -60,6 +64,7 @@ protected:
     void cbStep() override;
     void cbUnhandledException(const EXCEPTION_RECORD & exceptionRecord, bool firstChance) override;
     void cbInternalError(const std::string & error) override;
+    void cbPreDebugEvent(const DEBUG_EVENT & debugEvent) override;
     void cbPostDebugEvent(const DEBUG_EVENT & debugEvent) override;
 
 private:
@@ -175,8 +180,11 @@ private:
     std::mutex mCmdMutex;
     std::condition_variable mCmdCv;
     std::atomic<bool> mIsPaused{ false };
+    std::atomic<bool> mInDebugEvent{ false };     // between event delivery and ContinueDebugEvent
     std::atomic<bool> mBreakInExpected{ false };  // "pause" break-in is on its way
     std::atomic<bool> mPauseAfterResume{ false }; // "pause" arrived while paused
+    HANDLE mBreakInStubThread = nullptr;          // injected int3-stub thread
+    void* mBreakInStubPage = nullptr;             // page backing the stub
     bool mWantsPause = false;
     bool mStepArmed = false;      // a user-requested step is in flight
     bool mStepOverArmed = false;  // a user-requested step-over is in flight

@@ -168,9 +168,10 @@ void GleamDebugger::cmdFindAsm(const std::string & text)
         return;
     }
     size_t hits = 0;
+    bool capped = false;
     forEachExecRegion(mProcess->hProcess, [&](uint64_t base, uint64_t size)
     {
-        for(uint64_t off = 0; off < size; off += kChunkSize)
+        for(uint64_t off = 0; off < size && !capped; off += kChunkSize)
         {
             size_t chunk = (size_t)(std::min)((uint64_t)kChunkSize, size - off);
             std::vector<uint8_t> buf(chunk);
@@ -195,8 +196,8 @@ void GleamDebugger::cmdFindAsm(const std::string & text)
                     if(++hits >= 200)
                     {
                         printf("(stopped at 200 matches)\n");
-                        fflush(stdout);
-                        return;
+                        capped = true;
+                        break;
                     }
                 }
                 i += insn.info.length;
