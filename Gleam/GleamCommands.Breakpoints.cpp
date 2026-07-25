@@ -31,7 +31,7 @@ const char* GleamDebugger::memTypeText(MemoryType type)
 
 void GleamDebugger::cmdBreakpointList()
 {
-    if(mProcess->breakpoints.empty())
+    if(mProcess->breakpoints.empty() && mLogicalBps.empty())
     {
         printf("no breakpoints\n");
         fflush(stdout);
@@ -78,6 +78,29 @@ void GleamDebugger::cmdBreakpointList()
                info.singleshoot ? " once" : "",
                ruleText,
                ignore != mIgnoreHits.end() && ignore->second > 0 ? " (ignoring)" : "");
+    }
+    for(const auto & lb : mLogicalBps)
+    {
+        std::string line = "logical module=" + lb.module + " ";
+        if(!lb.symbol.empty())
+            line += "symbol=" + lb.symbol;
+        else
+        {
+            char rva[32];
+            sprintf_s(rva, "rva=0x%llX", (unsigned long long)lb.rva);
+            line += rva;
+        }
+        if(lb.once)
+            line += " once";
+        if(lb.boundAddr)
+        {
+            char bound[40];
+            sprintf_s(bound, " bound=0x%llX", (unsigned long long)lb.boundAddr);
+            line += bound;
+        }
+        else
+            line += " pending";
+        printf("%s\n", line.c_str());
     }
     fflush(stdout);
 }
@@ -141,14 +164,54 @@ bool GleamDebugger::evalBpRule(const BreakpointInfo & info, const BpRule* rule)
     return true;
 }
 
+// Parse "module!symbol" or "module+<hexrva>" as a module-relative spec.
+// The module part must look like a module name: expressions like "dead+beef"
+// or "1234+8" are rejected (hex-parseable module part = arithmetic).
+bool GleamDebugger::parseLogicalSpec(const std::string & s, LogicalBp & out)
+{
+    size_t bang = s.find('!');
+    if(bang != std::string::npos)
+    {
+        std::string mod = s.substr(0, bang);
+        std::string sym = s.substr(bang + 1);
+        if(mod.empty() || sym.empty())
+            return false;
+        if(mod.find_first_of("+-()[]") != std::string::npos ||
+           sym.find_first_of("+-()[]") != std::string::npos)
+            return false;
+        out.module = normalizeModuleName(mod);
+        out.symbol = sym;
+        return true;
+    }
+    size_t plus = s.find('+');
+    if(plus == std::string::npos || plus == 0)
+        return false;
+    std::string mod = s.substr(0, plus);
+    uint64_t dummy = 0, rva = 0;
+    if(parseHex(mod, dummy) || !parseHex(s.substr(plus + 1), rva))
+        return false;
+    if(mod.find_first_of("-()[]") != std::string::npos)
+        return false;
+    out.module = normalizeModuleName(mod);
+    out.rva = rva;
+    return true;
+}
+
 GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<std::string> & args)
 {
     const std::string & cmd = args[0];
     uint64_t a = 0, b = 0;
 
     // bp <addr> [once] [if <reg><op><hexval>] [do <command...>]
-    if(cmd == "bp" && args.size() >= 2 && parseAddress(args[1], a))
+    // <addr> may also be module!symbol or module+rva (module-relative: bound
+    // now when loaded, pending until the module loads otherwise).
+    if(cmd == "bp" && args.size() >= 2)
     {
+        LogicalBp lb;
+        const bool resolved = parseAddress(args[1], a);
+        const bool logical = parseLogicalSpec(args[1], lb);
+        if(!resolved && !logical)
+            return CmdResult::NotMine;
         bool once = false;
         BpRule rule;
         bool badArgs = false;
@@ -179,20 +242,35 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         {
             printf("usage: bp <addr> [once] [if <reg><==|!=|<|>><hexval>] [do <command...>]\n");
         }
-        else if(mProcess->SetBreakpoint(a, once))
+        else if(resolved)
         {
-            if(rule.condReg != RegId::Invalid || rule.trace || !rule.command.empty())
-                mBpRules[a] = rule;
-            printf("%sbreakpoint set at 0x%llX\n", once ? "one-shot " : "", a);
+            if(mProcess->SetBreakpoint(a, once))
+            {
+                if(rule.condReg != RegId::Invalid || rule.trace || !rule.command.empty())
+                    mBpRules[a] = rule;
+                if(logical) // module-relative: remember for unbind/re-bind
+                {
+                    lb.once = once;
+                    lb.rule = rule;
+                    lb.boundAddr = a;
+                    moduleBaseByName(lb.module, lb.boundBase);
+                    mLogicalBps.push_back(lb);
+                }
+                printf("%sbreakpoint set at 0x%llX\n", once ? "one-shot " : "", a);
+            }
+            else
+                printf("failed to set breakpoint at 0x%llX\n", a);
         }
-        else if(mProcess->SetBreakpoint(a, once))
+        else // module not loaded yet: bind when it loads
         {
-            if(rule.condReg != RegId::Invalid)
-                mBpRules[a] = rule;
-            printf("%sbreakpoint set at 0x%llX\n", once ? "one-shot " : "", a);
+            lb.once = once;
+            lb.rule = rule;
+            mLogicalBps.push_back(lb);
+            if(!lb.symbol.empty())
+                printf("breakpoint pending module=%s symbol=%s\n", lb.module.c_str(), lb.symbol.c_str());
+            else
+                printf("breakpoint pending module=%s rva=0x%llX\n", lb.module.c_str(), (unsigned long long)lb.rva);
         }
-        else
-            printf("failed to set breakpoint at 0x%llX\n", a);
         fflush(stdout);
         return CmdResult::Handled;
     }
@@ -213,13 +291,38 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         fflush(stdout);
         return CmdResult::Handled;
     }
-    if(cmd == "rbp" && args.size() == 2 && parseAddress(args[1], a))
+    if(cmd == "rbp" && args.size() == 2)
     {
-        mBpRules.erase(a);
-        mIgnoreHits.erase(a);
-        printf(mProcess->DeleteBreakpoint(a) ? "breakpoint removed at 0x%llX\n" : "failed to remove breakpoint at 0x%llX\n", a);
-        fflush(stdout);
-        return CmdResult::Handled;
+        if(parseAddress(args[1], a))
+        {
+            // Drop any logical entry bound at this address too.
+            for(auto it = mLogicalBps.begin(); it != mLogicalBps.end();)
+                it = it->boundAddr == a ? mLogicalBps.erase(it) : std::next(it);
+            mBpRules.erase(a);
+            mIgnoreHits.erase(a);
+            printf(mProcess->DeleteBreakpoint(a) ? "breakpoint removed at 0x%llX\n" : "failed to remove breakpoint at 0x%llX\n", a);
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        LogicalBp spec;
+        if(parseLogicalSpec(args[1], spec))
+        {
+            for(auto it = mLogicalBps.begin(); it != mLogicalBps.end(); ++it)
+            {
+                if(!it->boundAddr && it->module == spec.module &&
+                   it->symbol == spec.symbol && it->rva == spec.rva)
+                {
+                    mLogicalBps.erase(it);
+                    printf("pending breakpoint removed module=%s\n", spec.module.c_str());
+                    fflush(stdout);
+                    return CmdResult::Handled;
+                }
+            }
+            printf("no pending breakpoint for %s\n", args[1].c_str());
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        return CmdResult::NotMine;
     }
     if(cmd == "hbp" && args.size() >= 2 && args.size() <= 4 && parseAddress(args[1], a))
     {

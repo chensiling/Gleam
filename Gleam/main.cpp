@@ -113,6 +113,8 @@ int wmain(int argc, wchar_t* argv[])
     // still reference the debugger while the process is exiting.
     auto dbg = new GleamDebugger();
     bool attached = false;
+    std::wstring filePath;
+    std::wstring commandLine;
     if(!wcscmp(argv[1], L"-a") || !wcscmp(argv[1], L"attach"))
     {
         if(argc < 3)
@@ -131,14 +133,14 @@ int wmain(int argc, wchar_t* argv[])
     }
     else
     {
-        std::wstring filePath(argv[1]);
-        std::wstring commandLine;
+        filePath = argv[1];
         for(int i = 2; i < argc; i++)
         {
             if(!commandLine.empty())
                 commandLine += L' ';
             commandLine += quoteArg(argv[i]);
         }
+        dbg->setLaunched(true); // enables the "restart" command
         // newConsole=false: the debuggee shares our console so its output is captured too.
         if(!dbg->Init(filePath.c_str(), commandLine.empty() ? nullptr : commandLine.c_str(), nullptr, false))
         {
@@ -150,7 +152,23 @@ int wmain(int argc, wchar_t* argv[])
     fflush(stdout);
 
     std::thread repl(replThread, dbg);
-    dbg->Start();
+    for(;;)
+    {
+        dbg->Start();
+        if(!dbg->takeRestartRequest())
+            break;
+        // "restart": same target, same args. Logical breakpoints, exception
+        // filters and hide survive (they re-bind/re-apply); patches, ignore
+        // counts and thread selection are cleared (see resetTransientState).
+        printf("[gleam] restarting '%s'\n", toUtf8(filePath.c_str()).c_str());
+        fflush(stdout);
+        dbg->resetTransientState();
+        if(!dbg->Init(filePath.c_str(), commandLine.empty() ? nullptr : commandLine.c_str(), nullptr, false))
+        {
+            printf("[gleam] restart: failed to start debuggee\n");
+            break;
+        }
+    }
 
     printf("[gleam] session finished%s\n", attached ? " (detached or target exited)" : "");
     fflush(stdout);

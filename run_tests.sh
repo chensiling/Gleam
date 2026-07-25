@@ -461,7 +461,9 @@ for i in $(seq 1 25); do
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S1OK=$((S1OK+1)); else printf '%s' "$out" > /tmp/gleam_S1_fail_$i.txt; fi
-  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  # Kill by exact PID: killing by name races with the next iteration.
+  S1PID=$(printf '%s' "$out" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+  if [ -n "$S1PID" ]; then powershell -NoProfile -Command "Stop-Process -Id $S1PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1; fi
 done
 if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK/25 pause injections (artifacts: /tmp/gleam_S1_fail_*.txt)"; fi
 
@@ -602,7 +604,9 @@ for i in $(seq 1 100); do
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S2OK=$((S2OK+1)); else printf '%s' "$out" > /tmp/gleam_S2_fail_$i.txt; fi
-  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  # Kill by exact PID: killing by name races with the next iteration.
+  S2PID=$(printf '%s' "$out" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+  if [ -n "$S2PID" ]; then powershell -NoProfile -Command "Stop-Process -Id $S2PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1; fi
   sleep 0.3  # let the previous notepad fully exit before the next launch
 done
 if [ "$S2OK" -eq 100 ]; then ok "S2: 100/100 pause injections"; else bad "S2: $S2OK/100 pause injections (artifacts: /tmp/gleam_S2_fail_*.txt)"; fi
@@ -633,7 +637,10 @@ for i in $(seq 1 100); do
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S4OK=$((S4OK+1)); else printf '%s' "$out" > /tmp/gleam_S4_fail_$i.txt; fi
-  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  # Kill by exact PID: "Stop-Process -Name notepad" races with the next
+  # iteration (slow powershell startup can kill the NEW notepad).
+  S4PID=$(printf '%s' "$out" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+  if [ -n "$S4PID" ]; then powershell -NoProfile -Command "Stop-Process -Id $S4PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1; fi
   sleep 0.3
 done
 if [ "$S4OK" -eq 100 ]; then ok "S4: 100/100 runtime pauses"; else bad "S4: $S4OK/100 runtime pauses (artifacts: /tmp/gleam_S4_fail_*.txt)"; fi
@@ -647,7 +654,9 @@ for i in $(seq 1 100); do
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   f=$(printf '%s' "$out" | grep -c 'breakin fail=')
   if [ "$n" -eq 1 ] && [ "$f" -eq 0 ] && [ $ec -eq 0 ]; then S5OK=$((S5OK+1)); else printf '%s' "$out" > /tmp/gleam_S5_fail_$i.txt; fi
-  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  # Kill by exact PID: killing by name races with the next iteration.
+  S5PID=$(printf '%s' "$out" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+  if [ -n "$S5PID" ]; then powershell -NoProfile -Command "Stop-Process -Id $S5PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1; fi
   sleep 0.3
 done
 if [ "$S5OK" -eq 100 ]; then ok "S5: 100/100 hidden runtime pauses"; else bad "S5: $S5OK/100 hidden runtime pauses (artifacts: /tmp/gleam_S5_fail_*.txt)"; fi
@@ -689,6 +698,149 @@ pause
 quit
 EOF
 chkcount "R7: no injection after quit" /tmp/gleam_R7.txt "event breakin injected" 0
+
+# --- U1: address expressions (eval) ---
+run U1 "" <<'EOF'
+eval 140190000+8
+eval (140190000+10)-10
+eval dead+beef
+eval [140190000]
+eval TestTarget!marker
+eval rsp
+eval kernel32
+eval 1+
+eval foo
+read 140190000+4 4
+g
+EOF
+chk "U1: hex add"                /tmp/gleam_U1.txt "= 0x140190008"
+chk "U1: parens and sub"         /tmp/gleam_U1.txt "= 0x140190000"
+chk "U1: bare hex names"         /tmp/gleam_U1.txt "= 0x19D9C"
+chk "U1: deref g_data"           /tmp/gleam_U1.txt "= 0x45542D4D41454C47"
+chkre "U1: module!symbol"        /tmp/gleam_U1.txt "= 0x14007[0-9A-F]+"
+chkre "U1: register"             /tmp/gleam_U1.txt "= 0x[0-9A-F]+"
+chkre "U1: module base"          /tmp/gleam_U1.txt "= 0x7FF[0-9A-F]+"
+chk "U1: syntax error reported"  /tmp/gleam_U1.txt "error: expected a value"
+chk "U1: unknown name reported"  /tmp/gleam_U1.txt "error: unknown name 'foo'"
+chk "U1: expression in read"     /tmp/gleam_U1.txt "4D 2D 54 45"
+
+# --- U2: module-relative delayed breakpoints ---
+run U2 "dll" <<'EOF'
+bp version!GetFileVersionInfoSizeW
+bl
+g
+g
+EOF
+chk "U2: pending at set"         /tmp/gleam_U2.txt "breakpoint pending module=version symbol=GetFileVersionInfoSizeW"
+chk "U2: bl shows pending"       /tmp/gleam_U2.txt "logical module=version symbol=GetFileVersionInfoSizeW pending"
+chk "U2: bound on dll load"      /tmp/gleam_U2.txt "event bp bound module=version address=0x"
+chk "U2: breakpoint hit"         /tmp/gleam_U2.txt "stop reason=breakpoint"
+chk "U2: dll call ran"           /tmp/gleam_U2.txt "DLLCALL_RESULT="
+
+# --- U3: real stack frame enumeration (frames) ---
+run U3 "" <<'EOF'
+bp TestTarget!marker
+g
+frames
+frames 999999
+g
+g
+EOF
+chk "U3: marker frame"           /tmp/gleam_U3.txt "sym=marker+0x"
+chk "U3: main frame"             /tmp/gleam_U3.txt "sym=main+0x"
+chkre "U3: frame format"         /tmp/gleam_U3.txt "frame #[0-9]+ rip=0x[0-9A-F]+ rsp=0x[0-9A-F]+ module=TestTarget"
+chk "U3: unwind provenance"      /tmp/gleam_U3.txt "source=unwind"
+chk "U3: bad tid reported"       /tmp/gleam_U3.txt "thread 999999 not found"
+
+# --- U4: exception filters and disposition ---
+run U4 "exc" <<'EOF'
+excfilter
+excfilter add E0DEAD00 never pass
+excfilter
+g
+EOF
+chk "U4: initially empty"        /tmp/gleam_U4.txt "no exception filters"
+chk "U4: filter listed"          /tmp/gleam_U4.txt "code=0xE0DEAD00 break=never handledby=pass"
+chk "U4: passed to debuggee"     /tmp/gleam_U4.txt "action=passed-to-debuggee"
+chk "U4: survived"               /tmp/gleam_U4.txt "SURVIVED_EXCEPTION"
+
+run U4b "exc" <<'EOF'
+g
+exception pass
+EOF
+chk "U4b: exception stop"        /tmp/gleam_U4b.txt "stop reason=exception code=0xE0DEAD00"
+chk "U4b: pass line"             /tmp/gleam_U4b.txt "passing exception 0xE0DEAD00"
+chk "U4b: survived"              /tmp/gleam_U4b.txt "SURVIVED_EXCEPTION"
+
+run U4c "exc" <<'EOF'
+excfilter add E0DEAD00 never pass
+excfilter del E0DEAD00
+excfilter
+g
+quit
+EOF
+chk "U4c: filter removed"        /tmp/gleam_U4c.txt "exception filter removed code=0xE0DEAD00"
+chk "U4c: empty again"           /tmp/gleam_U4c.txt "no exception filters"
+chk "U4c: pauses again"          /tmp/gleam_U4c.txt "stop reason=exception code=0xE0DEAD00"
+
+run U4d "exc" <<'EOF'
+breakon exception off
+excfilter add E0DEAD00 first pass
+g
+exception pass
+EOF
+chk "U4d: filter overrides breakon" /tmp/gleam_U4d.txt "stop reason=exception code=0xE0DEAD00"
+chk "U4d: survived"              /tmp/gleam_U4d.txt "SURVIVED_EXCEPTION"
+
+# --- U5: typed memory read + savemem ---
+run U5 "" <<'EOF'
+read ansi 140190000
+read u8 140190000
+read u16 140190000
+read u32 140190000
+read u64 140190000
+read u64 1
+savemem 140190000 10 gleam_savemem_test.bin
+g
+EOF
+chk "U5: ansi string"            /tmp/gleam_U5.txt 'string at 0x140190000 = "GLEAM-TEST-DATA!"'
+chk "U5: u8"                     /tmp/gleam_U5.txt "= 0x47"
+chk "U5: u16"                    /tmp/gleam_U5.txt "= 0x4C47"
+chk "U5: u32"                    /tmp/gleam_U5.txt "= 0x41454C47"
+chk "U5: u64"                    /tmp/gleam_U5.txt "= 0x45542D4D41454C47"
+chk "U5: bad address reported"   /tmp/gleam_U5.txt "read failed at 0x1"
+chk "U5: savemem line"           /tmp/gleam_U5.txt "saved 0x10 bytes to gleam_savemem_test.bin holes=0"
+SAVED=$(od -An -v -tx1 gleam_savemem_test.bin 2>/dev/null | tr -d ' \n')
+rm -f gleam_savemem_test.bin
+if [ "$SAVED" = "474c45414d2d544553542d4441544121" ]; then ok "U5: savemem bytes"; else bad "U5: savemem bytes"; fi
+
+# --- U6: full thread context (eflags/dr/xmm/mxcsr) ---
+run U6 "" <<'EOF'
+setreg xmm0 00112233445566778899AABBCCDDEEFF
+setreg eflags 2D5
+setreg dr7 0
+regs
+g
+EOF
+chk "U6: xmm0 roundtrip"         /tmp/gleam_U6.txt "XMM0 =00112233445566778899AABBCCDDEEFF"
+chk "U6: eflags roundtrip"       /tmp/gleam_U6.txt "EFLAGS=000002D5"
+chk "U6: dr line present"        /tmp/gleam_U6.txt "DR7=0000000000000000"
+chk "U6: mxcsr present"          /tmp/gleam_U6.txt "MXCSR="
+
+# --- U7: session restart ---
+run U7 "" <<'EOF'
+bp TestTarget!marker
+patch 140190000 90 90
+restart
+bl
+g
+quit
+EOF
+chk "U7: restart requested"      /tmp/gleam_U7.txt "restart requested"
+chk "U7: patches cleared"        /tmp/gleam_U7.txt "patches cleared on restart"
+chkcount "U7: two sessions"      /tmp/gleam_U7.txt "stop reason=system" 2
+chk "U7: logical bp rebound"     /tmp/gleam_U7.txt "logical module=testtarget symbol=marker bound=0x140076BD0"
+chk "U7: bp hits after restart"  /tmp/gleam_U7.txt "stop reason=breakpoint"
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<'EOF'

@@ -155,6 +155,26 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         return CmdResult::Resume;
     }
 
+    // restart: terminate the target and re-launch it with the same path and
+    // args (main.cpp's session loop). Logical breakpoints, exception filters
+    // and hide survive; patches/ignore counts/thread selection are cleared.
+    if(cmd == "restart" && args.size() == 1)
+    {
+        if(!mHasLaunchInfo)
+        {
+            printf("restart requires a launched session (not attach)\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        printf("restart requested\n");
+        fflush(stdout);
+        mRestartPending = true;
+        mQuitting = true; // no pause injections during shutdown
+        cleanupBreakInStub();
+        Stop(); // the exit event ends Start(); main.cpp re-Inits
+        return CmdResult::Resume;
+    }
+
     if(cmd == "hide")
     {
         bool on = args.size() == 1 || args[1] == "on";
@@ -289,11 +309,94 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         uint64_t code = 0;
         if(parseHex(args[1], code) && code <= 0xFFFFFFFF)
         {
-            mIgnoredExceptions.insert((uint32_t)code);
+            // Sugar for "excfilter add <code> never pass".
+            mExFilters[(uint32_t)code] = ExFilter{};
             printf("will pass exception 0x%08llX to the debuggee\n", code);
         }
         else
             printf("usage: ignoreexc <hexcode>\n");
+        fflush(stdout);
+        return CmdResult::Handled;
+    }
+
+    // exception pass|handle: disposition for the CURRENT exception stop.
+    if(cmd == "exception" && args.size() == 2)
+    {
+        if(!mPausedOnException || !mLastExceptionValid)
+        {
+            printf("not paused on an exception\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        if(args[1] == "pass")
+        {
+            mContinueStatus = DBG_EXCEPTION_NOT_HANDLED;
+            printf("passing exception 0x%08lX to the debuggee\n", mLastException.ExceptionCode);
+            fflush(stdout);
+            return CmdResult::Resume;
+        }
+        if(args[1] == "handle")
+        {
+            if(!mLastExceptionFirstChance)
+                printf("warning: swallowing a second-chance exception\n");
+            mContinueStatus = DBG_CONTINUE;
+            printf("swallowing exception 0x%08lX\n", mLastException.ExceptionCode);
+            fflush(stdout);
+            return CmdResult::Resume;
+        }
+        printf("usage: exception pass|handle\n");
+        fflush(stdout);
+        return CmdResult::Handled;
+    }
+
+    if(cmd == "excfilter")
+    {
+        if(args.size() == 1)
+        {
+            if(mExFilters.empty())
+                printf("no exception filters\n");
+            for(const auto & kv : mExFilters)
+                printf("code=0x%08X break=%s handledby=%s\n", kv.first,
+                       kv.second.breakOn == 0 ? "first" : kv.second.breakOn == 1 ? "second" : "never",
+                       kv.second.handledBy == 1 ? "swallow" : "pass");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        if(args[1] == "add" && args.size() >= 3 && args.size() <= 5)
+        {
+            uint64_t code = 0;
+            ExFilter f;
+            bool ok = parseHex(args[2], code) && code <= 0xFFFFFFFF;
+            for(size_t i = 3; ok && i < args.size(); i++)
+            {
+                if(args[i] == "first") f.breakOn = 0;
+                else if(args[i] == "second") f.breakOn = 1;
+                else if(args[i] == "never") f.breakOn = 2;
+                else if(args[i] == "pass") f.handledBy = 0;
+                else if(args[i] == "swallow") f.handledBy = 1;
+                else ok = false;
+            }
+            if(ok)
+            {
+                mExFilters[(uint32_t)code] = f;
+                printf("exception filter added code=0x%08llX\n", code);
+            }
+            else
+                printf("usage: excfilter add <hexcode> [first|second|never] [pass|swallow]\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        if(args[1] == "del" && args.size() == 3)
+        {
+            uint64_t code = 0;
+            if(parseHex(args[2], code) && mExFilters.erase((uint32_t)code))
+                printf("exception filter removed code=0x%08llX\n", code);
+            else
+                printf("no exception filter for %s\n", args[2].c_str());
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        printf("usage: excfilter [add <hexcode> [first|second|never] [pass|swallow] | del <hexcode>]\n");
         fflush(stdout);
         return CmdResult::Handled;
     }

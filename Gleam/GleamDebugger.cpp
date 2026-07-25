@@ -1,8 +1,21 @@
 #include "GleamDebugger.h"
 
 #include <cstdio>
+#include <psapi.h>
 
 using namespace GleeBug;
+
+namespace
+{
+    // Normalized module name for a loaded module base ("" on failure).
+    std::string moduleNameFromBase(HANDLE hProcess, uint64_t base)
+    {
+        char path[MAX_PATH] = "";
+        if(!GetModuleFileNameExA(hProcess, (HMODULE)base, path, sizeof(path)))
+            return std::string();
+        return normalizeModuleName(path);
+    }
+}
 
 bool GleamDebugger::pushCommand(const std::string & cmd)
 {
@@ -312,6 +325,8 @@ void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread,
 
 void GleamDebugger::cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
 {
+    // Logical breakpoints bind regardless of the breakon dll switch.
+    bindModuleBreakpoints((uint64_t)loadDll.lpBaseOfDll);
     if(!mBreakOnDll)
         return;
     char details[80];
@@ -322,6 +337,10 @@ void GleamDebugger::cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
 
 void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
 {
+    // Unbind keeps the logical entries: a reload re-binds them.
+    unbindModuleBreakpoints((uint64_t)unloadDll.lpBaseOfDll);
+    // The module's cached .pdata is stale from here on.
+    mPdataCache.erase((uint64_t)unloadDll.lpBaseOfDll);
     if(!mBreakOnDll)
         return;
     char details[80];
@@ -330,12 +349,133 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
     mWantsPause = true;
 }
 
+// Bind pending module-relative breakpoints whose module just loaded.
+void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase)
+{
+    if(mLogicalBps.empty() || !mProcess)
+        return;
+    // During the load event the loader-list APIs are still blind; the PE
+    // export directory carries the DLL's own name and needs no loader list.
+    std::string name = dllNameFromBase(moduleBase);
+    if(name.empty())
+        name = moduleNameFromBase(mProcess->hProcess, moduleBase); // fallback
+    name = normalizeModuleName(name);
+    if(name.empty())
+        return;
+    for(auto & lb : mLogicalBps)
+    {
+        if(lb.boundAddr || lb.module != name)
+            continue;
+        uint64_t addr = 0;
+        if(!lb.symbol.empty())
+        {
+            addr = findExportByName(moduleBase, lb.symbol);
+            if(!addr) // dbghelp fallback (PDB-only symbols)
+                resolveModuleSymbol(lb.module + "!" + lb.symbol, addr);
+            if(!addr)
+                continue; // stay pending (symbols may be unavailable)
+        }
+        else
+            addr = moduleBase + lb.rva;
+        if(!mProcess->SetBreakpoint(addr, lb.once))
+            continue;
+        lb.boundAddr = addr;
+        lb.boundBase = moduleBase;
+        if(lb.rule.condReg != RegId::Invalid || lb.rule.trace || !lb.rule.command.empty())
+            mBpRules[addr] = lb.rule;
+        printf("event bp bound module=%s address=0x%llX\n",
+               name.c_str(), (unsigned long long)addr);
+        fflush(stdout);
+    }
+}
+
+// Unbind breakpoints of an unloading module; the logical entries survive.
+void GleamDebugger::unbindModuleBreakpoints(uint64_t moduleBase)
+{
+    if(mLogicalBps.empty() || !mProcess)
+        return;
+    for(auto & lb : mLogicalBps)
+    {
+        if(!lb.boundAddr || lb.boundBase != moduleBase)
+            continue;
+        // The DLL is still mapped while the unload event is delivered, so the
+        // engine can restore the original bytes cleanly. A one-shot entry
+        // that already fired simply fails DeleteBreakpoint - harmless.
+        mProcess->DeleteBreakpoint(lb.boundAddr);
+        mBpRules.erase(lb.boundAddr);
+        printf("event bp unbound module=%s address=0x%llX\n",
+               lb.module.c_str(), (unsigned long long)lb.boundAddr);
+        lb.boundAddr = 0;
+        lb.boundBase = 0;
+        fflush(stdout);
+    }
+}
+
+// Try to bind every pending logical breakpoint whose module is already
+// loaded. Needed because the main module never fires a load event.
+void GleamDebugger::rebindPendingBreakpoints()
+{
+    if(mLogicalBps.empty() || !mProcess)
+        return;
+    for(const auto & lb : mLogicalBps)
+    {
+        if(lb.boundAddr)
+            continue;
+        uint64_t base = 0;
+        if(moduleBaseByName(lb.module, base))
+            bindModuleBreakpoints(base);
+    }
+}
+
+// Clear per-session state before a restart. See the policy comment in
+// GleamDebugger.h (what survives vs what is cleared).
+void GleamDebugger::resetTransientState()
+{
+    mSelectedThreadId = 0;
+    mLastExceptionValid = false;
+    mPausedOnException = false;
+    mWantsPause = false;
+    mStepArmed = false;
+    mStepOverArmed = false;
+    mTraceActive = false;
+    mStepOutActive = false;
+    mStepOutPending = false;
+    mIgnoreHits.clear();
+    mBpRules.clear();
+    mPdataCache.clear();
+    mHideOriginals.clear(); // old-process writes are meaningless now
+    mOepBreakpoint = 0;
+    mBreakInExpected = false;
+    mPauseAfterResume = false;
+    mExitThreadAddr = 0;
+    mDbgBreakInAddr = 0;
+    mExitThreadResolveAttempts = 0;
+    mQuitting = false; // was set to shut the old session down cleanly
+    if(!mPatches.empty())
+    {
+        // Patches never auto-reapply: the new process must be re-examined
+        // and patched deliberately (fingerprint + original-bytes policy).
+        printf("patches cleared on restart\n");
+        mPatches.clear();
+    }
+    // Logical breakpoints survive but must re-bind in the new session.
+    for(auto & lb : mLogicalBps)
+    {
+        lb.boundAddr = 0;
+        lb.boundBase = 0;
+    }
+    fflush(stdout);
+}
+
 void GleamDebugger::cbSystemBreakpoint()
 {
     emitStop("system", nullptr);
     // At the system breakpoint all system DLLs are fully loaded, unlike at
     // process-creation time.
     resolveBreakInSymbols();
+    // The main module has no load event: bind its logical breakpoints here
+    // (also covers re-binding after a restart).
+    rebindPendingBreakpoints();
     // Best moment to hide: no target code has run yet.
     if(mHideOn)
         applyHides();
@@ -347,6 +487,7 @@ void GleamDebugger::cbAttachBreakpoint()
     // Fired (instead of the system breakpoint) when attached to a process.
     emitStop("attach", nullptr);
     resolveBreakInSymbols();
+    rebindPendingBreakpoints();
     mWantsPause = true;
 }
 
@@ -506,19 +647,33 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
         return;
     }
 
-    // Filtered exception codes are passed to the debuggee's own handlers
-    // (DBG_EXCEPTION_NOT_HANDLED) without pausing - NOT DBG_CONTINUE, which
-    // would swallow the exception entirely.
-    if(mIgnoredExceptions.count(exceptionRecord.ExceptionCode))
+    // Exception filters decide: break at this chance (overrides the breakon
+    // switch), or apply the configured disposition without pausing. "pass"
+    // keeps the engine default DBG_EXCEPTION_NOT_HANDLED (the debuggee's own
+    // handlers run); "swallow" is DBG_CONTINUE.
+    bool shouldPause = !firstChance || mBreakOnException;
+    auto filter = mExFilters.find(exceptionRecord.ExceptionCode);
+    if(filter != mExFilters.end())
     {
-        printf("event exception code=0x%08lX action=passed-to-debuggee\n", exceptionRecord.ExceptionCode);
-        fflush(stdout);
-        return;
+        const ExFilter & f = filter->second;
+        const bool breakNow = (f.breakOn == 0 && firstChance) || (f.breakOn == 1 && !firstChance);
+        if(breakNow)
+            shouldPause = true;
+        else
+        {
+            if(f.handledBy == 1)
+                mContinueStatus = DBG_CONTINUE;
+            printf("event exception code=0x%08lX action=%s\n",
+                   exceptionRecord.ExceptionCode,
+                   f.handledBy == 1 ? "swallowed" : "passed-to-debuggee");
+            fflush(stdout);
+            return;
+        }
     }
 
     // Second chance always pauses (last chance before the process dies);
     // first chance follows the "breakon exception" switch.
-    if(!firstChance || mBreakOnException)
+    if(shouldPause)
     {
         char details[128];
         sprintf_s(details, "code=0x%08lX address=0x%p chance=%s",
@@ -526,6 +681,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
                   exceptionRecord.ExceptionAddress,
                   firstChance ? "first" : "second");
         emitStop("exception", details);
+        mPausedOnException = true;
         mWantsPause = true;
     }
 }

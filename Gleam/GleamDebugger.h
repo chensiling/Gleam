@@ -17,6 +17,9 @@
 // Shared parsing helper (GleamCommands.cpp).
 bool parseHex(const std::string & s, uint64_t & out);
 
+// Shared helper (GleamCommands.cpp): basename, lowercase, ".dll" stripped.
+std::string normalizeModuleName(const std::string & name);
+
 // Command-driven headless debugger based on GleeBug.
 //
 // The debug loop (Init/Attach + Start) runs on the caller's thread. A REPL
@@ -50,6 +53,15 @@ public:
     // Terminate the stub thread, wait for it to die, close the handle, and
     // only then free the page - never free memory a stub thread may run on.
     void cleanupBreakInStub();
+
+    // "restart" support (main.cpp drives the re-Init + Start loop).
+    void setLaunched(bool launched) { mHasLaunchInfo = launched; }
+    bool takeRestartRequest() { const bool r = mRestartPending; mRestartPending = false; return r; }
+    // Clear per-session state before a restart. Survives: logical
+    // breakpoints (re-bind on module load), exception filters, breakon
+    // switches, hide. Cleared: patches, ignore counts, thread selection,
+    // last-exception state, all transient stepping/trace state.
+    void resetTransientState();
 
 private:
     // Unguarded break-in, only valid at the just-before-continue point.
@@ -113,8 +125,12 @@ private:
 
     // Inspect.cpp
     static bool registerByName(const std::string & name, RegId & reg);
+    bool setRegisterExtended(const std::string & name, const std::string & valueText);
     void cmdRegs();
     void cmdRead(uint64_t addr, uint64_t size);
+    void cmdReadTyped(const char* type, uint64_t addr);          // u8/u16/u32/u64/ptr
+    void cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16);
+    void cmdSaveMem(uint64_t addr, uint64_t size, const std::string & file);
     void cmdWrite(uint64_t addr, const std::vector<uint8_t> & bytes);
     void cmdThreads();
     void cmdDisasm(uint64_t addr, uint64_t count);
@@ -143,6 +159,31 @@ private:
     bool evalBpRule(const GleeBug::BreakpointInfo & info, const BpRule* rule); // true = pause normally
     bool evalCondition(RegId reg, int op, uint64_t value); // current thread registers
     static bool parseCondition(const std::string & text, RegId & reg, int & op, uint64_t & value);
+
+    // Module-relative logical breakpoints ("bp module!symbol" / "bp module+rva").
+    // A pending entry binds when its module loads; unbind on unload keeps the
+    // entry so a reload (or ASLR base change) re-binds to the right address.
+    struct LogicalBp
+    {
+        std::string module;          // normalized: lowercase, basename, no .dll
+        std::string symbol;          // empty = rva form
+        uint64_t rva = 0;
+        bool once = false;
+        BpRule rule;
+        GleeBug::ptr boundAddr = 0;  // 0 = pending
+        uint64_t boundBase = 0;      // module base this binding belongs to
+    };
+    std::vector<LogicalBp> mLogicalBps;
+    // Parse "module!symbol" or "module+<hexrva>"; module part must look like
+    // a module name (not a hex literal / not a pure expression).
+    static bool parseLogicalSpec(const std::string & s, LogicalBp & out);
+    // GleamDebugger.cpp: (un)bind on DLL load/unload events.
+    void bindModuleBreakpoints(uint64_t moduleBase);
+    void unbindModuleBreakpoints(uint64_t moduleBase);
+    // Try to bind every pending entry whose module is already loaded
+    // (system/attach breakpoint time - covers the main module, which has no
+    // load event, and modules loaded before a restart).
+    void rebindPendingBreakpoints();
 
     // Hide.cpp: anti-anti-debug.
     void cmdHide(bool on);
@@ -179,8 +220,39 @@ private:
     void cmdImports(const std::string & moduleName);
     void cmdExports(const std::string & moduleName, const std::string & filter);
     void cmdSym(uint64_t addr);
-    // Resolve an address argument: hex literal or "module!symbol".
+    // Real stack frame enumeration ("frames"): RtlVirtualUnwind over a local
+    // mirror of the remote stack + our own .pdata lookup (StackWalk64 leaves
+    // the x64 frame stale; dbghelp's SymFunctionTableAccess64 is unreliable).
+    // Verified frames only - heuristic guessing stays in stackscan.
+    void cmdFrames(uint32_t tid, uint64_t maxFrames);
+    RUNTIME_FUNCTION* findRuntimeFunction(uint64_t pc);
+    uint64_t moduleBaseOf(uint64_t addr);
+    // Session cache: module base -> remote .pdata (sorted by RVA).
+    struct PdataCache
+    {
+        std::vector<RUNTIME_FUNCTION> entries;
+        uint32_t dirRva = 0;  // exception directory range, for resolving
+        uint32_t dirSize = 0; // indirect table entries
+    };
+    std::map<uint64_t, PdataCache> mPdataCache;
+    // Resolve an address argument: any expression accepted by evalExpression
+    // (hex, registers, module base, module!symbol, [deref], +/-, parentheses).
     bool parseAddress(const std::string & s, uint64_t & out);
+    // Look up a loaded module's base by name (case-insensitive, .dll optional).
+    bool moduleBaseByName(const std::string & name, uint64_t & base);
+    // Resolve "module!symbol" through the dbghelp session.
+    bool resolveModuleSymbol(const std::string & modSym, uint64_t & out);
+    // Loader-list-independent module identity + export resolution (they work
+    // during the DLL load event, when EnumProcessModules/dbghelp are blind).
+    std::string dllNameFromBase(uint64_t base);
+    uint64_t findExportByName(uint64_t base, const std::string & name);
+
+    // Expr.cpp: address expression evaluation. See the grammar comment there.
+    bool evalExpression(const std::string & s, uint64_t & out, std::string & err);
+    bool exprParseSum(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
+    bool exprParseUnary(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
+    bool exprParseAtom(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
+    bool exprReadPointer(uint64_t addr, uint64_t & out);
     // Best-effort symbol name for an address (empty on failure).
     std::string symNameByAddr(uint64_t addr);
     // OEP (AddressOfEntryPoint) of a loaded module, 0 on failure.
@@ -233,15 +305,24 @@ private:
     GleeBug::ptr mOepBreakpoint = 0; // one-shot OEP breakpoint address (0 = none)
 
     std::map<GleeBug::ptr, uint32_t> mIgnoreHits;  // breakpoint address -> remaining ignores
-    std::set<uint32_t> mIgnoredExceptions;         // exception codes to pass to the debuggee
+    // Exception filters ("excfilter"): per-code break chance + disposition.
+    struct ExFilter
+    {
+        int breakOn = 2;    // 0=first chance, 1=second chance, 2=never
+        int handledBy = 0;  // 0=pass to debuggee (NOT_HANDLED), 1=swallow (DBG_CONTINUE)
+    };
+    std::map<uint32_t, ExFilter> mExFilters;
     EXCEPTION_RECORD mLastException{};
     bool mLastExceptionValid = false;
     bool mLastExceptionFirstChance = false;
+    bool mPausedOnException = false; // the current pause is an exception stop
     uint32_t mSelectedThreadId = 0;                // 0 = follow the event thread
     bool mSymInitialized = false;                  // dbghelp session is up
     bool mHideOn = false;                          // anti-anti-debug enabled
     std::map<uint64_t, std::vector<uint8_t>> mPatches; // patch addr -> original bytes
     std::vector<std::pair<uint64_t, std::vector<uint8_t>>> mHideOriginals; // hide writes, for restore
+    bool mHasLaunchInfo = false;    // launched (not attached): "restart" allowed
+    bool mRestartPending = false;   // "restart" command consumed by main.cpp
 };
 
 #endif //GLEAM_DEBUGGER_H

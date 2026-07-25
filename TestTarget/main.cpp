@@ -56,6 +56,26 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if(argc > 1 && !strcmp(argv[1], "dll"))
+    {
+        // Load a DLL that is NOT loaded at process creation, so the debugger
+        // can exercise module-relative pending breakpoints. Falls through to
+        // the normal body afterwards.
+        HMODULE ver = LoadLibraryW(L"version.dll");
+        if(ver)
+        {
+            printf("DLL_LOADED=1\n");
+            auto fn = (DWORD(WINAPI*)(LPCWSTR, LPDWORD))GetProcAddress(ver, "GetFileVersionInfoSizeW");
+            if(fn)
+            {
+                DWORD handle = 0;
+                DWORD size = fn(L"C:\\Windows\\notepad.exe", &handle);
+                printf("DLLCALL_RESULT=%lu\n", size);
+            }
+        }
+        fflush(stdout);
+    }
+
     CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 
     printf("ISDEBUGGERPRESENT=%d\n", IsDebuggerPresent() ? 1 : 0);

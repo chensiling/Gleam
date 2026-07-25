@@ -18,6 +18,21 @@ bool parseHex(const std::string & s, uint64_t & out)
     return end && *end == '\0' && end != p;
 }
 
+std::string normalizeModuleName(const std::string & name)
+{
+    // Keep only the basename.
+    size_t slash = name.find_last_of("\\/");
+    std::string base = slash == std::string::npos ? name : name.substr(slash + 1);
+    // Lowercase (Windows module names are case-insensitive).
+    for(auto & c : base)
+        c = (char)tolower((unsigned char)c);
+    // Strip a trailing ".dll" / ".exe".
+    if(base.size() > 4 && (base.compare(base.size() - 4, 4, ".dll") == 0 ||
+                           base.compare(base.size() - 4, 4, ".exe") == 0))
+        base.resize(base.size() - 4);
+    return base;
+}
+
 void GleamDebugger::cmdHelp()
 {
     printf(
@@ -29,8 +44,11 @@ void GleamDebugger::cmdHelp()
         "  pause                   interrupt a running debuggee\n"
         "  detach                  detach at the next suspended state (pause first if running)\n"
         "  quit                    terminate at the next suspended state (pause first if running)\n"
+        "  restart                 terminate and re-launch the target (same path/args;\n"
+        "                          logical breakpoints, exception filters and hide survive)\n"
         "breakpoints:\n"
         "  bp <hexaddr> [once]     set software breakpoint\n"
+        "  bp <mod>!<sym> / <mod>+<rva>  module-relative bp (pending until the dll loads)\n"
         "  bp <addr> if <r><op><v>  conditional bp (op: == != < >)\n"
         "  trace <addr>            tracepoint (log hit, auto-continue)\n"
         "  rbp <hexaddr>           remove software breakpoint\n"
@@ -41,15 +59,21 @@ void GleamDebugger::cmdHelp()
         "  bl                      list breakpoints\n"
         "  ignore <hexaddr> <n>    skip the next n hits of a breakpoint\n"
         "inspection:\n"
-        "  regs                    dump registers\n"
-        "  setreg <name> <hexval>  set register (rax..r15, rip)\n"
+        "  regs                    dump registers (GPR, EFLAGS, DR, XMM, MXCSR)\n"
+        "  setreg <name> <hexval>  set register (rax..r15, rip, eflags, dr0-7, mxcsr;\n"
+        "                          xmm0-15 take 32 hex chars, high half first.\n"
+        "                          warning: writing dr registers desyncs hw breakpoints)\n"
         "  read <hexaddr> <size>   read memory (hex dump)\n"
+        "  read u8|u16|u32|u64|ptr <addr>  typed read (single value)\n"
+        "  read ansi|utf16 <addr> [n]  read string (default max 256)\n"
+        "  savemem <addr> <size> <file>  export raw memory (page-granular, zero-filled holes)\n"
         "  write <hexaddr> <b...>  write memory (hex bytes)\n"
         "  disasm [hexaddr] [n]    disassemble n instructions (default: rip, 8)\n"
         "  maps                    list committed memory regions\n"
         "  modules                 list loaded modules\n"
         "  find <addr> <size> <pat>  search memory (pattern with ?? wildcards)\n"
         "  find <addr> <size> ascii|utf16 <text>  search string\n"
+        "  eval <expr>             evaluate an address expression\n"
         "  patch <addr> <b...>     patch memory (original bytes recorded)\n"
         "  patches                 list patches\n"
         "  restore <addr>          restore original bytes\n"
@@ -58,17 +82,21 @@ void GleamDebugger::cmdHelp()
         "  until <addr>            run until address\n"
         "  hide [on|off]           anti-anti-debug (apply now + at system bp)\n"
         "  bt                      naive stack backtrace (rbp chain)\n"
+        "  frames [tid] [n]        real stack frames (StackWalk64 + .pdata; verified only)\n"
         "  exinfo                  show last exception\n"
         "  imports [module]        import table of a module (default: main)\n"
         "  exports <module> [pat]  exports of a module, optional wildcard filter\n"
         "  breakon [sw] [on|off]   pause switches: entry/dll/thread/exception\n"
         "\n"
-        "addresses accept hex or module!symbol (e.g. bp kernel32!CreateFileW)\n"
+        "addresses accept expressions: hex, registers, module, module!symbol,\n"
+        "  [deref], +/- and parentheses (e.g. bp kernel32!CreateFileW, read [rsp+8] 10)\n"
         "pauses are reported as: stop reason=<r> ... rip=0x... tid=<id>\n"
         "  threads                 list threads\n"
         "  thread [tid]            show/select the thread commands apply to\n"
         "exception filters:\n"
-        "  ignoreexc <hexcode>     pass an exception code to the debuggee\n");
+        "  ignoreexc <hexcode>     pass an exception code to the debuggee\n"
+        "  exception pass|handle   disposition for the current exception stop\n"
+        "  excfilter [add <code> [first|second|never] [pass|swallow] | del <code>]\n");
     fflush(stdout);
 }
 
@@ -111,7 +139,10 @@ bool GleamDebugger::executeCommand(const std::string & cmdLine)
     {
         auto result = (this->*entry.handler)(args);
         if(result == CmdResult::Resume)
+        {
+            mPausedOnException = false;
             return true;
+        }
         if(result == CmdResult::Handled)
             return false;
     }
