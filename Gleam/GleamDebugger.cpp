@@ -20,9 +20,9 @@ void GleamDebugger::requestPause()
 {
     // Set-then-check: the request is published first, then both sides race
     // to consume it with exchange(). Whoever wins injects; the loser finds
-    // the flag already gone. No request can strand between the checks.
+    // the flag already gone. Once quitting, requests are refused entirely.
     mPauseAfterResume.store(true);
-    if(!mIsPaused.load() && !mInDebugEvent.load())
+    if(!mIsPaused.load() && !mInDebugEvent.load() && !mQuitting.load())
     {
         if(mPauseAfterResume.exchange(false))
             forceBreakIn();
@@ -31,14 +31,34 @@ void GleamDebugger::requestPause()
 
 void GleamDebugger::forceBreakIn()
 {
+    // Serialize against cleanup and the quitting transition: no injection
+    // may interleave with a cleanup or start after quitting began.
+    std::lock_guard<std::mutex> lock(mBreakInMutex);
+    if(mQuitting.load())
+    {
+        printf("event breakin skip=quitting\n");
+        fflush(stdout);
+        return;
+    }
+
     auto process = mProcess;
     if(!process)
+    {
+        // Engine state not ready (no process event processed yet): do NOT
+        // drop the request - re-defer it; the next event's consume point
+        // will fire the injection with mProcess in place.
+        mPauseAfterResume.store(true);
         return;
+    }
 
     // A stub break-in is already in flight: don't inject another one (the
     // pending event will arrive and clean itself up).
     if(mBreakInStubThread.load())
+    {
+        printf("event breakin skip=in_flight\n");
+        fflush(stdout);
         return;
+    }
 
     // NOTE: DebugBreakProcess checks PEB.BeingDebugged and refuses to inject
     // when it is cleared (our "hide" does exactly that), so inject our own
@@ -80,12 +100,24 @@ void GleamDebugger::forceBreakIn()
 
 void GleamDebugger::cleanupBreakInStub()
 {
-    if(auto hThread = mBreakInStubThread.exchange(nullptr))
+    std::lock_guard<std::mutex> lock(mBreakInMutex);
+    auto hThread = mBreakInStubThread.load();
+    if(hThread)
     {
         TerminateThread(hThread, 0);
-        // Never free the page while the stub thread may still execute on it.
-        WaitForSingleObject(hThread, 1000);
+        // Only after the thread is CONFIRMED dead may the page go away;
+        // on timeout keep the handle and the page and say so visibly.
+        DWORD wr = WaitForSingleObject(hThread, 1000);
+        if(wr != WAIT_OBJECT_0)
+        {
+            printf("event breakin cleanup wait=0x%lX (thread+page kept)\n", wr);
+            fflush(stdout);
+            CloseHandle(hThread);
+            mBreakInStubThread.store(nullptr);
+            return; // page intentionally kept
+        }
         CloseHandle(hThread);
+        mBreakInStubThread.store(nullptr);
     }
     if(auto page = mBreakInStubPage.exchange(nullptr))
         VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
@@ -224,13 +256,25 @@ void GleamDebugger::cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & creat
     if(mBreakOnEntry)
         applyEntryBreakpoint();
 
-    // Cache kernel32!ExitThread for the break-in stub (resolved here on the
-    // debugger thread; dbghelp is not thread-safe).
+    // Resolve break-in related symbols on the debugger thread (dbghelp is
+    // not thread-safe).
+    resolveBreakInSymbols();
+}
+
+// Resolve (and retry) the addresses needed for stub/fallback break-ins.
+void GleamDebugger::resolveBreakInSymbols()
+{
     if(!mExitThreadAddr.load())
     {
         uint64_t addr = 0;
         if(parseAddress("kernel32!ExitThread", addr))
             mExitThreadAddr.store(addr);
+    }
+    if(!mDbgBreakInAddr.load())
+    {
+        uint64_t addr = 0;
+        if(parseAddress("ntdll!DbgUiRemoteBreakin", addr))
+            mDbgBreakInAddr.store(addr);
     }
 }
 
@@ -289,14 +333,9 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
 void GleamDebugger::cbSystemBreakpoint()
 {
     emitStop("system", nullptr);
-    // Resolve ExitThread here too: at the system breakpoint all system DLLs
-    // are fully loaded, unlike at process-creation time.
-    if(!mExitThreadAddr.load())
-    {
-        uint64_t addr = 0;
-        if(parseAddress("kernel32!ExitThread", addr))
-            mExitThreadAddr.store(addr);
-    }
+    // At the system breakpoint all system DLLs are fully loaded, unlike at
+    // process-creation time.
+    resolveBreakInSymbols();
     // Best moment to hide: no target code has run yet.
     if(mHideOn)
         applyHides();
@@ -307,12 +346,7 @@ void GleamDebugger::cbAttachBreakpoint()
 {
     // Fired (instead of the system breakpoint) when attached to a process.
     emitStop("attach", nullptr);
-    if(!mExitThreadAddr.load())
-    {
-        uint64_t addr = 0;
-        if(parseAddress("kernel32!ExitThread", addr))
-            mExitThreadAddr.store(addr);
-    }
+    resolveBreakInSymbols();
     mWantsPause = true;
 }
 
@@ -430,13 +464,16 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     mLastExceptionValid = true;
     mLastExceptionFirstChance = firstChance;
 
-    // Our own break-in (triggered by "pause"). Two identification paths:
-    // the stub's exception address (race-free), or the fallback flag.
+    // Our own break-in (triggered by "pause"). Identification, most precise
+    // first: the stub's exception address, then the fallback thread's
+    // DbgUiRemoteBreakin address, then the fallback flag as last resort.
     const bool isStubBreakIn = exceptionRecord.ExceptionCode == STATUS_BREAKPOINT &&
                                mBreakInStubPage.load() != nullptr &&
                                exceptionRecord.ExceptionAddress == mBreakInStubPage.load();
     const bool isFallbackBreakIn = exceptionRecord.ExceptionCode == STATUS_BREAKPOINT &&
-                                   mBreakInExpected.exchange(false);
+                                   ((mDbgBreakInAddr.load() != 0 &&
+                                     (uint64_t)exceptionRecord.ExceptionAddress == mDbgBreakInAddr.load()) ||
+                                    mBreakInExpected.exchange(false));
     if(isStubBreakIn || isFallbackBreakIn)
     {
         mContinueStatus = DBG_CONTINUE;
@@ -491,7 +528,19 @@ void GleamDebugger::cbPreDebugEvent(const DEBUG_EVENT & debugEvent)
 
 void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
 {
-    if(mWantsPause && !mQuitting && mProcess && mThread)
+    // Event-opportunity retry for break-in symbol resolution (rate-limited
+    // logging; the pending state is simply "address still zero").
+    if(!mExitThreadAddr.load() || !mDbgBreakInAddr.load())
+    {
+        if(mExitThreadResolveAttempts++ % 32 == 0)
+        {
+            printf("event breakin resolve retry=%u\n", mExitThreadResolveAttempts);
+            fflush(stdout);
+        }
+        resolveBreakInSymbols();
+    }
+
+    if(mWantsPause && !mQuitting.load() && mProcess && mThread)
     {
         mWantsPause = false;
         commandLoop();
@@ -502,10 +551,14 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
     // When quitting (detach/quit in flight), stale requests are DISCARDED:
     // injecting a stub into a target we are letting go would crash it.
     mInDebugEvent.store(false);
-    if(mQuitting)
+    if(mQuitting.load())
         mPauseAfterResume.store(false);
     else if(mPauseAfterResume.exchange(false))
+    {
+        printf("event breakin deferred-fire\n");
+        fflush(stdout);
         forceBreakIn();
+    }
 }
 
 void GleamDebugger::commandLoop()

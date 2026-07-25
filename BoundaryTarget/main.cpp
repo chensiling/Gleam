@@ -8,7 +8,7 @@
 int main()
 {
     // Fixed hint address so tests can hardcode it (fails loudly if taken).
-    auto base = (uint8_t*)VirtualAlloc((LPVOID)0x60000000, 0x200000,
+    auto base = (uint8_t*)VirtualAlloc((LPVOID)0x60000000, 0x300000,
                                        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if(!base)
     {
@@ -16,7 +16,7 @@ int main()
         fflush(stdout);
         return 1;
     }
-    memset(base, 0x90, 0x200000); // nop sled
+    memset(base, 0x90, 0x300000); // nop sled
 
     base[0] = 0xC3; // ret at base: the (unique) call target
     base[0x100] = 0xE8; // control call, NOT straddling
@@ -51,6 +51,14 @@ int main()
 
     printf("BASE=%p\n", (void*)base);
     printf("STRADDLER=%p\n", (void*)p);
+
+    // jmp rel8 (2 bytes) straddling the SECOND 1MB boundary (base+2MB):
+    // starts 1 byte before it, targets a ret close by.
+    uint8_t* nearTarget2 = base + 0x200000 + 0x42;
+    *nearTarget2 = 0xC3;
+    uint8_t* j2 = base + 0x200000 - 1;
+    j2[0] = 0xEB;
+    j2[1] = (uint8_t)(nearTarget2 - (j2 + 2));
     fflush(stdout);
 
     __debugbreak(); // hand control to the debugger with the region in place

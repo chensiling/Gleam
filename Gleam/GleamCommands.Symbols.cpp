@@ -107,6 +107,7 @@ namespace
         uint32_t sizeOfImage = 0;
         IMAGE_DATA_DIRECTORY importDir{};
         IMAGE_DATA_DIRECTORY delayImportDir{};
+        IMAGE_DATA_DIRECTORY exceptionDir{};
     };
 
     PeInfo readPeDirectories(Process* process, uint64_t base)
@@ -135,6 +136,7 @@ namespace
             info.sizeOfImage = opt.SizeOfImage;
             info.importDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+            info.exceptionDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
         }
         else if(magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
         {
@@ -146,6 +148,7 @@ namespace
             info.sizeOfImage = opt.SizeOfImage;
             info.importDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+            info.exceptionDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
         }
         else
             return info;
@@ -159,6 +162,33 @@ namespace
         if(imageSize == 0 || rva > imageSize)
             return false;
         return size <= imageSize - rva;
+    }
+
+    // Find the module whose [base, base+size) contains addr.
+    bool moduleOf(HANDLE hProcess, uint64_t addr, ModuleInfo & out)
+    {
+        HMODULE modules[1024];
+        DWORD needed = 0;
+        if(!EnumProcessModules(hProcess, modules, sizeof(modules), &needed))
+            return false;
+        DWORD count = (DWORD)(std::min)(needed / sizeof(HMODULE), sizeof(modules) / sizeof(HMODULE));
+        for(DWORD i = 0; i < count; i++)
+        {
+            MODULEINFO mi;
+            if(!GetModuleInformation(hProcess, modules[i], &mi, sizeof(mi)))
+                continue;
+            uint64_t base = (uint64_t)(uintptr_t)mi.lpBaseOfDll;
+            if(addr >= base && addr - base < mi.SizeOfImage)
+            {
+                out.base = base;
+                out.size = mi.SizeOfImage;
+                char name[MAX_PATH] = "";
+                GetModuleBaseNameA(hProcess, modules[i], name, sizeof(name));
+                out.name = name;
+                return true;
+            }
+        }
+        return false;
     }
 
     // Case-insensitive wildcard match (* and ?).
@@ -215,7 +245,8 @@ static BOOL CALLBACK stackReadMemory(HANDLE hProcess, DWORD64 base, PVOID buffer
 
 // Unwind one frame with dbghelp StackWalk64 (uses .pdata, so it works for
 // FPO/optimized x64 code). Distinguishes a real caller from a confirmed
-// leaf function (no unwind record present) and from infrastructure failure.
+// leaf function (verified remote .pdata has no record for the ORIGINAL PC)
+// and from infrastructure failure.
 std::pair<GleamDebugger::UnwindStatus, uint64_t> GleamDebugger::stackWalkReturn(HANDLE hThread)
 {
     if(!mProcess || !ensureSymSession())
@@ -224,6 +255,9 @@ std::pair<GleamDebugger::UnwindStatus, uint64_t> GleamDebugger::stackWalkReturn(
     context.ContextFlags = CONTEXT_FULL;
     if(!GetThreadContext(hThread, &context))
         return { UnwindStatus::Failed, 0 };
+    // StackWalk64 rewrites the context to the CALLER's frame; the leaf check
+    // must use the ORIGINAL rip.
+    const uint64_t originalRip = context.Rip;
     STACKFRAME64 frame{};
     frame.AddrPC.Offset = context.Rip;
     frame.AddrPC.Mode = AddrModeFlat;
@@ -236,12 +270,46 @@ std::pair<GleamDebugger::UnwindStatus, uint64_t> GleamDebugger::stackWalkReturn(
                    stackReadMemory, SymFunctionTableAccess64, SymGetModuleBase64, nullptr) &&
        frame.AddrReturn.Offset)
         return { UnwindStatus::Success, frame.AddrReturn.Offset };
-    // No caller from the walk. If an unwind record exists for the current
-    // PC, the function is NOT a leaf - the unwind itself failed. Otherwise
-    // it is a genuine leaf and [rsp] holds the return address (x64 ABI).
-    if(SymFunctionTableAccess64(mProcess->hProcess, context.Rip))
-        return { UnwindStatus::Failed, 0 };
-    return { UnwindStatus::Leaf, 0 };
+
+    // The walk found no caller. Verify the remote .pdata directly: a
+    // RUNTIME_FUNCTION entry covering the original PC means the function is
+    // NOT a leaf (the unwind itself failed); no such entry means a genuine
+    // leaf and [rsp] holds the return address (x64 ABI).
+    switch(checkUnwindRecord(originalRip))
+    {
+    case PdataCheck::HasRecord:
+        return { UnwindStatus::Failed, 0 }; // has unwind info, yet unwinding failed
+    case PdataCheck::NoRecord:
+        return { UnwindStatus::Leaf, 0 };
+    default:
+        return { UnwindStatus::Failed, 0 }; // cannot verify; set no breakpoint
+    }
+}
+
+// Verify a remote module's .pdata for a RUNTIME_FUNCTION covering rva.
+GleamDebugger::PdataCheck GleamDebugger::checkUnwindRecord(uint64_t rip)
+{
+    ModuleInfo mod;
+    if(!moduleOf(mProcess->hProcess, rip, mod))
+        return PdataCheck::Unknown;
+    auto pe = readPeDirectories(mProcess, mod.base);
+    if(!pe.valid)
+        return PdataCheck::Unknown;
+    const uint64_t rva = rip - mod.base;
+    if(!rangeInImage(pe.exceptionDir.VirtualAddress, pe.exceptionDir.Size, mod.size))
+        return PdataCheck::Unknown;
+    if(pe.exceptionDir.Size == 0)
+        return PdataCheck::NoRecord;
+    const uint32_t count = pe.exceptionDir.Size / (uint32_t)sizeof(RUNTIME_FUNCTION);
+    for(uint32_t i = 0; i < count; i++)
+    {
+        RUNTIME_FUNCTION rf;
+        if(!mProcess->MemReadSafe(mod.base + pe.exceptionDir.VirtualAddress + (uint64_t)i * sizeof(rf), &rf, sizeof(rf)))
+            return PdataCheck::Unknown;
+        if(rva >= rf.BeginAddress && rva < rf.EndAddress)
+            return PdataCheck::HasRecord;
+    }
+    return PdataCheck::NoRecord;
 }
 
 uint64_t GleamDebugger::moduleEntryPoint(uint64_t base)
@@ -321,20 +389,30 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     ModuleInfo mod;
     if(moduleName.empty())
     {
-        // Loader-reported size for the main module: the record must match the
-        // main image base from the debug event. On any mismatch or failure we
-        // do NOT fall back to the (target-modifiable) PE header value.
-        HMODULE first = nullptr;
+        // Find the loader record whose base matches the main image base from
+        // the debug event - never just the first enumerated module. On any
+        // mismatch or failure we do NOT fall back to the (target-modifiable)
+        // PE header value.
+        HMODULE modules[1024];
         DWORD needed = 0;
-        MODULEINFO mi{};
-        if(EnumProcessModules(mProcess->hProcess, &first, sizeof(first), &needed) &&
-           GetModuleInformation(mProcess->hProcess, first, &mi, sizeof(mi)) &&
-           (uint64_t)(uintptr_t)mi.lpBaseOfDll == (uint64_t)mProcess->createProcessInfo.lpBaseOfImage)
+        bool found = false;
+        if(EnumProcessModules(mProcess->hProcess, modules, sizeof(modules), &needed))
         {
-            mod.base = (uint64_t)(uintptr_t)mi.lpBaseOfDll;
-            mod.size = mi.SizeOfImage;
+            DWORD count = (DWORD)(std::min)(needed / sizeof(HMODULE), sizeof(modules) / sizeof(HMODULE));
+            for(DWORD i = 0; i < count && !found; i++)
+            {
+                MODULEINFO mi{};
+                if(!GetModuleInformation(mProcess->hProcess, modules[i], &mi, sizeof(mi)))
+                    continue;
+                if((uint64_t)(uintptr_t)mi.lpBaseOfDll == (uint64_t)mProcess->createProcessInfo.lpBaseOfImage)
+                {
+                    mod.base = (uint64_t)(uintptr_t)mi.lpBaseOfDll;
+                    mod.size = mi.SizeOfImage;
+                    found = true;
+                }
+            }
         }
-        else
+        if(!found || !mod.size)
         {
             printf("cannot determine a trusted image range for the main module\n");
             fflush(stdout);

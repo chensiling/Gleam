@@ -506,12 +506,14 @@ timeout 30 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/BoundaryTarget.exe > /tmp/gle
 g
 xref 60000000
 xref 60100040
+xref 60200042
 quit
 EOF
 check_ec T2 $? /tmp/gleam_T2.txt
 chk "T2: straddler found"        /tmp/gleam_T2.txt "0x00000000600FFFFD  call 0x0000000060000000"
 chk "T2: direct+indirect calls"  /tmp/gleam_T2.txt "3 references to 0x60000000"
 chk "T2: rel8 jmp form"          /tmp/gleam_T2.txt "0x0000000060100010  jmp 0x0000000060100040"
+chk "T2: second-boundary straddler" /tmp/gleam_T2.txt "0x00000000601FFFFF  jmp 0x0000000060200042"
 
 # --- T3: patch matrix (containment / adjacent / extend-right / left-overlap) ---
 run T3 "" <<'EOF'
@@ -604,19 +606,19 @@ for i in $(seq 1 100); do
 done
 if [ "$S3OK" -eq 100 ]; then ok "S3: 100/100 sessions exited"; else bad "S3: $S3OK/100 sessions exited"; fi
 
-# --- S3b: REPL stdin-open lifecycle (natural exit / detach / quit) ---
+# --- S3b: REPL stdin-open lifecycle (natural exit / detach / quit, with artifacts) ---
 echo "== S3b =="
-out=$({ printf 'g\n'; sleep 8; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
-[ $ec -eq 0 ] && ok "S3b: natural exit with stdin open" || bad "S3b: natural exit (code $ec)"
-out=$({ printf 'bp 140070EC9\ng\ndetach\n'; sleep 8; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
-[ $ec -eq 0 ] && ok "S3b: detach with stdin open" || bad "S3b: detach (code $ec)"
-out=$({ printf 'quit\n'; sleep 8; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
-[ $ec -eq 0 ] && ok "S3b: quit with stdin open" || bad "S3b: quit (code $ec)"
+out=$({ printf 'g\n'; sleep 2; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+[ $ec -eq 0 ] && ok "S3b: natural exit with stdin open" || { printf '%s' "$out" > /tmp/gleam_S3b_exit.txt; bad "S3b: natural exit (code $ec)"; }
+out=$({ printf 'bp 140070EC9\ng\ndetach\n'; sleep 2; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+[ $ec -eq 0 ] && ok "S3b: detach with stdin open" || { printf '%s' "$out" > /tmp/gleam_S3b_detach.txt; bad "S3b: detach (code $ec)"; }
+out=$({ printf 'quit\n'; sleep 2; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+[ $ec -eq 0 ] && ok "S3b: quit with stdin open" || { printf '%s' "$out" > /tmp/gleam_S3b_quit.txt; bad "S3b: quit (code $ec)"; }
 
 # --- S4: runtime pause (delayed writer; pause sent while target RUNS free) ---
 echo "== S4 =="
 S4OK=0
-for i in $(seq 1 30); do
+for i in $(seq 1 100); do
   out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
@@ -624,12 +626,12 @@ for i in $(seq 1 30); do
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3
 done
-if [ "$S4OK" -eq 30 ]; then ok "S4: 30/30 runtime pauses"; else bad "S4: $S4OK/30 runtime pauses (artifacts: /tmp/gleam_S4_fail_*.txt)"; fi
+if [ "$S4OK" -eq 100 ]; then ok "S4: 100/100 runtime pauses"; else bad "S4: $S4OK/100 runtime pauses (artifacts: /tmp/gleam_S4_fail_*.txt)"; fi
 
 # --- S5: runtime pause with hide applied ---
 echo "== S5 =="
 S5OK=0
-for i in $(seq 1 30); do
+for i in $(seq 1 100); do
   out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
@@ -638,7 +640,7 @@ for i in $(seq 1 30); do
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3
 done
-if [ "$S5OK" -eq 30 ]; then ok "S5: 30/30 hidden runtime pauses"; else bad "S5: $S5OK/30 hidden runtime pauses (artifacts: /tmp/gleam_S5_fail_*.txt)"; fi
+if [ "$S5OK" -eq 100 ]; then ok "S5: 100/100 hidden runtime pauses"; else bad "S5: $S5OK/100 hidden runtime pauses (artifacts: /tmp/gleam_S5_fail_*.txt)"; fi
 
 # --- T7: one-shot + failing condition ---
 run T7 "" <<'EOF'
@@ -648,6 +650,15 @@ g
 EOF
 chkcount "T7: cond never met, no pause" /tmp/gleam_T7.txt "stop reason=breakpoint" 0
 chk "T7: results correct"        /tmp/gleam_T7.txt "MARKER_RESULT_2=13"
+
+# --- T8: one-shot tracepoint ---
+run T8 "" <<'EOF'
+trace 1400708AC once
+g
+g
+EOF
+chkcount "T8: one trace line"    /tmp/gleam_T8.txt "trace address=0x1400708AC" 1
+chk "T8: results correct"        /tmp/gleam_T8.txt "MARKER_RESULT_2=13"
 
 # --- R6: pause->detach must NOT re-inject after quitting ---
 run R6 "" <<'EOF'

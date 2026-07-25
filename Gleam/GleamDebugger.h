@@ -58,6 +58,8 @@ private:
     bool ensureBreakInStub(GleeBug::Process* process);
     // Last-resort break-in; sets the expectation flag only on success.
     void fallbackDebugBreak(GleeBug::Process* process);
+    // Resolve/retry break-in symbols (debugger thread only, dbghelp).
+    void resolveBreakInSymbols();
 
 protected:
     void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;
@@ -176,9 +178,13 @@ private:
     uint64_t moduleEntryPoint(uint64_t base);
     // dbghelp StackWalk64 one-frame unwind (.pdata-aware).
     enum class UnwindStatus { Success, Leaf, Failed };
-    // Returns (status, caller return address). Leaf = confirmed no unwind
-    // record for the current function (use [rsp] per the x64 ABI).
+    // Returns (status, caller return address). Leaf = verified no remote
+    // .pdata record for the ORIGINAL rip (use [rsp] per the x64 ABI).
     std::pair<UnwindStatus, uint64_t> stackWalkReturn(HANDLE hThread);
+
+    // Remote .pdata verification for the leaf/non-leaf distinction.
+    enum class PdataCheck { HasRecord, NoRecord, Unknown };
+    PdataCheck checkUnwindRecord(uint64_t rip);
 
     // GleamDebugger.cpp: unified machine-readable stop record.
     // Format: "stop reason=<r> ... rip=0x... tid=<id>" (one line, key=value).
@@ -199,10 +205,16 @@ private:
     std::atomic<HANDLE> mBreakInStubThread{ nullptr }; // injected int3-stub thread
     std::atomic<void*> mBreakInStubPage{ nullptr };    // page backing the stub
     std::atomic<uint64_t> mExitThreadAddr{ 0 };        // kernel32!ExitThread in the debuggee
+    std::atomic<uint64_t> mDbgBreakInAddr{ 0 };        // ntdll!DbgUiRemoteBreakin (fallback break-in identity)
+    uint32_t mExitThreadResolveAttempts = 0;           // rate-limit retry logging
     bool mWantsPause = false;
     bool mStepArmed = false;      // a user-requested step is in flight
     bool mStepOverArmed = false;  // a user-requested step-over is in flight
-    bool mQuitting = false;
+    std::atomic<bool> mQuitting{ false }; // detach/quit in flight: no injections
+
+    // Serializes stub injection (forceBreakIn) against stub cleanup and the
+    // quitting transition: an injection and a cleanup can never interleave.
+    std::mutex mBreakInMutex;
 
     // "breakon" switches: which event kinds may trigger a pause.
     bool mBreakOnEntry = false;

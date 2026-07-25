@@ -196,14 +196,17 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         fflush(stdout);
         return CmdResult::Handled;
     }
-    if(cmd == "trace" && args.size() == 2 && parseAddress(args[1], a))
+    if(cmd == "trace" && args.size() >= 2 && args.size() <= 3 && parseAddress(args[1], a))
     {
-        if(mProcess->SetBreakpoint(a))
+        bool once = args.size() == 3 && args[2] == "once";
+        if(args.size() == 3 && !once)
+            printf("usage: trace <addr> [once]\n");
+        else if(mProcess->SetBreakpoint(a, once))
         {
             BpRule rule;
             rule.trace = true;
             mBpRules[a] = rule;
-            printf("tracepoint set at 0x%llX\n", a);
+            printf("%stracepoint set at 0x%llX\n", once ? "one-shot " : "", a);
         }
         else
             printf("failed to set tracepoint at 0x%llX\n", a);
