@@ -104,18 +104,16 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "ret" || cmd == "stepout")
     {
-        // Return address resolution, three tiers:
-        // 1) [rsp] itself is exec+call-preceded -> function entry or the ret
-        //    instruction itself (the only cases where [rsp] is the answer).
-        // 2) valid rbp frame link -> [rbp+8] (exact for framed functions;
-        //    avoids stale return addresses in reused stack memory).
-        // 3) upward stack scan (FPO/optimized code; heuristic).
+        // Return address resolution, in priority order:
+        // 1) StackWalk64 unwind (.pdata): exact for non-leaf x64 functions,
+        //    including FPO/optimized code.
+        // 2) Leaf function (no unwind record): [rsp] per the x64 ABI.
+        // 3) rbp frame link, then an upward stack scan as last resorts.
         Registers r(currentThread()->hThread);
         ptr rsp = r.Gsp();
         ptr rbp = r.Gbp();
         ptr retAddr = 0;
-        bool viaFrame = false;
-        bool viaScan = false;
+        const char* via = "";
 
         auto isExecutable = [this](ptr a)
         {
@@ -139,11 +137,19 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             return false;
         };
 
-        ptr top = 0;
-        if(mProcess->MemReadSafe(rsp, &top, sizeof(top)) && isExecutable(top) && precededByCall(top))
+        if(auto walked = stackWalkReturn(currentThread()->hThread))
         {
-            retAddr = top;
-            viaScan = true;
+            retAddr = walked;
+            via = " (unwind)";
+        }
+        else
+        {
+            ptr top = 0;
+            if(mProcess->MemReadSafe(rsp, &top, sizeof(top)) && isExecutable(top) && precededByCall(top))
+            {
+                retAddr = top; // leaf function: return address at [rsp]
+                via = " (stack scan)";
+            }
         }
         if(!retAddr && rbp > rsp && rbp - rsp < 0x10000)
         {
@@ -153,7 +159,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                callerRbp >= rbp && isExecutable(candidate))
             {
                 retAddr = candidate;
-                viaFrame = true;
+                via = " (frame)";
             }
         }
         if(!retAddr)
@@ -166,7 +172,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                 if(isExecutable(candidate) && precededByCall(candidate))
                 {
                     retAddr = candidate;
-                    viaScan = true;
+                    via = " (stack scan)";
                 }
             }
         }
@@ -182,8 +188,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             fflush(stdout);
             return CmdResult::Handled;
         }
-        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr,
-               viaFrame ? " (frame)" : viaScan ? " (stack scan)" : "");
+        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr, via);
         fflush(stdout);
         return CmdResult::Resume;
     }

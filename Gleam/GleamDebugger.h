@@ -50,6 +50,8 @@ public:
 private:
     // Unguarded break-in, only valid at the just-before-continue point.
     void forceBreakIn();
+    // Lazily allocate/write the session stub page and resolve ExitThread.
+    bool ensureBreakInStub(GleeBug::Process* process);
 
 protected:
     void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;
@@ -166,6 +168,8 @@ private:
     std::string symNameByAddr(uint64_t addr);
     // OEP (AddressOfEntryPoint) of a loaded module, 0 on failure.
     uint64_t moduleEntryPoint(uint64_t base);
+    // dbghelp StackWalk64 one-frame unwind (.pdata-aware), 0 on leaf/failure.
+    uint64_t stackWalkReturn(HANDLE hThread);
 
     // GleamDebugger.cpp: unified machine-readable stop record.
     // Format: "stop reason=<r> ... rip=0x... tid=<id>" (one line, key=value).

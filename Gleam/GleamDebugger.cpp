@@ -37,28 +37,66 @@ void GleamDebugger::forceBreakIn()
 
     // A stub break-in is already in flight: don't inject another one (the
     // pending event will arrive and clean itself up).
-    if(mBreakInStubThread.load() || mBreakInStubPage.load())
+    if(mBreakInStubThread.load())
         return;
 
     // NOTE: DebugBreakProcess checks PEB.BeingDebugged and refuses to inject
     // when it is cleared (our "hide" does exactly that), so inject our own
-    // stub thread instead: int3, then ExitThread(0) so it cleans itself up.
-    // Race-free bookkeeping: the page is stored BEFORE the thread starts,
-    // and the break-in is identified by the exception address.
+    // stub thread instead. Lifecycle (no publication race):
+    //   1. allocate ONE stub page per session (reused, freed at session end)
+    //   2. create the thread CREATE_SUSPENDED
+    //   3. publish page + handle
+    //   4. ResumeThread - only now can the int3 fire
+    // The thread self-terminates via call ExitThread; the page is freed at
+    // session end, never while a stub thread might still execute on it.
+    if(!ensureBreakInStub(process))
+        return;
+
+    HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
+                                        (LPTHREAD_START_ROUTINE)mBreakInStubPage.load(),
+                                        nullptr, CREATE_SUSPENDED, nullptr);
+    if(!hThread)
+    {
+        printf("event breakin fail=thread_create err=%lu\n", GetLastError());
+        fflush(stdout);
+        mBreakInExpected.store(true);
+        DebugBreakProcess(process->hProcess);
+        return;
+    }
+    mBreakInStubThread.store(hThread);
+    ResumeThread(hThread); // the int3 can only fire after this point
+    printf("event breakin injected page=0x%p\n", mBreakInStubPage.load());
+    fflush(stdout);
+}
+
+// Allocate/write the session stub page (once) and resolve ExitThread.
+bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
+{
+    if(mBreakInStubPage.load())
+        return true;
+
     uint8_t stub[] = {
         0xCC,                         // int3
         0xB9, 0, 0, 0, 0,             // mov ecx, 0
         0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, ExitThread
         0xFF, 0xD0                    // call rax
     };
-    const uint64_t exitThread = mExitThreadAddr.load();
+    uint64_t exitThread = mExitThreadAddr.load();
     if(!exitThread)
     {
-        printf("event breakin fallback=dbg addr=0\n");
+        // Retry the resolution - safe only on the debugger thread (dbghelp).
+        if(mInDebugEvent.load() && parseAddress("kernel32!ExitThread", exitThread))
+            mExitThreadAddr.store(exitThread);
+    }
+    if(!exitThread)
+    {
+        printf("event breakin fail=no_exitthread (will retry later)\n");
         fflush(stdout);
+        // NOTE: DebugBreakProcess is BeingDebugged-dependent; use only as a
+        // last resort and expect a later retry via the stub path.
         mBreakInExpected.store(true);
         DebugBreakProcess(process->hProcess);
-        return;
+        return false;
     }
     memcpy(stub + 8, &exitThread, 8);
 
@@ -66,37 +104,23 @@ void GleamDebugger::forceBreakIn()
                                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if(!page)
     {
-        printf("event breakin fallback=dbg alloc_fail=%lu\n", GetLastError());
+        printf("event breakin fail=alloc err=%lu\n", GetLastError());
         fflush(stdout);
         mBreakInExpected.store(true);
         DebugBreakProcess(process->hProcess);
-        return;
+        return false;
     }
-    // The page IS the break-in identity: publish it before the thread exists.
-    mBreakInStubPage.store(page);
     if(!WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
     {
-        printf("event breakin fallback=dbg write_fail=%lu\n", GetLastError());
+        printf("event breakin fail=write err=%lu\n", GetLastError());
         fflush(stdout);
-        mBreakInStubPage.store(nullptr);
         VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
         mBreakInExpected.store(true);
         DebugBreakProcess(process->hProcess);
-        return;
+        return false;
     }
-    HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
-                                        (LPTHREAD_START_ROUTINE)page, nullptr, 0, nullptr);
-    if(!hThread)
-    {
-        printf("event breakin fallback=dbg thread_fail=%lu\n", GetLastError());
-        fflush(stdout);
-        mBreakInStubPage.store(nullptr);
-        VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
-        mBreakInExpected.store(true);
-        DebugBreakProcess(process->hProcess);
-        return;
-    }
-    mBreakInStubThread.store(hThread);
+    mBreakInStubPage.store(page);
+    return true;
 }
 
 bool GleamDebugger::isPaused() const
@@ -182,6 +206,13 @@ void GleamDebugger::cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProce
     char details[64];
     sprintf_s(details, "code=0x%08X", exitProcess.dwExitCode);
     emitStop("exit", details);
+    if(auto hThread = mBreakInStubThread.exchange(nullptr))
+    {
+        TerminateThread(hThread, 0);
+        CloseHandle(hThread);
+    }
+    if(auto page = mBreakInStubPage.exchange(nullptr))
+        VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
     closeSymSession();
 }
 
@@ -231,6 +262,14 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
 void GleamDebugger::cbSystemBreakpoint()
 {
     emitStop("system", nullptr);
+    // Resolve ExitThread here too: at the system breakpoint all system DLLs
+    // are fully loaded, unlike at process-creation time.
+    if(!mExitThreadAddr.load())
+    {
+        uint64_t addr = 0;
+        if(parseAddress("kernel32!ExitThread", addr))
+            mExitThreadAddr.store(addr);
+    }
     // Best moment to hide: no target code has run yet.
     if(mHideOn)
         applyHides();
@@ -374,13 +413,14 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     if(isStubBreakIn || isFallbackBreakIn)
     {
         mContinueStatus = DBG_CONTINUE;
+        // The stub thread self-terminates via call ExitThread; kill it as a
+        // belt-and-braces. The page is session-scoped and reused, freed at
+        // cbExitProcessEvent - never while a stub thread may run on it.
         if(auto hThread = mBreakInStubThread.exchange(nullptr))
         {
             TerminateThread(hThread, 0);
             CloseHandle(hThread);
         }
-        if(auto page = mBreakInStubPage.exchange(nullptr))
-            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
         emitStop("pause", nullptr);
         mWantsPause = true;
         return;
@@ -428,7 +468,12 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         mWantsPause = false;
         commandLoop();
     }
+    // Consume deferred pause requests LAST, after marking ourselves
+    // running-free: requests arriving after this point go straight to
+    // forceBreakIn, so no request can be stranded between the two checks.
     mInDebugEvent.store(false);
+    if(mPauseAfterResume.exchange(false))
+        forceBreakIn();
 }
 
 void GleamDebugger::commandLoop()
@@ -449,8 +494,4 @@ void GleamDebugger::commandLoop()
             break;
     }
     mIsPaused.store(false);
-    // A "pause" that arrived while we were paused takes effect right before
-    // the resume - the only deterministic injection point.
-    if(mPauseAfterResume.exchange(false))
-        forceBreakIn();
 }

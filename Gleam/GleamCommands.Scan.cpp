@@ -72,6 +72,12 @@ namespace
             target = addr + len + (int64_t)rel;
             return TargetKind::Direct;
         }
+        // EB jmp rel8 (2 bytes)
+        if(buf[0] == 0xEB && len == 2)
+        {
+            target = addr + len + (int8_t)buf[1];
+            return TargetKind::Direct;
+        }
         // FF /2 call [rip+disp32] / FF /4 jmp [rip+disp32]
         if(buf[0] == 0xFF && len == 6)
         {

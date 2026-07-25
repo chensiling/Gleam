@@ -28,7 +28,13 @@ run() { # run <name> <target-args> < commands
   local name=$1; shift
   local args=$1; shift
   timeout 60 "$GLEAM" $TARGET $args > /tmp/gleam_$name.txt 2>&1
+  local ec=$?
   echo "== $name =="
+  # A scenario that hangs or crashes after printing expected text must NOT
+  # count as passed: check the exit status first.
+  if [ $ec -ne 0 ]; then
+    bad "$name: abnormal exit (code $ec; see /tmp/gleam_$name.txt)"
+  fi
 }
 
 # --- A: inspection commands + regs/read/write/setreg/step ---
@@ -370,7 +376,7 @@ ret
 g
 g
 EOF
-chk "Q4: frame-based return"     /tmp/gleam_Q4.txt "(frame)"
+chk "Q4: frame-based return"     /tmp/gleam_Q4.txt "(unwind)"
 
 # --- R1: one-shot 'do g' rule fully cleaned ---
 run R1 "" <<'EOF'
@@ -465,15 +471,28 @@ chk "T1: tab arg"                /tmp/gleam_T1.txt "$(printf 'ARGV[3]=[x\ty]')"
 chk "T1: embedded quote"         /tmp/gleam_T1.txt 'ARGV[4]=[quote"in]'
 chk "T1: trailing backslash"     /tmp/gleam_T1.txt 'ARGV[5]=[trail\]'
 
+# --- T1b: argv unicode + backslash-before-quote ---
+echo "== T1b =="
+timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe "中文路径" 'a\"b' > /tmp/gleam_T1b.txt 2>&1 <<'EOF'
+g
+EOF
+# The target's CRT converts narrow argv using the system ANSI codepage (GBK),
+# so the log contains GBK bytes - compare against those, not UTF-8.
+T1B_UNICODE=$(printf '中文路径' | iconv -f UTF-8 -t GBK)
+chk "T1b: unicode arg (gbk bytes)" /tmp/gleam_T1b.txt "$T1B_UNICODE"
+chk "T1b: backslash before quote" /tmp/gleam_T1b.txt 'ARGV[2]=[a\"b]'
+
 # --- T2: cross-chunk instruction scan ---
 echo "== T2 =="
 timeout 30 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/BoundaryTarget.exe > /tmp/gleam_T2.txt 2>&1 <<'EOF'
 g
 xref 60000000
+xref 60100040
 quit
 EOF
 chk "T2: straddler found"        /tmp/gleam_T2.txt "0x00000000600FFFFD  call 0x0000000060000000"
-chk "T2: both calls found"       /tmp/gleam_T2.txt "2 references to 0x60000000"
+chk "T2: direct+indirect calls"  /tmp/gleam_T2.txt "3 references to 0x60000000"
+chk "T2: rel8 jmp form"          /tmp/gleam_T2.txt "0x0000000060100010  jmp 0x0000000060100040"
 
 # --- T3: patch matrix (containment / adjacent / extend-right / left-overlap) ---
 run T3 "" <<'EOF'
@@ -532,7 +551,7 @@ regs
 g
 g
 EOF
-chk "T5: ret at entry"           /tmp/gleam_T5.txt "stepping out to 0x140076E94 (stack scan)"
+chk "T5: ret at entry"           /tmp/gleam_T5.txt "stepping out to 0x140076E94 (unwind)"
 run T5b "" <<'EOF'
 bp 140070EC9
 g
@@ -542,7 +561,7 @@ regs
 g
 g
 EOF
-chk "T5: ret at ret insn"        /tmp/gleam_T5b.txt "stepping out to 0x140076E94 (stack scan)"
+chk "T5: ret at ret insn"        /tmp/gleam_T5b.txt "stepping out to 0x140076E94 (unwind)"
 
 # --- S2: 100 pause injections (reviewer-standard stress) ---
 echo "== S2 =="
@@ -564,6 +583,40 @@ for i in $(seq 1 100); do
   [ $? -eq 0 ] && S3OK=$((S3OK+1))
 done
 if [ "$S3OK" -eq 100 ]; then ok "S3: 100/100 sessions exited"; else bad "S3: $S3OK/100 sessions exited"; fi
+
+# --- S4: runtime pause (delayed writer; pause sent while target RUNS free) ---
+echo "== S4 =="
+S4OK=0
+for i in $(seq 1 30); do
+  out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
+  [ "$n" -eq 1 ] && S4OK=$((S4OK+1))
+  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  sleep 0.3
+done
+if [ "$S4OK" -eq 30 ]; then ok "S4: 30/30 runtime pauses"; else bad "S4: $S4OK/30 runtime pauses"; fi
+
+# --- S5: runtime pause with hide applied ---
+echo "== S5 =="
+S5OK=0
+for i in $(seq 1 30); do
+  out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
+  f=$(printf '%s' "$out" | grep -c 'breakin fail=')
+  [ "$n" -eq 1 ] && [ "$f" -eq 0 ] && S5OK=$((S5OK+1))
+  powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  sleep 0.3
+done
+if [ "$S5OK" -eq 30 ]; then ok "S5: 30/30 hidden runtime pauses"; else bad "S5: $S5OK/30 hidden runtime pauses"; fi
+
+# --- T7: one-shot + failing condition ---
+run T7 "" <<'EOF'
+bp 1400708AC once if rcx==0
+g
+g
+EOF
+chkcount "T7: cond never met, no pause" /tmp/gleam_T7.txt "stop reason=breakpoint" 0
+chk "T7: results correct"        /tmp/gleam_T7.txt "MARKER_RESULT_2=13"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

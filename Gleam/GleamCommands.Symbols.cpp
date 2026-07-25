@@ -104,6 +104,7 @@ namespace
         bool valid = false;
         bool pe64 = true;
         uint32_t entryPointRva = 0;
+        uint32_t sizeOfImage = 0;
         IMAGE_DATA_DIRECTORY importDir{};
         IMAGE_DATA_DIRECTORY delayImportDir{};
     };
@@ -131,6 +132,7 @@ namespace
                 return info;
             info.pe64 = true;
             info.entryPointRva = opt.AddressOfEntryPoint;
+            info.sizeOfImage = opt.SizeOfImage;
             info.importDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         }
@@ -141,6 +143,7 @@ namespace
                 return info;
             info.pe64 = false;
             info.entryPointRva = opt.AddressOfEntryPoint;
+            info.sizeOfImage = opt.SizeOfImage;
             info.importDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
         }
@@ -148,6 +151,14 @@ namespace
             return info;
         info.valid = true;
         return info;
+    }
+
+    // Overflow-safe range check: is [rva, rva+size) fully inside the image?
+    bool rangeInImage(uint64_t rva, uint64_t size, uint64_t imageSize)
+    {
+        if(imageSize == 0 || rva > imageSize)
+            return false;
+        return size <= imageSize - rva;
     }
 
     // Case-insensitive wildcard match (* and ?).
@@ -187,6 +198,37 @@ namespace
         ctx->shown++;
         return TRUE;
     }
+}
+
+// ReadMemoryProc for StackWalk64 on the remote target.
+static BOOL CALLBACK stackReadMemory(HANDLE hProcess, DWORD64 base, PVOID buffer, DWORD size, LPDWORD bytesRead)
+{
+    return ReadProcessMemory(hProcess, (LPCVOID)base, buffer, size, (SIZE_T*)bytesRead);
+}
+
+// Unwind one frame with dbghelp StackWalk64 (uses .pdata, so it works for
+// FPO/optimized x64 code). Returns the caller's return address, 0 for leaf
+// functions or on failure.
+uint64_t GleamDebugger::stackWalkReturn(HANDLE hThread)
+{
+    if(!mProcess || !ensureSymSession())
+        return 0;
+    CONTEXT context{};
+    context.ContextFlags = CONTEXT_FULL;
+    if(!GetThreadContext(hThread, &context))
+        return 0;
+    STACKFRAME64 frame{};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+    if(!StackWalk64(IMAGE_FILE_MACHINE_AMD64,
+                    mProcess->hProcess, hThread, &frame, &context,
+                    stackReadMemory, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+        return 0;
+    return frame.AddrReturn.Offset;
 }
 
 uint64_t GleamDebugger::moduleEntryPoint(uint64_t base)
@@ -283,6 +325,15 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
         fflush(stdout);
         return;
     }
+    // Effective image size: psapi for named modules, PE header for the main
+    // module (and as a cross-check). Every read below is bounded by it.
+    const uint64_t imageSize = mod.size ? mod.size : pe.sizeOfImage;
+    if(!imageSize)
+    {
+        printf("cannot determine image size for 0x%llX\n", mod.base);
+        fflush(stdout);
+        return;
+    }
     if(!ensureSymSession())
     {
         printf("dbghelp SymInitialize failed\n");
@@ -308,29 +359,34 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     const size_t thunkSize = pe.pe64 ? 8 : 4;
     size_t groups = 0, slots = 0;
 
-    // Bound imports. Walk bounded by the data directory size (with a hard cap
-    // as a backstop for malformed sizes).
-    if(pe.importDir.VirtualAddress)
+    // Bound imports. The directory RVA/Size must lie inside the image; the
+    // walk is bounded by the directory size and each thunk walk by the image.
+    if(pe.importDir.VirtualAddress &&
+       rangeInImage(pe.importDir.VirtualAddress, pe.importDir.Size, imageSize))
     {
-        uint32_t maxDesc = pe.importDir.Size ? pe.importDir.Size / (uint32_t)sizeof(IMAGE_IMPORT_DESCRIPTOR) : 1024;
+        uint32_t maxDesc = pe.importDir.Size
+            ? pe.importDir.Size / (uint32_t)sizeof(IMAGE_IMPORT_DESCRIPTOR) : 0;
         if(maxDesc > 4096)
             maxDesc = 4096;
         for(uint32_t i = 0; i < maxDesc; i++)
         {
+            if(!rangeInImage(pe.importDir.VirtualAddress + (uint64_t)i * sizeof(IMAGE_IMPORT_DESCRIPTOR),
+                             sizeof(IMAGE_IMPORT_DESCRIPTOR), imageSize))
+                break;
             IMAGE_IMPORT_DESCRIPTOR desc;
             if(!readAt(mProcess, mod.base + pe.importDir.VirtualAddress + i * sizeof(desc), desc))
                 break;
             if(!desc.Name && !desc.FirstThunk)
                 break;
+            if(!rangeInImage(desc.Name, 1, imageSize) || !rangeInImage(desc.FirstThunk, 1, imageSize))
+                continue; // bogus RVA in a malformed descriptor
             auto dllName = readCString(mProcess, mod.base + desc.Name);
             printf("%s:\n", dllName.c_str());
             groups++;
-            // Thunk walk bounded by the module image (with a hard cap).
-            uint64_t maxT = 65536;
-            if(mod.size && desc.FirstThunk < mod.size)
-                maxT = (std::min)(maxT, (mod.size - desc.FirstThunk) / thunkSize + 1);
-            else if(mod.size && desc.FirstThunk >= mod.size)
-                continue; // bogus thunk RVA
+            // Thunk walk bounded by complete elements inside the image.
+            uint64_t maxT = 0;
+            if(desc.FirstThunk < imageSize)
+                maxT = (std::min)((uint64_t)65536, (imageSize - desc.FirstThunk) / thunkSize);
             for(uint32_t t = 0; t < maxT; t++)
             {
                 uint64_t slotAddr = mod.base + desc.FirstThunk + t * thunkSize;
@@ -360,14 +416,19 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
         }
     }
 
-    // Delay-loaded imports.
-    if(pe.delayImportDir.VirtualAddress)
+    // Delay-loaded imports (same bounding rules).
+    if(pe.delayImportDir.VirtualAddress &&
+       rangeInImage(pe.delayImportDir.VirtualAddress, pe.delayImportDir.Size, imageSize))
     {
-        uint32_t maxDesc = pe.delayImportDir.Size ? pe.delayImportDir.Size / (uint32_t)sizeof(ImgDelayDescr) : 1024;
+        uint32_t maxDesc = pe.delayImportDir.Size
+            ? pe.delayImportDir.Size / (uint32_t)sizeof(ImgDelayDescr) : 0;
         if(maxDesc > 4096)
             maxDesc = 4096;
         for(uint32_t i = 0; i < maxDesc; i++)
         {
+            if(!rangeInImage(pe.delayImportDir.VirtualAddress + (uint64_t)i * sizeof(ImgDelayDescr),
+                             sizeof(ImgDelayDescr), imageSize))
+                break;
             ImgDelayDescr desc{};
             if(!readAt(mProcess, mod.base + pe.delayImportDir.VirtualAddress + i * sizeof(desc), desc))
                 break;
@@ -377,16 +438,14 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
             const bool rva = (desc.grAttrs & 1) != 0;
             uint64_t nameAddr = rva ? mod.base + (uint64_t)desc.rvaDLLName : (uint64_t)desc.rvaDLLName;
             uint64_t iatAddr = rva ? mod.base + (uint64_t)desc.rvaIAT : (uint64_t)desc.rvaIAT;
+            if(!rangeInImage(nameAddr - mod.base, 1, imageSize) || !rangeInImage(iatAddr - mod.base, 1, imageSize))
+                continue;
             auto dllName = readCString(mProcess, nameAddr);
             printf("%s (delay):\n", dllName.c_str());
             groups++;
-            // Thunk walk bounded by the module image (with a hard cap).
-            uint64_t maxT = 65536;
+            // Thunk walk bounded by complete elements inside the image.
             uint64_t iatRva = iatAddr - mod.base;
-            if(mod.size && iatRva < mod.size)
-                maxT = (std::min)(maxT, (mod.size - iatRva) / thunkSize + 1);
-            else if(mod.size)
-                continue; // bogus IAT address
+            uint64_t maxT = (std::min)((uint64_t)65536, (imageSize - iatRva) / thunkSize);
             for(uint32_t t = 0; t < maxT; t++)
             {
                 uint64_t slotAddr = iatAddr + t * thunkSize;

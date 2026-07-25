@@ -70,11 +70,13 @@ static std::wstring quoteArg(const wchar_t* arg)
     return out;
 }
 
+static std::atomic<bool> g_replStop{ false };
+
 static void replThread(GleamDebugger* dbg)
 {
     // std::getline handles arbitrarily long commands (no fixed buffer).
     std::string line;
-    while(std::getline(std::cin, line))
+    while(!g_replStop.load() && std::getline(std::cin, line))
     {
         while(!line.empty() && line.back() == '\r')
             line.pop_back();
@@ -148,12 +150,19 @@ int wmain(int argc, wchar_t* argv[])
     fflush(stdout);
 
     std::thread repl(replThread, dbg);
-    repl.detach(); // blocked on stdin; killed by ExitProcess below
     dbg->Start();
 
     printf("[gleam] session finished%s\n", attached ? " (detached or target exited)" : "");
     fflush(stdout);
-    // ExitProcess terminates all threads (including the stdin-blocked REPL)
-    // before DLL/CRT teardown - no racing stdio cleanup.
-    ExitProcess(0);
+
+    // Controlled REPL shutdown: set the stop flag, then cancel the blocking
+    // read. CancelSynchronousIo only cancels an in-flight read, so retry
+    // until the thread actually exits (handles the "cancel before the next
+    // read starts" race).
+    g_replStop.store(true);
+    while(WaitForSingleObject(repl.native_handle(), 50) != WAIT_OBJECT_0)
+        CancelSynchronousIo(repl.native_handle());
+    repl.join();
+    delete dbg; // proper cleanup: no intentional leak
+    return 0;
 }
