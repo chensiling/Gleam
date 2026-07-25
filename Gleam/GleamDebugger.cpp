@@ -67,6 +67,9 @@ void GleamDebugger::forceBreakIn()
     {
         printf("event breakin fail=resume err=%lu\n", GetLastError());
         fflush(stdout);
+        // Don't leave a permanently suspended thread in the target.
+        TerminateThread(hThread, 0);
+        WaitForSingleObject(hThread, 1000);
         CloseHandle(mBreakInStubThread.exchange(nullptr));
         fallbackDebugBreak(process);
         return;
@@ -75,14 +78,28 @@ void GleamDebugger::forceBreakIn()
     fflush(stdout);
 }
 
+void GleamDebugger::cleanupBreakInStub()
+{
+    if(auto hThread = mBreakInStubThread.exchange(nullptr))
+    {
+        TerminateThread(hThread, 0);
+        // Never free the page while the stub thread may still execute on it.
+        WaitForSingleObject(hThread, 1000);
+        CloseHandle(hThread);
+    }
+    if(auto page = mBreakInStubPage.exchange(nullptr))
+        VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
+}
+
 void GleamDebugger::fallbackDebugBreak(GleeBug::Process* process)
 {
-    // Set the expectation flag only when the API actually injected; otherwise
-    // a later unrelated int3 would be mistaken for our break-in.
-    if(DebugBreakProcess(process->hProcess))
-        mBreakInExpected.store(true);
-    else
+    // Publish the expectation BEFORE injecting (the event can arrive
+    // immediately); clear it again when the API fails, so a later unrelated
+    // int3 is not mistaken for our break-in.
+    mBreakInExpected.store(true);
+    if(!DebugBreakProcess(process->hProcess))
     {
+        mBreakInExpected.store(false);
         printf("event breakin fail=debugbreakprocess err=%lu\n", GetLastError());
         fflush(stdout);
     }
@@ -222,13 +239,7 @@ void GleamDebugger::cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProce
     char details[64];
     sprintf_s(details, "code=0x%08X", exitProcess.dwExitCode);
     emitStop("exit", details);
-    if(auto hThread = mBreakInStubThread.exchange(nullptr))
-    {
-        TerminateThread(hThread, 0);
-        CloseHandle(hThread);
-    }
-    if(auto page = mBreakInStubPage.exchange(nullptr))
-        VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
+    cleanupBreakInStub();
     closeSymSession();
 }
 
@@ -435,6 +446,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
         if(auto hThread = mBreakInStubThread.exchange(nullptr))
         {
             TerminateThread(hThread, 0);
+            WaitForSingleObject(hThread, 1000);
             CloseHandle(hThread);
         }
         emitStop("pause", nullptr);
@@ -487,8 +499,12 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
     // Consume deferred pause requests LAST, after marking ourselves
     // running-free: requests arriving after this point go straight to
     // forceBreakIn, so no request can be stranded between the two checks.
+    // When quitting (detach/quit in flight), stale requests are DISCARDED:
+    // injecting a stub into a target we are letting go would crash it.
     mInDebugEvent.store(false);
-    if(mPauseAfterResume.exchange(false))
+    if(mQuitting)
+        mPauseAfterResume.store(false);
+    else if(mPauseAfterResume.exchange(false))
         forceBreakIn();
 }
 

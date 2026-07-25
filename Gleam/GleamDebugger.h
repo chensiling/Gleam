@@ -47,6 +47,10 @@ public:
     // Called from the REPL thread: break in right after the next resume.
     void pauseAfterResume();
 
+    // Terminate the stub thread, wait for it to die, close the handle, and
+    // only then free the page - never free memory a stub thread may run on.
+    void cleanupBreakInStub();
+
 private:
     // Unguarded break-in, only valid at the just-before-continue point.
     void forceBreakIn();
@@ -170,8 +174,11 @@ private:
     std::string symNameByAddr(uint64_t addr);
     // OEP (AddressOfEntryPoint) of a loaded module, 0 on failure.
     uint64_t moduleEntryPoint(uint64_t base);
-    // dbghelp StackWalk64 one-frame unwind (.pdata-aware), 0 on leaf/failure.
-    uint64_t stackWalkReturn(HANDLE hThread);
+    // dbghelp StackWalk64 one-frame unwind (.pdata-aware).
+    enum class UnwindStatus { Success, Leaf, Failed };
+    // Returns (status, caller return address). Leaf = confirmed no unwind
+    // record for the current function (use [rsp] per the x64 ABI).
+    std::pair<UnwindStatus, uint64_t> stackWalkReturn(HANDLE hThread);
 
     // GleamDebugger.cpp: unified machine-readable stop record.
     // Format: "stop reason=<r> ... rip=0x... tid=<id>" (one line, key=value).

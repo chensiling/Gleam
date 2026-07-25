@@ -459,8 +459,9 @@ echo "== S1 =="
 S1OK=0
 for i in $(seq 1 25); do
   out=$(printf 'g\npause\ndetach\n' | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
-  if [ "$n" -eq 1 ]; then S1OK=$((S1OK+1)); else printf '%s' "$out" > /tmp/gleam_S1_fail_$i.txt; fi
+  if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S1OK=$((S1OK+1)); else printf '%s' "$out" > /tmp/gleam_S1_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
 done
 if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK/25 pause injections (artifacts: /tmp/gleam_S1_fail_*.txt)"; fi
@@ -586,8 +587,9 @@ echo "== S2 =="
 S2OK=0
 for i in $(seq 1 100); do
   out=$(printf 'g\npause\ndetach\n' | timeout 30 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
-  if [ "$n" -eq 1 ]; then S2OK=$((S2OK+1)); else printf '%s' "$out" > /tmp/gleam_S2_fail_$i.txt; fi
+  if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S2OK=$((S2OK+1)); else printf '%s' "$out" > /tmp/gleam_S2_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3  # let the previous notepad fully exit before the next launch
 done
@@ -616,8 +618,9 @@ echo "== S4 =="
 S4OK=0
 for i in $(seq 1 30); do
   out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
-  if [ "$n" -eq 1 ]; then S4OK=$((S4OK+1)); else printf '%s' "$out" > /tmp/gleam_S4_fail_$i.txt; fi
+  if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S4OK=$((S4OK+1)); else printf '%s' "$out" > /tmp/gleam_S4_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3
 done
@@ -628,9 +631,10 @@ echo "== S5 =="
 S5OK=0
 for i in $(seq 1 30); do
   out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   f=$(printf '%s' "$out" | grep -c 'breakin fail=')
-  if [ "$n" -eq 1 ] && [ "$f" -eq 0 ]; then S5OK=$((S5OK+1)); else printf '%s' "$out" > /tmp/gleam_S5_fail_$i.txt; fi
+  if [ "$n" -eq 1 ] && [ "$f" -eq 0 ] && [ $ec -eq 0 ]; then S5OK=$((S5OK+1)); else printf '%s' "$out" > /tmp/gleam_S5_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3
 done
@@ -644,6 +648,33 @@ g
 EOF
 chkcount "T7: cond never met, no pause" /tmp/gleam_T7.txt "stop reason=breakpoint" 0
 chk "T7: results correct"        /tmp/gleam_T7.txt "MARKER_RESULT_2=13"
+
+# --- R6: pause->detach must NOT re-inject after quitting ---
+run R6 "" <<'EOF'
+bp 140070EC9
+g
+pause
+detach
+EOF
+chk "R6: detaching"              /tmp/gleam_R6.txt "detaching..."
+chkcount "R6: no injection after detach" /tmp/gleam_R6.txt "event breakin injected" 0
+chk "R6: target ran to completion" /tmp/gleam_R6.txt "MARKER_RESULT_2=13"
+
+# --- R7: pause->quit must NOT re-inject ---
+run R7 "" <<'EOF'
+bp 140070EC9
+g
+pause
+quit
+EOF
+chkcount "R7: no injection after quit" /tmp/gleam_R7.txt "event breakin injected" 0
+
+# --- selftest: rangeInImage unit boundaries ---
+run ST "" <<'EOF'
+selftest
+g
+EOF
+chk "selftest: rangeInImage"     /tmp/gleam_ST.txt "selftest rangeInImage 12/12 ok"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

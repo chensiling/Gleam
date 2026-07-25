@@ -104,14 +104,14 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "ret" || cmd == "stepout")
     {
-        // Return address resolution, in priority order:
-        // 1) StackWalk64 unwind (.pdata): exact for non-leaf x64 functions,
-        //    including FPO/optimized code.
-        // 2) Leaf function (no unwind record): [rsp] per the x64 ABI.
-        // 3) rbp frame link, then an upward stack scan as last resorts.
+        // Return address resolution via real unwinding only:
+        // - non-leaf x64 function: StackWalk64 (.pdata) decides the caller;
+        // - confirmed leaf (no unwind record): [rsp] per the x64 ABI;
+        // - unwind infrastructure failure: report, set no breakpoint.
+        // Heuristic fallbacks (frame links, stack scans) are deliberately NOT
+        // used: they can mistake stale or in-function values for the caller.
         Registers r(currentThread()->hThread);
         ptr rsp = r.Gsp();
-        ptr rbp = r.Gbp();
         ptr retAddr = 0;
         const char* via = "";
 
@@ -122,59 +122,28 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                    mbi.State == MEM_COMMIT &&
                    (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
         };
-        // Is there a call instruction ending exactly at 'retAddrCandidate'?
-        auto precededByCall = [this](ptr retva)
-        {
-            uint8_t b[8];
-            if(retva < 8 || !mProcess->MemReadSafe(retva - 8, b, sizeof(b)))
-                return false;
-            if(b[3] == 0xE8)                                                  // call rel32
-                return true;
-            if(b[2] == 0xFF && ((b[3] >> 3) & 7) == 2 && (b[3] >> 6) == 0 && (b[3] & 7) == 5) // call [rip+disp]
-                return true;
-            if(b[6] == 0xFF && ((b[7] >> 3) & 7) == 2)                        // call r/m
-                return true;
-            return false;
-        };
 
-        if(auto walked = stackWalkReturn(currentThread()->hThread))
+        auto walked = stackWalkReturn(currentThread()->hThread);
+        switch(walked.first)
         {
-            retAddr = walked;
+        case UnwindStatus::Success:
+            retAddr = walked.second;
             via = " (unwind)";
-        }
-        else
+            break;
+        case UnwindStatus::Leaf:
         {
             ptr top = 0;
-            if(mProcess->MemReadSafe(rsp, &top, sizeof(top)) && isExecutable(top) && precededByCall(top))
+            if(mProcess->MemReadSafe(rsp, &top, sizeof(top)) && top && isExecutable(top))
             {
-                retAddr = top; // leaf function: return address at [rsp]
-                via = " (stack scan)";
+                retAddr = top;
+                via = " (leaf)";
             }
+            break;
         }
-        if(!retAddr && rbp > rsp && rbp - rsp < 0x10000)
-        {
-            ptr callerRbp = 0, candidate = 0;
-            if(mProcess->MemReadSafe(rbp, &callerRbp, sizeof(callerRbp)) &&
-               mProcess->MemReadSafe(rbp + sizeof(rbp), &candidate, sizeof(candidate)) &&
-               callerRbp >= rbp && isExecutable(candidate))
-            {
-                retAddr = candidate;
-                via = " (frame)";
-            }
-        }
-        if(!retAddr)
-        {
-            for(ptr sp = rsp; sp < rsp + 0x400 && !retAddr; sp += sizeof(ptr))
-            {
-                ptr candidate = 0;
-                if(!mProcess->MemReadSafe(sp, &candidate, sizeof(candidate)))
-                    break;
-                if(isExecutable(candidate) && precededByCall(candidate))
-                {
-                    retAddr = candidate;
-                    via = " (stack scan)";
-                }
-            }
+        case UnwindStatus::Failed:
+            printf("unwind failed for the current function; no breakpoint set\n");
+            fflush(stdout);
+            return CmdResult::Handled;
         }
         if(!retAddr)
         {
@@ -196,14 +165,9 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     if(cmd == "detach")
     {
         mQuitting = true;
-        // Reclaim stub resources left in the target before letting it go.
-        if(auto hThread = mBreakInStubThread.exchange(nullptr))
-        {
-            TerminateThread(hThread, 0);
-            CloseHandle(hThread);
-        }
-        if(auto page = mBreakInStubPage.exchange(nullptr))
-            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
+        // Reclaim stub resources left in the target before letting it go
+        // (terminate -> wait -> close -> free, in that order).
+        cleanupBreakInStub();
         Detach(); // detach happens at the end of the debug loop iteration
         printf("detaching...\n");
         fflush(stdout);
@@ -213,13 +177,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     if(cmd == "quit")
     {
         mQuitting = true;
-        if(auto hThread = mBreakInStubThread.exchange(nullptr))
-        {
-            TerminateThread(hThread, 0);
-            CloseHandle(hThread);
-        }
-        if(auto page = mBreakInStubPage.exchange(nullptr))
-            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
+        cleanupBreakInStub();
         Stop();
         return CmdResult::Resume;
     }

@@ -73,24 +73,23 @@ namespace
 
     // Read a NUL-terminated string from the debuggee. `cap` limits the total
     // number of bytes read; every chunk read is checked so we never go past it.
-    std::string readCString(Process* process, uint64_t addr, size_t cap = 260)
+    // Returns (text, true) only when a NUL was found within the range.
+    std::pair<std::string, bool> readCString(Process* process, uint64_t addr, size_t cap = 260)
     {
         std::string result;
         char buf[64];
         while(result.size() < cap)
         {
             size_t chunk = (std::min)(sizeof(buf), cap - result.size());
-            if(!process->MemReadSafe(addr + result.size(), buf, chunk))
-                break;
+            if(chunk == 0 || !process->MemReadSafe(addr + result.size(), buf, chunk))
+                return { result, false }; // truncated or unreadable
             size_t i = 0;
             for(; i < chunk && buf[i]; i++)
                 result += buf[i];
             if(i < chunk) // hit the NUL
-                break;
-            if(chunk == 0)
-                break;
+                return { result, true };
         }
-        return result;
+        return { result, false }; // no NUL within the cap
     }
 
     template<typename T>
@@ -215,16 +214,16 @@ static BOOL CALLBACK stackReadMemory(HANDLE hProcess, DWORD64 base, PVOID buffer
 }
 
 // Unwind one frame with dbghelp StackWalk64 (uses .pdata, so it works for
-// FPO/optimized x64 code). Returns the caller's return address, 0 for leaf
-// functions or on failure.
-uint64_t GleamDebugger::stackWalkReturn(HANDLE hThread)
+// FPO/optimized x64 code). Distinguishes a real caller from a confirmed
+// leaf function (no unwind record present) and from infrastructure failure.
+std::pair<GleamDebugger::UnwindStatus, uint64_t> GleamDebugger::stackWalkReturn(HANDLE hThread)
 {
     if(!mProcess || !ensureSymSession())
-        return 0;
+        return { UnwindStatus::Failed, 0 };
     CONTEXT context{};
     context.ContextFlags = CONTEXT_FULL;
     if(!GetThreadContext(hThread, &context))
-        return 0;
+        return { UnwindStatus::Failed, 0 };
     STACKFRAME64 frame{};
     frame.AddrPC.Offset = context.Rip;
     frame.AddrPC.Mode = AddrModeFlat;
@@ -232,11 +231,17 @@ uint64_t GleamDebugger::stackWalkReturn(HANDLE hThread)
     frame.AddrFrame.Mode = AddrModeFlat;
     frame.AddrStack.Offset = context.Rsp;
     frame.AddrStack.Mode = AddrModeFlat;
-    if(!StackWalk64(IMAGE_FILE_MACHINE_AMD64,
-                    mProcess->hProcess, hThread, &frame, &context,
-                    stackReadMemory, SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
-        return 0;
-    return frame.AddrReturn.Offset;
+    if(StackWalk64(IMAGE_FILE_MACHINE_AMD64,
+                   mProcess->hProcess, hThread, &frame, &context,
+                   stackReadMemory, SymFunctionTableAccess64, SymGetModuleBase64, nullptr) &&
+       frame.AddrReturn.Offset)
+        return { UnwindStatus::Success, frame.AddrReturn.Offset };
+    // No caller from the walk. If an unwind record exists for the current
+    // PC, the function is NOT a leaf - the unwind itself failed. Otherwise
+    // it is a genuine leaf and [rsp] holds the return address (x64 ABI).
+    if(SymFunctionTableAccess64(mProcess->hProcess, context.Rip))
+        return { UnwindStatus::Failed, 0 };
+    return { UnwindStatus::Leaf, 0 };
 }
 
 uint64_t GleamDebugger::moduleEntryPoint(uint64_t base)
@@ -316,20 +321,25 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     ModuleInfo mod;
     if(moduleName.empty())
     {
-        // Loader-reported size for the main module as well: the first module
-        // EnumProcessModules returns is the executable itself. The PE header
-        // SizeOfImage is only a cross-check, never the trust source.
+        // Loader-reported size for the main module: the record must match the
+        // main image base from the debug event. On any mismatch or failure we
+        // do NOT fall back to the (target-modifiable) PE header value.
         HMODULE first = nullptr;
         DWORD needed = 0;
         MODULEINFO mi{};
         if(EnumProcessModules(mProcess->hProcess, &first, sizeof(first), &needed) &&
-           GetModuleInformation(mProcess->hProcess, first, &mi, sizeof(mi)))
+           GetModuleInformation(mProcess->hProcess, first, &mi, sizeof(mi)) &&
+           (uint64_t)(uintptr_t)mi.lpBaseOfDll == (uint64_t)mProcess->createProcessInfo.lpBaseOfImage)
         {
             mod.base = (uint64_t)(uintptr_t)mi.lpBaseOfDll;
             mod.size = mi.SizeOfImage;
         }
         else
-            mod.base = (uint64_t)mProcess->createProcessInfo.lpBaseOfImage;
+        {
+            printf("cannot determine a trusted image range for the main module\n");
+            fflush(stdout);
+            return;
+        }
         mod.name = "(main module)";
     }
     else if(!findModule(mProcess->hProcess, moduleName, mod))
@@ -346,12 +356,11 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
         fflush(stdout);
         return;
     }
-    // Effective image size: loader-reported (psapi) whenever available; the
-    // PE header value is only a fallback. Every read below is bounded by it.
-    const uint64_t imageSize = mod.size ? mod.size : pe.sizeOfImage;
+    // Every read below is bounded by the loader-reported image range.
+    const uint64_t imageSize = mod.size;
     if(!imageSize)
     {
-        printf("cannot determine image size for 0x%llX\n", mod.base);
+        printf("cannot determine a trusted image size for 0x%llX\n", mod.base);
         fflush(stdout);
         return;
     }
@@ -403,7 +412,12 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
                 continue; // bogus RVA in a malformed descriptor
             auto dllName = readCString(mProcess, mod.base + desc.Name,
                                        (size_t)(std::min)((uint64_t)260, imageSize - desc.Name));
-            printf("%s:\n", dllName.c_str());
+            if(!dllName.second)
+            {
+                printf("(invalid dll name at rva 0x%llX, skipped)\n", (unsigned long long)desc.Name);
+                continue; // unterminated or truncated: not a valid import entry
+            }
+            printf("%s:\n", dllName.first.c_str());
             groups++;
             // Thunk walk bounded by complete elements inside the image.
             uint64_t maxT = 0;
@@ -464,7 +478,12 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
                 continue;
             auto dllName = readCString(mProcess, nameAddr,
                                        (size_t)(std::min)((uint64_t)260, imageSize - (nameAddr - mod.base)));
-            printf("%s (delay):\n", dllName.c_str());
+            if(!dllName.second)
+            {
+                printf("(invalid dll name at 0x%llX, skipped)\n", (unsigned long long)nameAddr);
+                continue;
+            }
+            printf("%s (delay):\n", dllName.first.c_str());
             groups++;
             // Thunk walk bounded by complete elements inside the image.
             uint64_t iatRva = iatAddr - mod.base;
@@ -559,6 +578,27 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
     if(cmd == "exports" && (args.size() == 2 || args.size() == 3))
     {
         cmdExports(args[1], args.size() == 3 ? args[2] : std::string());
+        return CmdResult::Handled;
+    }
+    if(cmd == "selftest")
+    {
+        // Unit boundaries for rangeInImage (no malformed-PE samples needed).
+        int pass = 0, total = 0;
+        auto T = [&](bool got, bool want) { total++; if(got == want) pass++; };
+        T(rangeInImage(0, 1, 100), true);                    // start of image
+        T(rangeInImage(99, 1, 100), true);                   // exactly to the end
+        T(rangeInImage(99, 2, 100), false);                  // one byte past the end
+        T(rangeInImage(100, 1, 100), false);                 // rva at the end
+        T(rangeInImage(0, 0, 100), true);                    // zero-size range
+        T(rangeInImage(50, 0xFFFFFFFFFFFFFFFFULL, 100), false); // size overflow
+        T(rangeInImage(0xFFFFFFFFFFFFFFFFULL, 1, 100), false);  // rva overflow
+        T(rangeInImage(92, 8, 100), true);                   // last complete element
+        T(rangeInImage(96, 8, 100), false);                  // element past the end
+        T(rangeInImage(97, 8, 100), false);                  // incomplete element
+        T(rangeInImage(0, 100, 0), false);                   // zero-size image
+        T(rangeInImage(60, 40, 100), true);                  // full tail range
+        printf("selftest rangeInImage %d/%d ok\n", pass, total);
+        fflush(stdout);
         return CmdResult::Handled;
     }
     if(cmd == "sym" && args.size() == 2 && parseAddress(args[1], a))
