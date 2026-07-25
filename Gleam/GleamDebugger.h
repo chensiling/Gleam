@@ -164,6 +164,15 @@ private:
     uint64_t mTraceCount = 0;
     bool mTraceLog = false;
 
+    // Control.cpp: stepout ("ret") - a core stepping loop with three special
+    // cases (ret / call / backward jump), no stack analysis at all.
+    bool mStepOutActive = false;
+    bool mStepOutPending = false;   // a ret was just executed; finish next tick
+    uint64_t mStepOutSteps = 0;
+    uint64_t mStepOutMax = 0x40000;
+    void stepOutTick();                 // inspect the current instruction, act
+    void stepOutFinish(const char* reason);
+
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();
     void closeSymSession();

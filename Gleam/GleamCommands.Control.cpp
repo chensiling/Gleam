@@ -7,7 +7,15 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <GleeBug/Zydis/Zydis.h>
+
 using namespace GleeBug;
+
+#ifdef _WIN64
+static const ZydisMachineMode kStepOutMode = ZYDIS_MACHINE_MODE_LONG_64;
+#else
+static const ZydisMachineMode kStepOutMode = ZYDIS_MACHINE_MODE_LONG_COMPAT_32;
+#endif
 
 GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std::string> & args)
 {
@@ -104,61 +112,26 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
 
     if(cmd == "ret" || cmd == "stepout")
     {
-        // Return address resolution via real unwinding only:
-        // - non-leaf x64 function: StackWalk64 (.pdata) decides the caller;
-        // - confirmed leaf (no unwind record): [rsp] per the x64 ABI;
-        // - unwind infrastructure failure: report, set no breakpoint.
-        // Heuristic fallbacks (frame links, stack scans) are deliberately NOT
-        // used: they can mistake stale or in-function values for the caller.
-        Registers r(currentThread()->hThread);
-        ptr rsp = r.Gsp();
-        ptr retAddr = 0;
-        const char* via = "";
-
-        auto isExecutable = [this](ptr a)
+        // stepout = a core stepping loop with three special cases:
+        //   ret            -> execute it, stop in the caller
+        //   call           -> one-shot bp after it, full speed (skip)
+        //   backward jump  -> one-shot bp at the loop exit, full speed
+        // No stack analysis: works on FPO, packed code and shellcode.
+        mStepOutActive = true;
+        mStepOutSteps = 0;
+        if(args.size() == 2)
         {
-            MEMORY_BASIC_INFORMATION mbi;
-            return a && VirtualQueryEx(mProcess->hProcess, (LPCVOID)a, &mbi, sizeof(mbi)) &&
-                   mbi.State == MEM_COMMIT &&
-                   (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
-        };
-
-        auto walked = stackWalkReturn(currentThread()->hThread);
-        switch(walked.first)
-        {
-        case UnwindStatus::Success:
-            retAddr = walked.second;
-            via = " (unwind)";
-            break;
-        case UnwindStatus::Leaf:
-        {
-            ptr top = 0;
-            if(mProcess->MemReadSafe(rsp, &top, sizeof(top)) && top && isExecutable(top))
+            uint64_t maxSteps = 0;
+            if(!parseHex(args[1], maxSteps) || !maxSteps)
             {
-                retAddr = top;
-                via = " (leaf)";
+                printf("usage: ret [maxsteps-hex]\n");
+                fflush(stdout);
+                mStepOutActive = false;
+                return CmdResult::Handled;
             }
-            break;
+            mStepOutMax = maxSteps;
         }
-        case UnwindStatus::Failed:
-            printf("unwind failed for the current function; no breakpoint set\n");
-            fflush(stdout);
-            return CmdResult::Handled;
-        }
-        if(!retAddr)
-        {
-            printf("no plausible return address on the stack\n");
-            fflush(stdout);
-            return CmdResult::Handled;
-        }
-        if(!mProcess->SetBreakpoint(retAddr, true))
-        {
-            printf("failed to set return breakpoint at 0x%llX\n", (unsigned long long)retAddr);
-            fflush(stdout);
-            return CmdResult::Handled;
-        }
-        printf("stepping out to 0x%llX%s\n", (unsigned long long)retAddr, via);
-        fflush(stdout);
+        stepOutTick();
         return CmdResult::Resume;
     }
 
@@ -380,4 +353,108 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     }
 
     return CmdResult::NotMine;
+}
+
+// stepout engine. Every tick inspects the CURRENT instruction (GIP) and
+// takes exactly one action:
+//   ret            -> finish (we are in the caller now)
+//   call           -> one-shot bp after it, resume full speed (skip)
+//   backward jump  -> one-shot bp at the loop exit, resume full speed
+//   anything else  -> single step
+// Ticks come from cbStep (after a step) and cbBreakpoint (after a one-shot
+// bp hit) while mStepOutActive is set.
+void GleamDebugger::stepOutFinish(const char* reason)
+{
+    mStepOutActive = false;
+    mStepArmed = false;
+    char details[96];
+    sprintf_s(details, "%s steps=%llu", reason, (unsigned long long)mStepOutSteps);
+    emitStop("stepout", details);
+    mWantsPause = true;
+}
+
+void GleamDebugger::stepOutTick()
+{
+    // The ret we just executed has landed us in the caller: finish.
+    if(mStepOutPending)
+    {
+        mStepOutPending = false;
+        stepOutFinish("return");
+        return;
+    }
+    if(mStepOutSteps >= mStepOutMax)
+    {
+        stepOutFinish("maxreached");
+        return;
+    }
+
+    Registers r(currentThread()->hThread);
+    auto gip = r.Gip();
+    uint8_t data[16];
+    ZydisDisassembledInstruction insn;
+    bool decoded = mProcess->MemReadSafe(gip, data, sizeof(data)) &&
+                   ZYAN_SUCCESS(ZydisDisassembleIntel(kStepOutMode, gip, data, sizeof(data), &insn));
+    if(decoded)
+    {
+        // ret / ret imm16 (also rep ret): execute it, then stop in the caller.
+        if(!strcmp(insn.text, "ret") || !strncmp(insn.text, "ret ", 4))
+        {
+            mStepOutSteps++;
+            mStepOutPending = true;
+            mStepArmed = true;
+            currentThread()->StepInto();
+            return;
+        }
+
+        // call -> skip it at full speed.
+        if(!strncmp(insn.text, "call", 4))
+        {
+            mStepOutSteps++;
+            if(mProcess->SetBreakpoint(gip + insn.info.length, true))
+                return; // bp hit -> tick again
+            // Fall through to single stepping if the bp cannot be set.
+        }
+        else
+        {
+            // Backward jump (loop back edge) -> fast-forward to the loop exit.
+            uint64_t target = 0;
+            uint8_t len = insn.info.length;
+            bool isJump = false;
+            if(data[0] == 0xE9 && len == 5) // jmp rel32
+            {
+                int32_t rel;
+                memcpy(&rel, data + 1, 4);
+                target = gip + len + (int64_t)rel;
+                isJump = true;
+            }
+            else if(data[0] == 0xEB && len == 2) // jmp rel8
+            {
+                target = gip + len + (int8_t)data[1];
+                isJump = true;
+            }
+            else if((data[0] & 0xF0) == 0x70 && len == 2) // jcc rel8
+            {
+                target = gip + len + (int8_t)data[1];
+                isJump = true;
+            }
+            else if(data[0] == 0x0F && (data[1] & 0xF0) == 0x80 && len == 6) // jcc rel32
+            {
+                int32_t rel;
+                memcpy(&rel, data + 2, 4);
+                target = gip + len + (int64_t)rel;
+                isJump = true;
+            }
+            if(isJump && target < gip)
+            {
+                mStepOutSteps++;
+                if(mProcess->SetBreakpoint(gip + len, true))
+                    return; // loop-exit bp hit -> tick again
+            }
+        }
+    }
+
+    // Default: single step (also the fallback when decoding/bp-setting fails).
+    mStepOutSteps++;
+    mStepArmed = true;
+    currentThread()->StepInto();
 }

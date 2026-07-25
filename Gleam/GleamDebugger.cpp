@@ -387,6 +387,14 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
         return;
     }
 
+    // stepout engine: its internal one-shot breakpoints (call skips and loop
+    // fast-forwards) drive the next tick instead of pausing.
+    if(mStepOutActive && info.singleshoot)
+    {
+        stepOutTick();
+        return;
+    }
+
     // Conditional breakpoints, tracepoints and "do" commands may suppress
     // the pause entirely.
     if(!evalBpRule(info, rulePtr))
@@ -417,6 +425,13 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
 
 void GleamDebugger::cbStep()
 {
+    // stepout engine: a step landed; inspect what is at GIP now.
+    if(mStepOutActive)
+    {
+        stepOutTick();
+        return;
+    }
+
     // Conditional tracing ("tgo"): keep stepping in the core until the
     // condition holds or the step cap is reached.
     if(mTraceActive)

@@ -135,18 +135,17 @@ chk "G: exception passed"        /tmp/gleam_G.txt "action=passed-to-debuggee"
 chk "G: survived"                /tmp/gleam_G.txt "SURVIVED_EXCEPTION"
 chk "G: exit 0"                  /tmp/gleam_G.txt "stop reason=exit code=0x00000000"
 
-# --- H: ret (step out) ---
+# --- H: stepout (stepping loop) ---
 run H "" <<EOF
 bp $INNER
 g
-step
 ret
 regs
 g
 g
 EOF
 chk "H: bp inner hit"            /tmp/gleam_H.txt "stop reason=breakpoint type=software address=0x1400708AC"
-chk "H: stepping out"            /tmp/gleam_H.txt "stepping out to 0x"
+chk "H: stepout stop"            /tmp/gleam_H.txt "stop reason=stepout return"
 chk "H: result1 normal"          /tmp/gleam_H.txt "MARKER_RESULT_1=47"
 
 # --- I: stepover ---
@@ -165,7 +164,7 @@ regs
 g
 g
 EOF
-chk "I: stepped over the call"   /tmp/gleam_I.txt "stop reason=step rip=0x140076B8F"
+chk "I: stepped over the call"   /tmp/gleam_I.txt "stop reason=step rip=0x140076BEF"
 chk "I: result1 normal"          /tmp/gleam_I.txt "MARKER_RESULT_1=47"
 
 # --- J: detach ---
@@ -209,7 +208,7 @@ chk "L: OEP entry stop"          /tmp/gleam_L.txt "stop reason=entry address=0x1
 chk "L: thread create stop"      /tmp/gleam_L.txt "stop reason=thread op=create"
 chk "L: thread start named"      /tmp/gleam_L.txt "name=worker"
 chk "L: dll load stop"           /tmp/gleam_L.txt "stop reason=dll op=load"
-chk "L: symbol bp hit (real body)" /tmp/gleam_L.txt "stop reason=breakpoint type=software address=0x140076B70"
+chk "L: symbol bp hit (real body)" /tmp/gleam_L.txt "stop reason=breakpoint type=software address=0x140076BD0"
 
 # --- M: breakon exception off ---
 run M "exc" <<'EOF'
@@ -247,14 +246,14 @@ chkcount "N3: only rcx==7 pauses" /tmp/gleam_N3.txt "stop reason=breakpoint" 1
 run N4 "" <<'EOF'
 bp 140070EC9
 g
-sym 140076B70
+sym 140076BD0
 stackscan 10
 find 140190000 100 ascii GLEAM
 patch 140190000 AA BB
 patches
 restore 140190000
 patches
-until 140076B70
+until 140076BD0
 g
 g
 EOF
@@ -264,7 +263,7 @@ chk "N4: find ascii"             /tmp/gleam_N4.txt "found at 0x140190000"
 chk "N4: patched"                /tmp/gleam_N4.txt "patched 0x140190000 (2 bytes)"
 chk "N4: restored"               /tmp/gleam_N4.txt "restored 0x140190000"
 chk "N4: list empty after restore" /tmp/gleam_N4.txt "no patches"
-chk "N4: until hits"             /tmp/gleam_N4.txt "stop reason=breakpoint type=software address=0x140076B70"
+chk "N4: until hits"             /tmp/gleam_N4.txt "stop reason=breakpoint type=software address=0x140076BD0"
 chk "N4: restore kept data"      /tmp/gleam_N4.txt "GDATA_AFTER=584C45414D2D544553542D4441544121"
 
 # --- O1: alloc/protect ---
@@ -282,7 +281,7 @@ xref 1400708AC
 findasm call
 g
 EOF
-chk "O2: xref finds call site"   /tmp/gleam_O2.txt "0x0000000140076B9F  call 0x00000001400708AC"
+chk "O2: xref finds call site"   /tmp/gleam_O2.txt "0x0000000140076BFF  call 0x00000001400708AC"
 chk "O2: xref count"             /tmp/gleam_O2.txt "1 references to 0x1400708AC"
 chk "O2: findasm indirect call"  /tmp/gleam_O2.txt "call [0x000000014019F008]"
 
@@ -308,7 +307,7 @@ g
 g
 EOF
 chk "P1: trace stops on condition" /tmp/gleam_P1.txt "stop reason=trace condition steps=1"
-chk "P1: rip at real body"       /tmp/gleam_P1.txt "RIP=0000000140076B70"
+chk "P1: rip at real body"       /tmp/gleam_P1.txt "RIP=0000000140076BD0"
 
 # --- P2: bp do <command> (non-resume) ---
 run P2 "" <<'EOF'
@@ -360,7 +359,7 @@ g
 EOF
 chk "Q3: restored to original"   /tmp/gleam_Q3.txt "47 4C 45 41"
 
-# --- Q4: ret via frame pointer ---
+# --- Q4: stepout mid-function (framed) ---
 run Q4 "" <<'EOF'
 bp 140070EC9
 g
@@ -376,7 +375,7 @@ ret
 g
 g
 EOF
-chk "Q4: frame-based return"     /tmp/gleam_Q4.txt "(unwind)"
+chk "Q4: stepout stop"           /tmp/gleam_Q4.txt "stop reason=stepout return"
 
 # --- R1: one-shot 'do g' rule fully cleaned ---
 run R1 "" <<'EOF'
@@ -419,7 +418,7 @@ check_ec() { # check_ec <desc> <code> <outfile>
   if [ "$2" -ne 0 ]; then bad "$1: abnormal exit (code $2; see $3)"; fi
 }
 
-# --- R4: ret in Release/FPO function (guarded: needs Release binaries) ---
+# --- R4: stepout in Release/FPO function (guarded: needs Release binaries) ---
 REL=bin/Release/x64
 if [ -f "$REL/Gleam.exe" ] && [ -f "$REL/TestTarget.exe" ]; then
   echo "== R4 =="
@@ -434,7 +433,7 @@ g
 g
 EOF
   check_ec R4 $? /tmp/gleam_R4.txt
-  chk "R4: unwind ret"            /tmp/gleam_R4.txt "(unwind)"
+  chk "R4: stepout stop (FPO)"   /tmp/gleam_R4.txt "stop reason=stepout return"
   chk "R4: caller resume"        /tmp/gleam_R4.txt "MARKER_RESULT_1=47"
 else
   echo "== R4 == (skipped: no Release binaries)"
@@ -563,7 +562,7 @@ EOF
 chkcount "T4b: no bp pause"      /tmp/gleam_T4b.txt "stop reason=breakpoint" 0
 chk "T4b: results correct"       /tmp/gleam_T4b.txt "MARKER_RESULT_2=13"
 
-# --- T5: ret at function entry and at the ret instruction ---
+# --- T5: stepout at function entry and at the ret instruction ---
 run T5 "" <<'EOF'
 bp 140070EC9
 g
@@ -572,17 +571,28 @@ regs
 g
 g
 EOF
-chk "T5: ret at entry"           /tmp/gleam_T5.txt "stepping out to 0x140076E94 (unwind)"
+chk "T5: stepout at entry"       /tmp/gleam_T5.txt "stop reason=stepout return"
 run T5b "" <<'EOF'
 bp 140070EC9
 g
-until 140076BAE
+until 140076C10
 ret
 regs
 g
 g
 EOF
-chk "T5: ret at ret insn"        /tmp/gleam_T5b.txt "stepping out to 0x140076E94 (unwind)"
+chk "T5b: stepout at ret insn"   /tmp/gleam_T5b.txt "stop reason=stepout return"
+
+# --- T5c: stepout fast-forwards a 100k-iteration loop ---
+run T5c "" <<'EOF'
+bp TestTarget!looper
+g
+ret
+regs
+g
+EOF
+chkre "T5c: few steps, not 100k" /tmp/gleam_T5c.txt "stop reason=stepout return steps=[0-9][0-9]? "
+chk "T5c: loop result correct"   /tmp/gleam_T5c.txt "LOOP_RESULT=4999950000"
 
 # --- S2: 100 pause injections (reviewer-standard stress) ---
 echo "== S2 =="

@@ -22,6 +22,16 @@ __declspec(noinline) uint64_t marker(uint64_t x)
     return inner(keep) + 1;
 }
 
+// A function with a real loop: stepout must fast-forward it, not single-step
+// all 100000 iterations.
+__declspec(noinline) uint64_t looper(uint64_t n)
+{
+    volatile uint64_t sum = 0;
+    for(uint64_t i = 0; i < n; i++)
+        sum += i;
+    return sum;
+}
+
 static DWORD WINAPI worker(LPVOID)
 {
     Sleep(60000);
@@ -66,6 +76,11 @@ int main(int argc, char** argv)
     printf("MARKER_RESULT_1=%llu\n", (unsigned long long)r1);
     uint64_t r2 = marker(7);
     printf("MARKER_RESULT_2=%llu\n", (unsigned long long)r2);
+
+    printf("LOOPER=%p\n", (void*)&looper);
+    fflush(stdout);
+    uint64_t r3 = looper(100000);
+    printf("LOOP_RESULT=%llu\n", (unsigned long long)r3);
 
     // A self-write so data breakpoints have something to catch.
     g_data[0] = 0x58;
