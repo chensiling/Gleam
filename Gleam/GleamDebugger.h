@@ -52,6 +52,8 @@ private:
     void forceBreakIn();
     // Lazily allocate/write the session stub page and resolve ExitThread.
     bool ensureBreakInStub(GleeBug::Process* process);
+    // Last-resort break-in; sets the expectation flag only on success.
+    void fallbackDebugBreak(GleeBug::Process* process);
 
 protected:
     void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;

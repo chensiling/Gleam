@@ -414,6 +414,11 @@ EOF
 chk "R3: detection restored"     /tmp/gleam_R3.txt "ISDEBUGGERPRESENT=1"
 chk "R3: skip re-apply"          /tmp/gleam_R3.txt "hide already applied"
 
+# Direct scenarios must check the exit status too (no false pass after a hang).
+check_ec() { # check_ec <desc> <code> <outfile>
+  if [ "$2" -ne 0 ]; then bad "$1: abnormal exit (code $2; see $3)"; fi
+}
+
 # --- R4: ret in Release/FPO function (guarded: needs Release binaries) ---
 REL=bin/Release/x64
 if [ -f "$REL/Gleam.exe" ] && [ -f "$REL/TestTarget.exe" ]; then
@@ -428,7 +433,8 @@ ret
 g
 g
 EOF
-  chk "R4: stack-scan ret"       /tmp/gleam_R4.txt "(stack scan)"
+  check_ec R4 $? /tmp/gleam_R4.txt
+  chk "R4: unwind ret"            /tmp/gleam_R4.txt "(unwind)"
   chk "R4: caller resume"        /tmp/gleam_R4.txt "MARKER_RESULT_1=47"
 else
   echo "== R4 == (skipped: no Release binaries)"
@@ -454,16 +460,17 @@ S1OK=0
 for i in $(seq 1 25); do
   out=$(printf 'g\npause\ndetach\n' | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
-  [ "$n" -eq 1 ] && S1OK=$((S1OK+1))
+  if [ "$n" -eq 1 ]; then S1OK=$((S1OK+1)); else printf '%s' "$out" > /tmp/gleam_S1_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
 done
-if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK/25 pause injections"; fi
+if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK/25 pause injections (artifacts: /tmp/gleam_S1_fail_*.txt)"; fi
 
 # --- T1: argv quoting matrix ---
 echo "== T1 =="
 timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe "" "a b" "$(printf 'x\ty')" "quote\"in" 'trail\' > /tmp/gleam_T1.txt 2>&1 <<'EOF'
 g
 EOF
+check_ec T1 $? /tmp/gleam_T1.txt
 chk "T1: argc"                   /tmp/gleam_T1.txt "ARGC=6"
 chk "T1: empty arg kept"         /tmp/gleam_T1.txt "ARGV[1]=[]"
 chk "T1: space arg"              /tmp/gleam_T1.txt "ARGV[2]=[a b]"
@@ -471,11 +478,21 @@ chk "T1: tab arg"                /tmp/gleam_T1.txt "$(printf 'ARGV[3]=[x\ty]')"
 chk "T1: embedded quote"         /tmp/gleam_T1.txt 'ARGV[4]=[quote"in]'
 chk "T1: trailing backslash"     /tmp/gleam_T1.txt 'ARGV[5]=[trail\]'
 
+# --- T1c: argv backslash parity ---
+echo "== T1c =="
+timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe 'a\\' 'x\\"y' > /tmp/gleam_T1c.txt 2>&1 <<'EOF'
+g
+EOF
+check_ec T1c $? /tmp/gleam_T1c.txt
+chk "T1c: trailing double backslash" /tmp/gleam_T1c.txt 'ARGV[1]=[a\\]'
+chk "T1c: 2x backslash + quote"  /tmp/gleam_T1c.txt 'ARGV[2]=[x\\"y]'
+
 # --- T1b: argv unicode + backslash-before-quote ---
 echo "== T1b =="
 timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe "中文路径" 'a\"b' > /tmp/gleam_T1b.txt 2>&1 <<'EOF'
 g
 EOF
+check_ec T1b $? /tmp/gleam_T1b.txt
 # The target's CRT converts narrow argv using the system ANSI codepage (GBK),
 # so the log contains GBK bytes - compare against those, not UTF-8.
 T1B_UNICODE=$(printf '中文路径' | iconv -f UTF-8 -t GBK)
@@ -490,6 +507,7 @@ xref 60000000
 xref 60100040
 quit
 EOF
+check_ec T2 $? /tmp/gleam_T2.txt
 chk "T2: straddler found"        /tmp/gleam_T2.txt "0x00000000600FFFFD  call 0x0000000060000000"
 chk "T2: direct+indirect calls"  /tmp/gleam_T2.txt "3 references to 0x60000000"
 chk "T2: rel8 jmp form"          /tmp/gleam_T2.txt "0x0000000060100010  jmp 0x0000000060100040"
@@ -569,11 +587,11 @@ S2OK=0
 for i in $(seq 1 100); do
   out=$(printf 'g\npause\ndetach\n' | timeout 30 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
-  [ "$n" -eq 1 ] && S2OK=$((S2OK+1))
+  if [ "$n" -eq 1 ]; then S2OK=$((S2OK+1)); else printf '%s' "$out" > /tmp/gleam_S2_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3  # let the previous notepad fully exit before the next launch
 done
-if [ "$S2OK" -eq 100 ]; then ok "S2: 100/100 pause injections"; else bad "S2: $S2OK/100 pause injections"; fi
+if [ "$S2OK" -eq 100 ]; then ok "S2: 100/100 pause injections"; else bad "S2: $S2OK/100 pause injections (artifacts: /tmp/gleam_S2_fail_*.txt)"; fi
 
 # --- S3: 100 quick sessions (REPL lifecycle) ---
 echo "== S3 =="
@@ -584,17 +602,26 @@ for i in $(seq 1 100); do
 done
 if [ "$S3OK" -eq 100 ]; then ok "S3: 100/100 sessions exited"; else bad "S3: $S3OK/100 sessions exited"; fi
 
+# --- S3b: REPL stdin-open lifecycle (natural exit / detach / quit) ---
+echo "== S3b =="
+out=$({ printf 'g\n'; sleep 8; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+[ $ec -eq 0 ] && ok "S3b: natural exit with stdin open" || bad "S3b: natural exit (code $ec)"
+out=$({ printf 'bp 140070EC9\ng\ndetach\n'; sleep 8; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+[ $ec -eq 0 ] && ok "S3b: detach with stdin open" || bad "S3b: detach (code $ec)"
+out=$({ printf 'quit\n'; sleep 8; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+[ $ec -eq 0 ] && ok "S3b: quit with stdin open" || bad "S3b: quit (code $ec)"
+
 # --- S4: runtime pause (delayed writer; pause sent while target RUNS free) ---
 echo "== S4 =="
 S4OK=0
 for i in $(seq 1 30); do
   out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
-  [ "$n" -eq 1 ] && S4OK=$((S4OK+1))
+  if [ "$n" -eq 1 ]; then S4OK=$((S4OK+1)); else printf '%s' "$out" > /tmp/gleam_S4_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3
 done
-if [ "$S4OK" -eq 30 ]; then ok "S4: 30/30 runtime pauses"; else bad "S4: $S4OK/30 runtime pauses"; fi
+if [ "$S4OK" -eq 30 ]; then ok "S4: 30/30 runtime pauses"; else bad "S4: $S4OK/30 runtime pauses (artifacts: /tmp/gleam_S4_fail_*.txt)"; fi
 
 # --- S5: runtime pause with hide applied ---
 echo "== S5 =="
@@ -603,11 +630,11 @@ for i in $(seq 1 30); do
   out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   f=$(printf '%s' "$out" | grep -c 'breakin fail=')
-  [ "$n" -eq 1 ] && [ "$f" -eq 0 ] && S5OK=$((S5OK+1))
+  if [ "$n" -eq 1 ] && [ "$f" -eq 0 ]; then S5OK=$((S5OK+1)); else printf '%s' "$out" > /tmp/gleam_S5_fail_$i.txt; fi
   powershell -NoProfile -Command "Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   sleep 0.3
 done
-if [ "$S5OK" -eq 30 ]; then ok "S5: 30/30 hidden runtime pauses"; else bad "S5: $S5OK/30 hidden runtime pauses"; fi
+if [ "$S5OK" -eq 30 ]; then ok "S5: 30/30 hidden runtime pauses"; else bad "S5: $S5OK/30 hidden runtime pauses (artifacts: /tmp/gleam_S5_fail_*.txt)"; fi
 
 # --- T7: one-shot + failing condition ---
 run T7 "" <<'EOF'

@@ -18,15 +18,15 @@ bool GleamDebugger::pushCommand(const std::string & cmd)
 
 void GleamDebugger::requestPause()
 {
-    // Only safe to inject while the debuggee is running free (debugger
-    // blocked in WaitForDebugEvent). During event/command processing the
-    // request is deferred to just before ContinueDebugEvent instead.
-    if(mIsPaused.load() || mInDebugEvent.load())
+    // Set-then-check: the request is published first, then both sides race
+    // to consume it with exchange(). Whoever wins injects; the loser finds
+    // the flag already gone. No request can strand between the checks.
+    mPauseAfterResume.store(true);
+    if(!mIsPaused.load() && !mInDebugEvent.load())
     {
-        mPauseAfterResume.store(true);
-        return;
+        if(mPauseAfterResume.exchange(false))
+            forceBreakIn();
     }
-    forceBreakIn();
 }
 
 void GleamDebugger::forceBreakIn()
@@ -59,14 +59,33 @@ void GleamDebugger::forceBreakIn()
     {
         printf("event breakin fail=thread_create err=%lu\n", GetLastError());
         fflush(stdout);
-        mBreakInExpected.store(true);
-        DebugBreakProcess(process->hProcess);
+        fallbackDebugBreak(process);
         return;
     }
     mBreakInStubThread.store(hThread);
-    ResumeThread(hThread); // the int3 can only fire after this point
+    if(ResumeThread(hThread) == (DWORD)-1)
+    {
+        printf("event breakin fail=resume err=%lu\n", GetLastError());
+        fflush(stdout);
+        CloseHandle(mBreakInStubThread.exchange(nullptr));
+        fallbackDebugBreak(process);
+        return;
+    }
     printf("event breakin injected page=0x%p\n", mBreakInStubPage.load());
     fflush(stdout);
+}
+
+void GleamDebugger::fallbackDebugBreak(GleeBug::Process* process)
+{
+    // Set the expectation flag only when the API actually injected; otherwise
+    // a later unrelated int3 would be mistaken for our break-in.
+    if(DebugBreakProcess(process->hProcess))
+        mBreakInExpected.store(true);
+    else
+    {
+        printf("event breakin fail=debugbreakprocess err=%lu\n", GetLastError());
+        fflush(stdout);
+    }
 }
 
 // Allocate/write the session stub page (once) and resolve ExitThread.
@@ -94,8 +113,7 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
         fflush(stdout);
         // NOTE: DebugBreakProcess is BeingDebugged-dependent; use only as a
         // last resort and expect a later retry via the stub path.
-        mBreakInExpected.store(true);
-        DebugBreakProcess(process->hProcess);
+        fallbackDebugBreak(process);
         return false;
     }
     memcpy(stub + 8, &exitThread, 8);
@@ -106,8 +124,7 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
     {
         printf("event breakin fail=alloc err=%lu\n", GetLastError());
         fflush(stdout);
-        mBreakInExpected.store(true);
-        DebugBreakProcess(process->hProcess);
+        fallbackDebugBreak(process);
         return false;
     }
     if(!WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
@@ -115,8 +132,7 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
         printf("event breakin fail=write err=%lu\n", GetLastError());
         fflush(stdout);
         VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
-        mBreakInExpected.store(true);
-        DebugBreakProcess(process->hProcess);
+        fallbackDebugBreak(process);
         return false;
     }
     mBreakInStubPage.store(page);

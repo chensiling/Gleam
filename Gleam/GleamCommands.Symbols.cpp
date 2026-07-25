@@ -71,7 +71,8 @@ namespace
         return false;
     }
 
-    // Read a NUL-terminated string from the debuggee (capped).
+    // Read a NUL-terminated string from the debuggee. `cap` limits the total
+    // number of bytes read; every chunk read is checked so we never go past it.
     std::string readCString(Process* process, uint64_t addr, size_t cap = 260)
     {
         std::string result;
@@ -203,7 +204,14 @@ namespace
 // ReadMemoryProc for StackWalk64 on the remote target.
 static BOOL CALLBACK stackReadMemory(HANDLE hProcess, DWORD64 base, PVOID buffer, DWORD size, LPDWORD bytesRead)
 {
-    return ReadProcessMemory(hProcess, (LPCVOID)base, buffer, size, (SIZE_T*)bytesRead);
+    // ReadProcessMemory reports through SIZE_T (8 bytes on x64); converting
+    // LPDWORD to SIZE_T* directly would write 8 bytes into a 4-byte out
+    // parameter. Receive into a local first, then convert with a bound.
+    SIZE_T read = 0;
+    BOOL ok = ReadProcessMemory(hProcess, (LPCVOID)base, buffer, size, &read);
+    if(bytesRead)
+        *bytesRead = (DWORD)(std::min)(read, (SIZE_T)size);
+    return ok;
 }
 
 // Unwind one frame with dbghelp StackWalk64 (uses .pdata, so it works for
@@ -308,7 +316,20 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
     ModuleInfo mod;
     if(moduleName.empty())
     {
-        mod.base = (uint64_t)mProcess->createProcessInfo.lpBaseOfImage;
+        // Loader-reported size for the main module as well: the first module
+        // EnumProcessModules returns is the executable itself. The PE header
+        // SizeOfImage is only a cross-check, never the trust source.
+        HMODULE first = nullptr;
+        DWORD needed = 0;
+        MODULEINFO mi{};
+        if(EnumProcessModules(mProcess->hProcess, &first, sizeof(first), &needed) &&
+           GetModuleInformation(mProcess->hProcess, first, &mi, sizeof(mi)))
+        {
+            mod.base = (uint64_t)(uintptr_t)mi.lpBaseOfDll;
+            mod.size = mi.SizeOfImage;
+        }
+        else
+            mod.base = (uint64_t)mProcess->createProcessInfo.lpBaseOfImage;
         mod.name = "(main module)";
     }
     else if(!findModule(mProcess->hProcess, moduleName, mod))
@@ -325,8 +346,8 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
         fflush(stdout);
         return;
     }
-    // Effective image size: psapi for named modules, PE header for the main
-    // module (and as a cross-check). Every read below is bounded by it.
+    // Effective image size: loader-reported (psapi) whenever available; the
+    // PE header value is only a fallback. Every read below is bounded by it.
     const uint64_t imageSize = mod.size ? mod.size : pe.sizeOfImage;
     if(!imageSize)
     {
@@ -380,7 +401,8 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
                 break;
             if(!rangeInImage(desc.Name, 1, imageSize) || !rangeInImage(desc.FirstThunk, 1, imageSize))
                 continue; // bogus RVA in a malformed descriptor
-            auto dllName = readCString(mProcess, mod.base + desc.Name);
+            auto dllName = readCString(mProcess, mod.base + desc.Name,
+                                       (size_t)(std::min)((uint64_t)260, imageSize - desc.Name));
             printf("%s:\n", dllName.c_str());
             groups++;
             // Thunk walk bounded by complete elements inside the image.
@@ -440,7 +462,8 @@ void GleamDebugger::cmdImports(const std::string & moduleName)
             uint64_t iatAddr = rva ? mod.base + (uint64_t)desc.rvaIAT : (uint64_t)desc.rvaIAT;
             if(!rangeInImage(nameAddr - mod.base, 1, imageSize) || !rangeInImage(iatAddr - mod.base, 1, imageSize))
                 continue;
-            auto dllName = readCString(mProcess, nameAddr);
+            auto dllName = readCString(mProcess, nameAddr,
+                                       (size_t)(std::min)((uint64_t)260, imageSize - (nameAddr - mod.base)));
             printf("%s (delay):\n", dllName.c_str());
             groups++;
             // Thunk walk bounded by complete elements inside the image.

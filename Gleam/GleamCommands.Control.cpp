@@ -196,6 +196,14 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     if(cmd == "detach")
     {
         mQuitting = true;
+        // Reclaim stub resources left in the target before letting it go.
+        if(auto hThread = mBreakInStubThread.exchange(nullptr))
+        {
+            TerminateThread(hThread, 0);
+            CloseHandle(hThread);
+        }
+        if(auto page = mBreakInStubPage.exchange(nullptr))
+            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
         Detach(); // detach happens at the end of the debug loop iteration
         printf("detaching...\n");
         fflush(stdout);
@@ -205,6 +213,13 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     if(cmd == "quit")
     {
         mQuitting = true;
+        if(auto hThread = mBreakInStubThread.exchange(nullptr))
+        {
+            TerminateThread(hThread, 0);
+            CloseHandle(hThread);
+        }
+        if(auto page = mBreakInStubPage.exchange(nullptr))
+            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
         Stop();
         return CmdResult::Resume;
     }
