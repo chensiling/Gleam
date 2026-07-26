@@ -244,7 +244,17 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         }
         else if(resolved)
         {
-            if(mProcess->SetBreakpoint(a, once))
+            // RVA form with the module already loaded: reject out-of-image
+            // offsets immediately instead of recording a bogus entry.
+            uint64_t infoBase = 0;
+            uint32_t imageSize = 0;
+            if(logical && lb.symbol.empty() &&
+               (!moduleInfoOf(lb.module, infoBase, imageSize) || lb.rva >= imageSize))
+            {
+                printf("rva 0x%llX out of image for module %s\n",
+                       (unsigned long long)lb.rva, lb.module.c_str());
+            }
+            else if(mProcess->SetBreakpoint(a, once))
             {
                 if(rule.condReg != RegId::Invalid || rule.trace || !rule.command.empty())
                     mBpRules[a] = rule;
@@ -357,6 +367,12 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         if(badArgs)
         {
             printf("usage: hbp <hexaddr> [x|w|rw] [1|2|4|8]\n");
+        }
+        else if(mRawDrWritten)
+        {
+            // P0-6 bidirectional conflict rule: raw DR state and engine
+            // hardware breakpoints must never coexist.
+            printf("engine hardware breakpoints unavailable after raw dr write\n");
         }
         else
         {

@@ -126,6 +126,10 @@ private:
     // Inspect.cpp
     static bool registerByName(const std::string & name, RegId & reg);
     bool setRegisterExtended(const std::string & name, const std::string & valueText);
+    void cmdPrintRegister(const std::string & name);
+    // Raw DR mode: set once the user writes dr0-7 directly (P0-6). Blocks
+    // engine hardware breakpoints and enables DR6 hit reporting.
+    bool mRawDrWritten = false;
     void cmdRegs();
     void cmdRead(uint64_t addr, uint64_t size);
     void cmdReadTyped(const char* type, uint64_t addr);          // u8/u16/u32/u64/ptr
@@ -177,8 +181,10 @@ private:
     // Parse "module!symbol" or "module+<hexrva>"; module part must look like
     // a module name (not a hex literal / not a pure expression).
     static bool parseLogicalSpec(const std::string & s, LogicalBp & out);
-    // GleamDebugger.cpp: (un)bind on DLL load/unload events.
-    void bindModuleBreakpoints(uint64_t moduleBase);
+    // GleamDebugger.cpp: (un)bind on DLL load/unload events. The primary
+    // module identity is the real path from the event's file handle (or the
+    // loader list); the export-directory name is only an alias.
+    void bindModuleBreakpoints(uint64_t moduleBase, const std::string & primaryName);
     void unbindModuleBreakpoints(uint64_t moduleBase);
     // Try to bind every pending entry whose module is already loaded
     // (system/attach breakpoint time - covers the main module, which has no
@@ -205,14 +211,16 @@ private:
     uint64_t mTraceCount = 0;
     bool mTraceLog = false;
 
-    // Control.cpp: stepout ("ret") - a core stepping loop with three special
-    // cases (ret / call / backward jump), no stack analysis at all.
+    // Control.cpp: stepout ("ret") - a core stepping loop with two special
+    // cases (ret / call), no stack analysis at all.
     bool mStepOutActive = false;
     bool mStepOutPending = false;   // a ret was just executed; finish next tick
     uint64_t mStepOutSteps = 0;
     uint64_t mStepOutMax = 0x40000;
+    GleeBug::ptr mStepOutBpAddr = 0; // internal one-shot bp we are waiting on
     void stepOutTick();                 // inspect the current instruction, act
     void stepOutFinish(const char* reason);
+    void abortStepOut(const char* why); // pause/exception/detach/restart cleanup
 
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();
@@ -237,9 +245,15 @@ private:
     std::map<uint64_t, PdataCache> mPdataCache;
     // Resolve an address argument: any expression accepted by evalExpression
     // (hex, registers, module base, module!symbol, [deref], +/-, parentheses).
+    // On failure the concrete reason is kept in mAddrError for printAddrError.
     bool parseAddress(const std::string & s, uint64_t & out);
+    bool parseAddress(const std::string & s, uint64_t & out, std::string & err);
+    void printAddrError();           // GleamCommands.Symbols.cpp
+    std::string mAddrError;          // reason of the last failed parseAddress
     // Look up a loaded module's base by name (case-insensitive, .dll optional).
     bool moduleBaseByName(const std::string & name, uint64_t & base);
+    // Same, with image size (for RVA bounds checks).
+    bool moduleInfoOf(const std::string & name, uint64_t & base, uint32_t & size);
     // Resolve "module!symbol" through the dbghelp session.
     bool resolveModuleSymbol(const std::string & modSym, uint64_t & out);
     // Loader-list-independent module identity + export resolution (they work
@@ -266,6 +280,30 @@ private:
     // Remote .pdata verification for the leaf/non-leaf distinction.
     enum class PdataCheck { HasRecord, NoRecord, Unknown };
     PdataCheck checkUnwindRecord(uint64_t rip);
+
+    // Exception disposition policy (P0-3), x64dbg-compatible. Pure decision
+    // function so the full combination matrix is unit-testable ("selftest").
+    // Rules:
+    //   filter hit, breakOn matches chance  -> pause (second chance: swallow default)
+    //   filter hit, no break                -> handledBy: pass (NOT_HANDLED) / swallow
+    //   filter miss, first chance           -> breakOnException ? pause (pass default) : silent pass
+    //   filter miss, second chance          -> pause; default disposition is SWALLOW
+    //     (DBG_CONTINUE) because passing NOT_HANDLED certainly kills the
+    //     process; "exception pass" is the explicit escape (warned).
+    struct ExPolicyInput
+    {
+        bool firstChance;
+        bool filterHit;
+        int breakOn;        // 0=first 1=second 2=never (filter only)
+        int handledBy;      // 0=pass 1=swallow (filter only)
+        bool breakOnException;
+    };
+    struct ExPolicyOutput
+    {
+        bool pause;
+        bool swallow;
+    };
+    static ExPolicyOutput decideExPolicy(const ExPolicyInput & in);
 
     // GleamDebugger.cpp: unified machine-readable stop record.
     // Format: "stop reason=<r> ... rip=0x... tid=<id>" (one line, key=value).

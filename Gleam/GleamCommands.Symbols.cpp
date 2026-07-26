@@ -332,13 +332,33 @@ std::string GleamDebugger::symNameByAddr(uint64_t addr)
     return std::string();
 }
 
+bool GleamDebugger::parseAddress(const std::string & s, uint64_t & out, std::string & err)
+{
+    if(!evalExpression(s, out, err))
+    {
+        mAddrError = err;
+        return false;
+    }
+    mAddrError.clear();
+    return true;
+}
+
 bool GleamDebugger::parseAddress(const std::string & s, uint64_t & out)
 {
-    // All address arguments go through the expression evaluator
-    // (GleamCommands.Expr.cpp). Errors are silently mapped to "not an
-    // address"; callers print their own usage line.
     std::string err;
-    return evalExpression(s, out, err);
+    return parseAddress(s, out, err);
+}
+
+// Print the reason of the last failed parseAddress, if any. Called by the
+// central "unknown command" path and by usage printers.
+void GleamDebugger::printAddrError()
+{
+    if(!mAddrError.empty())
+    {
+        printf("error: %s\n", mAddrError.c_str());
+        mAddrError.clear();
+        fflush(stdout);
+    }
 }
 
 bool GleamDebugger::moduleBaseByName(const std::string & name, uint64_t & base)
@@ -349,6 +369,18 @@ bool GleamDebugger::moduleBaseByName(const std::string & name, uint64_t & base)
     if(!findModule(mProcess->hProcess, name, mod))
         return false;
     base = mod.base;
+    return true;
+}
+
+bool GleamDebugger::moduleInfoOf(const std::string & name, uint64_t & base, uint32_t & size)
+{
+    if(!mProcess)
+        return false;
+    ModuleInfo mod;
+    if(!findModule(mProcess->hProcess, name, mod))
+        return false;
+    base = mod.base;
+    size = mod.size;
     return true;
 }
 
@@ -1121,6 +1153,36 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
         T(rangeInImage(0, 100, 0), false);                   // zero-size image
         T(rangeInImage(60, 40, 100), true);                  // full tail range
         printf("selftest rangeInImage %d/%d ok\n", pass, total);
+        // P0-3 exception disposition policy: full table-driven matrix.
+        pass = total = 0;
+        auto D = [](bool fc, bool hit, int bo, int hb, bool boe)
+        {
+            ExPolicyInput in{ fc, hit, bo, hb, boe };
+            return decideExPolicy(in);
+        };
+        auto P = [](ExPolicyOutput o, bool pause, bool swallow)
+        {
+            return o.pause == pause && o.swallow == swallow;
+        };
+        // filter miss
+        T(P(D(true, false, 2, 0, true), true, false), true);   // first + breakon on  -> pause/pass
+        T(P(D(true, false, 2, 0, false), false, false), true); // first + breakon off -> silent pass
+        T(P(D(false, false, 2, 0, true), true, true), true);   // second              -> pause/swallow
+        T(P(D(false, false, 2, 0, false), true, true), true);  // second (breakon off)-> pause/swallow
+        // filter never
+        T(P(D(true, true, 2, 0, true), false, false), true);   // never pass, first
+        T(P(D(false, true, 2, 0, true), false, false), true);  // never pass, second (explicit: may die)
+        T(P(D(true, true, 2, 1, true), false, true), true);    // never swallow, first
+        T(P(D(false, true, 2, 1, true), false, true), true);   // never swallow, second
+        // filter breakOn=first
+        T(P(D(true, true, 0, 0, true), true, false), true);    // break first @first  -> pause/pass
+        T(P(D(false, true, 0, 0, true), false, false), true);  // break first @second -> disposition pass
+        T(P(D(false, true, 0, 1, true), false, true), true);   // break first @second -> disposition swallow
+        // filter breakOn=second
+        T(P(D(false, true, 1, 0, true), true, true), true);    // break second @second-> pause/swallow
+        T(P(D(true, true, 1, 0, true), false, false), true);   // break second @first -> disposition pass
+        T(P(D(true, true, 1, 1, true), false, true), true);    // break second @first -> disposition swallow
+        printf("selftest excpolicy %d/%d ok\n", pass, total);
         fflush(stdout);
         return CmdResult::Handled;
     }

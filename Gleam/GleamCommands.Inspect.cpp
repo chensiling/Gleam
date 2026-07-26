@@ -41,9 +41,136 @@ bool GleamDebugger::registerByName(const std::string & name, RegId & reg)
     return false;
 }
 
+// ---- Register target resolution (P0-6 contract) ----
+// Direct Get/SetThreadContext access. Sub-register writes are
+// debugger-slice read-modify-write: untouched bits are preserved (the
+// TitanEngine/x64dbg slice-editing semantics; NOT zero-extension).
+
+namespace
+{
+    enum class RegKind { Gpr, EFlags, Dr, Mxcsr, Xmm };
+
+    struct RegTarget
+    {
+        RegKind kind;
+        size_t off = 0;    // CONTEXT field offset (Gpr)
+        int width = 8;     // slice width in bytes (Gpr)
+        bool high = false; // high half of the 16-bit word (ah..dh)
+        int index = 0;     // Dr/Xmm index
+    };
+
+    bool resolveRegTarget(const std::string & name, RegTarget & t)
+    {
+        struct Slice { const char* name; size_t off; int width; bool high; };
+        static const Slice kSlices[] = {
+            { "rax", offsetof(CONTEXT, Rax), 8, false }, { "rbx", offsetof(CONTEXT, Rbx), 8, false },
+            { "rcx", offsetof(CONTEXT, Rcx), 8, false }, { "rdx", offsetof(CONTEXT, Rdx), 8, false },
+            { "rsi", offsetof(CONTEXT, Rsi), 8, false }, { "rdi", offsetof(CONTEXT, Rdi), 8, false },
+            { "rbp", offsetof(CONTEXT, Rbp), 8, false }, { "rsp", offsetof(CONTEXT, Rsp), 8, false },
+            { "rip", offsetof(CONTEXT, Rip), 8, false },
+            { "r8", offsetof(CONTEXT, R8), 8, false }, { "r9", offsetof(CONTEXT, R9), 8, false },
+            { "r10", offsetof(CONTEXT, R10), 8, false }, { "r11", offsetof(CONTEXT, R11), 8, false },
+            { "r12", offsetof(CONTEXT, R12), 8, false }, { "r13", offsetof(CONTEXT, R13), 8, false },
+            { "r14", offsetof(CONTEXT, R14), 8, false }, { "r15", offsetof(CONTEXT, R15), 8, false },
+            { "eax", offsetof(CONTEXT, Rax), 4, false }, { "ebx", offsetof(CONTEXT, Rbx), 4, false },
+            { "ecx", offsetof(CONTEXT, Rcx), 4, false }, { "edx", offsetof(CONTEXT, Rdx), 4, false },
+            { "esi", offsetof(CONTEXT, Rsi), 4, false }, { "edi", offsetof(CONTEXT, Rdi), 4, false },
+            { "ebp", offsetof(CONTEXT, Rbp), 4, false }, { "esp", offsetof(CONTEXT, Rsp), 4, false },
+            { "eip", offsetof(CONTEXT, Rip), 4, false },
+            { "ax", offsetof(CONTEXT, Rax), 2, false }, { "bx", offsetof(CONTEXT, Rbx), 2, false },
+            { "cx", offsetof(CONTEXT, Rcx), 2, false }, { "dx", offsetof(CONTEXT, Rdx), 2, false },
+            { "si", offsetof(CONTEXT, Rsi), 2, false }, { "di", offsetof(CONTEXT, Rdi), 2, false },
+            { "bp", offsetof(CONTEXT, Rbp), 2, false }, { "sp", offsetof(CONTEXT, Rsp), 2, false },
+            { "al", offsetof(CONTEXT, Rax), 1, false }, { "bl", offsetof(CONTEXT, Rbx), 1, false },
+            { "cl", offsetof(CONTEXT, Rcx), 1, false }, { "dl", offsetof(CONTEXT, Rdx), 1, false },
+            { "ah", offsetof(CONTEXT, Rax), 1, true }, { "bh", offsetof(CONTEXT, Rbx), 1, true },
+            { "ch", offsetof(CONTEXT, Rcx), 1, true }, { "dh", offsetof(CONTEXT, Rdx), 1, true },
+        };
+        for(const auto & s : kSlices)
+        {
+            if(_stricmp(name.c_str(), s.name) == 0)
+            {
+                t.kind = RegKind::Gpr;
+                t.off = s.off;
+                t.width = s.width;
+                t.high = s.high;
+                return true;
+            }
+        }
+        if(_stricmp(name.c_str(), "eflags") == 0) { t.kind = RegKind::EFlags; return true; }
+        if(_stricmp(name.c_str(), "mxcsr") == 0) { t.kind = RegKind::Mxcsr; return true; }
+        if(name.size() == 3 && (name[0] == 'd' || name[0] == 'D') &&
+           (name[1] == 'r' || name[1] == 'R') && name[2] >= '0' && name[2] <= '7')
+        {
+            t.kind = RegKind::Dr;
+            t.index = name[2] - '0';
+            if(t.index == 4) t.index = 6;      // DR4 aliases DR6
+            else if(t.index == 5) t.index = 7; // DR5 aliases DR7
+            return true;
+        }
+        if(name.size() >= 4 && name.size() <= 5 && _strnicmp(name.c_str(), "xmm", 3) == 0)
+        {
+            char* end = nullptr;
+            long idx = strtol(name.c_str() + 3, &end, 10);
+            if(end && *end == '\0' && end != name.c_str() + 3 && idx >= 0 && idx <= 15)
+            {
+                t.kind = RegKind::Xmm;
+                t.index = (int)idx;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint64_t gprRead(const CONTEXT & ctx, const RegTarget & t)
+    {
+        const uint64_t full = *(const uint64_t*)((const char*)&ctx + t.off);
+        const uint64_t mask = t.width >= 8 ? ~0ull : ((1ull << (t.width * 8)) - 1);
+        return (full >> (t.high ? 8 : 0)) & mask;
+    }
+
+    void gprWrite(CONTEXT & ctx, const RegTarget & t, uint64_t v)
+    {
+        uint64_t & full = *(uint64_t*)((char*)&ctx + t.off);
+        const int shift = t.high ? 8 : 0;
+        const uint64_t mask = t.width >= 8 ? ~0ull : ((1ull << (t.width * 8)) - 1);
+        full = (full & ~(mask << shift)) | ((v & mask) << shift);
+    }
+
+    uint64_t drRead(const CONTEXT & ctx, int idx)
+    {
+        switch(idx)
+        {
+        case 0: return ctx.Dr0;
+        case 1: return ctx.Dr1;
+        case 2: return ctx.Dr2;
+        case 3: return ctx.Dr3;
+        case 6: return ctx.Dr6;
+        case 7: return ctx.Dr7;
+        default: return 0;
+        }
+    }
+
+    void drWrite(CONTEXT & ctx, int idx, uint64_t v)
+    {
+        switch(idx)
+        {
+        case 0: ctx.Dr0 = v; break;
+        case 1: ctx.Dr1 = v; break;
+        case 2: ctx.Dr2 = v; break;
+        case 3: ctx.Dr3 = v; break;
+        case 6: ctx.Dr6 = v; break;
+        case 7: ctx.Dr7 = v; break;
+        }
+    }
+}
+
 void GleamDebugger::cmdRegs()
 {
-    Registers r(currentThread()->hThread);
+    Thread* thread = currentThread();
+    if(!thread)
+        return;
+    Registers r(thread->hThread);
     printf("RAX=%016llX RBX=%016llX RCX=%016llX RDX=%016llX\n", r.Rax(), r.Rbx(), r.Rcx(), r.Rdx());
     printf("RSI=%016llX RDI=%016llX RBP=%016llX RSP=%016llX\n", r.Rsi(), r.Rdi(), r.Rbp(), r.Rsp());
     printf("R8 =%016llX R9 =%016llX R10=%016llX R11=%016llX\n", r.R8(), r.R9(), r.R10(), r.R11());
@@ -64,77 +191,175 @@ void GleamDebugger::cmdRegs()
     fflush(stdout);
 }
 
-// Write one register: GPR (engine enum), eflags, dr0-dr7 (dr4->dr6, dr5->dr7
-// aliases like x64dbg), mxcsr, xmm0-xmm15 (32 hex chars, high half first).
-// The write lands via the Registers RAII destructor (SetThreadContext).
+// Write one register (P0-6 contract): direct Get/SetThreadContext, explicit
+// error codes, read-back verification before reporting success.
+// Sub-register writes are debugger-slice RMW (high bits preserved).
+// Raw DR writes are rejected while engine hardware breakpoints exist.
 bool GleamDebugger::setRegisterExtended(const std::string & name, const std::string & valueText)
 {
-    Registers r(currentThread()->hThread);
-    CONTEXT* ctx = r.GetContext();
-    uint64_t v = 0;
+    Thread* thread = currentThread();
+    if(!thread)
+        return false;
+    RegTarget t;
+    if(!resolveRegTarget(name, t))
+    {
+        printf("unknown register '%s'\n", name.c_str());
+        fflush(stdout);
+        return false;
+    }
 
-    RegId reg;
-    if(registerByName(name, reg))
+    uint64_t v = 0, hi = 0, lo = 0;
+    if(t.kind == RegKind::Xmm)
     {
-        if(!parseHex(valueText, v))
-            return false;
-        r.Set(reg, v);
-        printf("%s = 0x%llX\n", name.c_str(), v);
-        return true;
-    }
-    if(_stricmp(name.c_str(), "eflags") == 0)
-    {
-        if(!parseHex(valueText, v) || v > 0xFFFFFFFF)
-            return false;
-        ctx->EFlags = (DWORD)v;
-        printf("eflags = 0x%08X\n", (DWORD)v);
-        return true;
-    }
-    if(_stricmp(name.c_str(), "mxcsr") == 0)
-    {
-        if(!parseHex(valueText, v) || v > 0xFFFFFFFF)
-            return false;
-        ctx->FltSave.MxCsr = (DWORD)v;
-        printf("mxcsr = 0x%08X\n", (DWORD)v);
-        return true;
-    }
-    if(name.size() == 3 && (name[0] == 'd' || name[0] == 'D') &&
-       (name[1] == 'r' || name[1] == 'R') && name[2] >= '0' && name[2] <= '7')
-    {
-        if(!parseHex(valueText, v))
-            return false;
-        int n = name[2] - '0';
-        if(n == 4) n = 6;      // DR4 aliases DR6
-        else if(n == 5) n = 7; // DR5 aliases DR7
-        switch(n)
+        if(valueText.size() != 32 ||
+           !parseHex(valueText.substr(0, 16), hi) || !parseHex(valueText.substr(16), lo))
         {
-        case 0: ctx->Dr0 = v; break;
-        case 1: ctx->Dr1 = v; break;
-        case 2: ctx->Dr2 = v; break;
-        case 3: ctx->Dr3 = v; break;
-        case 6: ctx->Dr6 = v; break;
-        case 7: ctx->Dr7 = v; break;
+            printf("bad value '%s' (xmm wants 32 hex chars)\n", valueText.c_str());
+            fflush(stdout);
+            return false;
         }
-        printf("%s = 0x%llX\n", name.c_str(), v);
-        return true;
     }
-    if(name.size() >= 4 && name.size() <= 5 && _strnicmp(name.c_str(), "xmm", 3) == 0)
+    else
     {
-        char* end = nullptr;
-        long idx = strtol(name.c_str() + 3, &end, 10);
-        if(!end || *end != '\0' || end == name.c_str() + 3 || idx < 0 || idx > 15)
+        if(!parseHex(valueText, v) ||
+           (t.kind == RegKind::Gpr && t.width < 8 && v >= (1ull << (t.width * 8))) ||
+           ((t.kind == RegKind::EFlags || t.kind == RegKind::Mxcsr) && v > 0xFFFFFFFF))
+        {
+            printf("bad value '%s' for %s\n", valueText.c_str(), name.c_str());
+            fflush(stdout);
             return false;
-        if(valueText.size() != 32)
-            return false;
-        uint64_t hi = 0, lo = 0;
-        if(!parseHex(valueText.substr(0, 16), hi) || !parseHex(valueText.substr(16), lo))
-            return false;
-        ctx->FltSave.XmmRegisters[idx].High = hi;
-        ctx->FltSave.XmmRegisters[idx].Low = lo;
-        printf("xmm%ld = %016llX%016llX\n", idx, hi, lo);
-        return true;
+        }
     }
-    return false;
+
+    // Raw DR writes desync the engine's hardware breakpoint table; refuse
+    // while any engine slot is active (P0-6 bidirectional conflict rule).
+    if(t.kind == RegKind::Dr)
+    {
+        for(int i = 0; i < 4; i++)
+        {
+            if(mProcess->hardwareBreakpoints[i].internal.hardware.enabled)
+            {
+                printf("dr write rejected: engine hardware breakpoint active in dr%d (hbpd it first)\n", i);
+                fflush(stdout);
+                return false;
+            }
+        }
+    }
+
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_ALL;
+    if(!GetThreadContext(thread->hThread, &ctx))
+    {
+        printf("setreg failed: GetThreadContext error %lu\n", GetLastError());
+        return false;
+    }
+    switch(t.kind)
+    {
+    case RegKind::Gpr: gprWrite(ctx, t, v); break;
+    case RegKind::EFlags: ctx.EFlags = (DWORD)v; break;
+    case RegKind::Mxcsr: ctx.FltSave.MxCsr = (DWORD)v; break;
+    case RegKind::Dr: drWrite(ctx, t.index, v); break;
+    case RegKind::Xmm:
+        ctx.FltSave.XmmRegisters[t.index].High = hi;
+        ctx.FltSave.XmmRegisters[t.index].Low = lo;
+        break;
+    }
+    if(!SetThreadContext(thread->hThread, &ctx))
+    {
+        printf("setreg failed: SetThreadContext error %lu\n", GetLastError());
+        return false;
+    }
+
+    // Read back and verify the targeted field before reporting success.
+    CONTEXT back{};
+    back.ContextFlags = CONTEXT_ALL;
+    bool verified = GetThreadContext(thread->hThread, &back) != 0;
+    if(verified)
+    {
+        switch(t.kind)
+        {
+        case RegKind::Gpr:
+        {
+            const uint64_t mask = t.width >= 8 ? ~0ull : ((1ull << (t.width * 8)) - 1);
+            verified = gprRead(back, t) == (v & mask);
+            break;
+        }
+        // The kernel sanitizes EFLAGS on write (observed: IF forced on,
+        // reserved bit1 forced off); verify only the stable bits.
+        case RegKind::EFlags: verified = (back.EFlags & ~0x202u) == ((DWORD)v & ~0x202u); break;
+        case RegKind::Mxcsr: verified = back.FltSave.MxCsr == (DWORD)v; break;
+        case RegKind::Dr: verified = drRead(back, t.index) == v; break;
+        case RegKind::Xmm:
+            verified = back.FltSave.XmmRegisters[t.index].High == hi &&
+                       back.FltSave.XmmRegisters[t.index].Low == lo;
+            break;
+        }
+    }
+    if(!verified)
+    {
+        printf("setreg verify failed for %s\n", name.c_str());
+        fflush(stdout);
+        return false;
+    }
+
+    if(t.kind == RegKind::Dr)
+        mRawDrWritten = true;
+    switch(t.kind)
+    {
+    case RegKind::Gpr:
+        printf("%s = 0x%llX\n", name.c_str(), gprRead(back, t));
+        break;
+    case RegKind::EFlags: printf("eflags = 0x%08X\n", back.EFlags); break;
+    case RegKind::Mxcsr: printf("mxcsr = 0x%08X\n", back.FltSave.MxCsr); break;
+    case RegKind::Dr: printf("%s = 0x%llX\n", name.c_str(), drRead(back, t.index)); break;
+    case RegKind::Xmm:
+        printf("xmm%d = %016llX%016llX\n", t.index,
+               (unsigned long long)back.FltSave.XmmRegisters[t.index].High,
+               (unsigned long long)back.FltSave.XmmRegisters[t.index].Low);
+        break;
+    }
+    fflush(stdout);
+    return true;
+}
+
+// Print a single register ("regs <name>"): any name resolveRegTarget knows.
+void GleamDebugger::cmdPrintRegister(const std::string & name)
+{
+    Thread* thread = currentThread();
+    if(!thread)
+        return;
+    RegTarget t;
+    if(!resolveRegTarget(name, t))
+    {
+        printf("unknown register '%s'\n", name.c_str());
+        fflush(stdout);
+        return;
+    }
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_ALL;
+    if(!GetThreadContext(thread->hThread, &ctx))
+    {
+        printf("GetThreadContext failed (%lu)\n", GetLastError());
+        return;
+    }
+    switch(t.kind)
+    {
+    case RegKind::Gpr:
+    {
+        const uint64_t mask = t.width >= 8 ? ~0ull : ((1ull << (t.width * 8)) - 1);
+        printf("%s = 0x%0*llX\n", name.c_str(), t.width * 2, gprRead(ctx, t) & mask);
+        break;
+    }
+    case RegKind::EFlags: printf("eflags = 0x%08X\n", ctx.EFlags); break;
+    case RegKind::Mxcsr: printf("mxcsr = 0x%08X\n", ctx.FltSave.MxCsr); break;
+    case RegKind::Dr: printf("%s = 0x%016llX\n", name.c_str(), drRead(ctx, t.index)); break;
+    case RegKind::Xmm:
+        printf("xmm%d = %016llX%016llX\n", t.index,
+               (unsigned long long)ctx.FltSave.XmmRegisters[t.index].High,
+               (unsigned long long)ctx.FltSave.XmmRegisters[t.index].Low);
+        break;
+    }
+    fflush(stdout);
 }
 
 void GleamDebugger::cmdRead(uint64_t addr, uint64_t size)
@@ -187,55 +412,80 @@ void GleamDebugger::cmdReadTyped(const char* type, uint64_t addr)
 
 void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
 {
-    std::string text;
+    const size_t unit = utf16 ? 2 : 1;
+    // Cursor in INPUT units (bytes for ANSI, code units for UTF-16), never
+    // in output bytes: UTF-8 expansion must not shift the read position.
+    std::wstring wide;  // UTF-16 code units, converted once at the end
+    std::string narrow; // ANSI bytes
+    uint64_t units = 0;
     bool terminated = false;
-    bool firstChunk = true;
-    while(text.size() < maxLen && !terminated)
+    uint64_t failedAt = 0; // 0 = no failed read
+    while(units < maxLen && !terminated)
     {
-        const size_t unit = utf16 ? 2 : 1;
-        const size_t chunk = (std::min)((size_t)64, ((size_t)maxLen - text.size()) * unit);
+        const uint64_t cur = addr + units * unit;
+        // Never cross a page boundary: the next page may be unreadable, and
+        // a spanning read fails as a whole even if this page is fine.
+        const size_t pageLeft = 0x1000 - (size_t)(cur & 0xFFF);
+        size_t chunk = (std::min)((size_t)64, ((size_t)maxLen - (size_t)units) * unit);
+        chunk = (std::min)(chunk, pageLeft);
+        chunk -= chunk % unit; // whole code units only
+        if(chunk == 0)
+            break;
         char buf[64];
-        if(!mProcess->MemReadSafe(addr + text.size() * unit, buf, chunk))
+        if(!mProcess->MemReadSafe(cur, buf, chunk))
         {
-            if(firstChunk)
-            {
-                printf("cannot read string at 0x%llX\n", addr);
-                fflush(stdout);
-                return;
-            }
-            break; // truncated by an unreadable page
+            failedAt = cur;
+            break;
         }
-        firstChunk = false;
         for(size_t i = 0; i < chunk; i += unit)
         {
             if(utf16)
             {
-                uint16_t wc = *(uint16_t*)(buf + i);
+                uint16_t wc;
+                memcpy(&wc, buf + i, 2);
                 if(!wc) { terminated = true; break; }
-                // Best-effort UTF-8 (BMP only; enough for typical strings).
-                if(wc < 0x80)
-                    text += (char)wc;
-                else if(wc < 0x800)
-                {
-                    text += (char)(0xC0 | (wc >> 6));
-                    text += (char)(0x80 | (wc & 0x3F));
-                }
-                else
-                {
-                    text += (char)(0xE0 | (wc >> 12));
-                    text += (char)(0x80 | ((wc >> 6) & 0x3F));
-                    text += (char)(0x80 | (wc & 0x3F));
-                }
+                wide += (wchar_t)wc;
             }
             else
             {
                 if(!buf[i]) { terminated = true; break; }
-                text += buf[i];
+                narrow += buf[i];
+            }
+        }
+        units += chunk / unit;
+    }
+    if(units == 0 && failedAt)
+    {
+        printf("cannot read string at 0x%llX\n", addr);
+        fflush(stdout);
+        return;
+    }
+    std::string text;
+    if(utf16)
+    {
+        // System conversion handles surrogate pairs (and code units split
+        // across chunks, since we accumulated units, not text).
+        if(!wide.empty())
+        {
+            int need = WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(),
+                                           nullptr, 0, nullptr, nullptr);
+            if(need > 0)
+            {
+                text.resize((size_t)need);
+                WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(),
+                                    &text[0], need, nullptr, nullptr);
             }
         }
     }
-    printf("string at 0x%llX = \"%s\"%s\n", addr, text.c_str(),
-           terminated ? "" : " (no NUL within limit)");
+    else
+        text = narrow;
+    printf("string at 0x%llX = \"%s\"", addr, text.c_str());
+    if(terminated)
+        printf("\n");
+    else if(failedAt)
+        printf(" (partial: read failed at 0x%llX)\n", failedAt);
+    else
+        printf(" (no NUL within limit)\n");
     fflush(stdout);
 }
 
@@ -254,17 +504,30 @@ void GleamDebugger::cmdSaveMem(uint64_t addr, uint64_t size, const std::string &
         fflush(stdout);
         return;
     }
-    // Page-granular export: a failing page is zero-filled and counted, so
-    // offsets in the file always match the address space layout.
-    const uint64_t kPage = 0x1000;
-    std::vector<uint8_t> buf(kPage);
-    uint64_t holes = 0, done = 0;
+    // Chunk on REAL page boundaries: pages are the commit/protection unit,
+    // so an aligned chunk either reads fully or fails fully. A failing
+    // chunk is zero-filled and reported with its exact range, so offsets in
+    // the file always match the address space layout.
+    std::vector<uint8_t> buf(0x1000);
+    uint64_t holeBytes = 0, done = 0;
+    std::string holeRanges;
+    int holes = 0;
     while(done < size)
     {
-        const size_t n = (size_t)(std::min)(kPage, size - done);
-        if(!mProcess->MemReadSafe(addr + done, buf.data(), n))
+        const uint64_t cur = addr + done;
+        const size_t pageLeft = 0x1000 - (size_t)(cur & 0xFFF);
+        const size_t n = (size_t)(std::min)((uint64_t)pageLeft, size - done);
+        if(!mProcess->MemReadSafe(cur, buf.data(), n))
         {
             memset(buf.data(), 0, n);
+            holeBytes += n;
+            if(holes < 3)
+            {
+                char tmp[64];
+                sprintf_s(tmp, "%s[0x%llX-0x%llX)", holes ? " " : "",
+                          (unsigned long long)cur, (unsigned long long)(cur + n));
+                holeRanges += tmp;
+            }
             holes++;
         }
         out.write((const char*)buf.data(), n);
@@ -272,10 +535,18 @@ void GleamDebugger::cmdSaveMem(uint64_t addr, uint64_t size, const std::string &
     }
     out.close();
     if(!out)
+    {
         printf("write error while saving %s\n", file.c_str());
+        fflush(stdout);
+        return;
+    }
+    if(holes)
+        printf("saved 0x%llX bytes to %s holes=%d (0x%llX bytes) at %s%s\n",
+               (unsigned long long)size, file.c_str(), holes,
+               (unsigned long long)holeBytes, holeRanges.c_str(), holes > 3 ? " ..." : "");
     else
-        printf("saved 0x%llX bytes to %s holes=%llu\n",
-               (unsigned long long)size, file.c_str(), (unsigned long long)holes);
+        printf("saved 0x%llX bytes to %s holes=0\n",
+               (unsigned long long)size, file.c_str());
     fflush(stdout);
 }
 
@@ -468,7 +739,10 @@ void GleamDebugger::cmdStackScan(uint64_t count)
     // point into executable committed memory (likely return addresses).
     if(count == 0 || count > 0x1000)
         count = 32;
-    Registers r(currentThread()->hThread);
+    Thread* thread = currentThread();
+    if(!thread)
+        return;
+    Registers r(thread->hThread);
     uint64_t rsp = r.Gsp();
     ensureSymSession();
     for(uint64_t i = 0; i < count; i++)
@@ -604,7 +878,10 @@ void GleamDebugger::cmdExceptionInfo()
 void GleamDebugger::cmdBacktrace()
 {
     // Naive rbp-chain walk; functions without frame pointers are invisible.
-    Registers r(currentThread()->hThread);
+    Thread* thread = currentThread();
+    if(!thread)
+        return;
+    Registers r(thread->hThread);
     uint64_t rbp = r.Gbp();
     printf("#0  0x%016llX (rip)\n", r.Gip());
     for(int frame = 1; frame <= 32; frame++)
@@ -628,16 +905,15 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
 
     if(cmd == "regs")
     {
-        cmdRegs();
+        if(args.size() == 2)
+            cmdPrintRegister(args[1]);
+        else
+            cmdRegs();
         return CmdResult::Handled;
     }
     if(cmd == "setreg" && args.size() == 3)
     {
-        if(!setRegisterExtended(args[1], args[2]))
-        {
-            printf("unknown register or bad value '%s %s'\n", args[1].c_str(), args[2].c_str());
-            fflush(stdout);
-        }
+        setRegisterExtended(args[1], args[2]); // reports its own errors
         return CmdResult::Handled;
     }
     if(cmd == "read" && args.size() >= 3 &&
@@ -648,6 +924,7 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
             cmdReadTyped(args[1].c_str(), a);
         else
         {
+            printAddrError();
             printf("usage: read u8|u16|u32|u64|ptr <addr>\n");
             fflush(stdout);
         }
@@ -663,6 +940,7 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
             cmdReadString(a, maxLen, args[1] == "utf16");
         else
         {
+            printAddrError();
             printf("usage: read ansi|utf16 <addr> [hexmaxlen]\n");
             fflush(stdout);
         }
@@ -706,7 +984,10 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
             ok = parseAddress(args[1], addr);
         else
         {
-            Registers r(currentThread()->hThread);
+            Thread* thread = currentThread();
+            if(!thread)
+                return CmdResult::Handled;
+            Registers r(thread->hThread);
             addr = r.Gip();
         }
         if(ok && args.size() == 3)
@@ -715,6 +996,7 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
             cmdDisasm(addr, count);
         else
         {
+            printAddrError();
             printf("usage: disasm [hexaddr] [count]\n");
             fflush(stdout);
         }

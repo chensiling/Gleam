@@ -73,6 +73,10 @@ retry_no_aslr:
             {
                 TerminateThread(mMainProcess.hThread, STATUS_CONFLICTING_ADDRESSES);
                 TerminateProcess(mMainProcess.hProcess, STATUS_CONFLICTING_ADDRESSES);
+                // PROCESS_INFORMATION handles are caller-owned (launch).
+                CloseHandle(mMainProcess.hThread);
+                CloseHandle(mMainProcess.hProcess);
+                memset(&mMainProcess, 0, sizeof(mMainProcess));
                 if(retries++ < 10)
                     goto retry_no_aslr;
                 result = false;

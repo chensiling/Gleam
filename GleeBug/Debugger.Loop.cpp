@@ -270,5 +270,17 @@ namespace GleeBug
         mProcesses.clear();
         mProcess = nullptr;
         mIsDebugging = false;
+        // Handle ownership: CreateProcessW's PROCESS_INFORMATION handles are
+        // caller-owned - close them here (launch sessions only). Attach
+        // sessions hold system-owned debug-event handles in mMainProcess,
+        // which Windows closes after the exit event is continued.
+        if(!mAttachedToProcess)
+        {
+            if(mMainProcess.hThread)
+                CloseHandle(mMainProcess.hThread);
+            if(mMainProcess.hProcess)
+                CloseHandle(mMainProcess.hProcess);
+        }
+        memset(&mMainProcess, 0, sizeof(mMainProcess));
     }
 };

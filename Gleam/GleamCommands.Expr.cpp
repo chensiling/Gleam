@@ -49,6 +49,21 @@ bool GleamDebugger::exprParseAtom(const std::string & s, size_t & pos, uint64_t 
     if(parseHex(tok, out))
         return true;
 
+    // It looked like a hex literal but did not parse: out of range.
+    {
+        const char* p = tok.c_str();
+        if(p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+            p += 2;
+        bool allHex = *p != '\0';
+        for(const char* q = p; *q && allHex; q++)
+            allHex = isxdigit((unsigned char)*q) != 0;
+        if(allHex && (isdigit((unsigned char)*p) || tok.size() > 2))
+        {
+            err = "literal out of range: '" + tok + "'";
+            return false;
+        }
+    }
+
     // register of the current thread
     RegId reg;
     if(registerByName(tok, reg))

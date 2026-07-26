@@ -14,7 +14,10 @@ bool parseHex(const std::string & s, uint64_t & out)
     if(p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
         p += 2;
     char* end = nullptr;
+    errno = 0;
     out = strtoull(p, &end, 16);
+    if(errno == ERANGE)
+        return false; // literal does not fit in 64 bits
     return end && *end == '\0' && end != p;
 }
 
@@ -40,7 +43,8 @@ void GleamDebugger::cmdHelp()
         "  g                       continue\n"
         "  step                    single step (into)\n"
         "  stepover                step over calls\n"
-        "  ret                     run until current function returns\n"
+        "  ret [max]               run until current function returns (stops AFTER the\n"
+        "                          ret, in the caller; x64dbg rtr stops BEFORE it)\n"
         "  pause                   interrupt a running debuggee\n"
         "  detach                  detach at the next suspended state (pause first if running)\n"
         "  quit                    terminate at the next suspended state (pause first if running)\n"
@@ -59,10 +63,13 @@ void GleamDebugger::cmdHelp()
         "  bl                      list breakpoints\n"
         "  ignore <hexaddr> <n>    skip the next n hits of a breakpoint\n"
         "inspection:\n"
-        "  regs                    dump registers (GPR, EFLAGS, DR, XMM, MXCSR)\n"
-        "  setreg <name> <hexval>  set register (rax..r15, rip, eflags, dr0-7, mxcsr;\n"
-        "                          xmm0-15 take 32 hex chars, high half first.\n"
-        "                          warning: writing dr registers desyncs hw breakpoints)\n"
+        "  regs [name]             dump registers (GPR, EFLAGS, DR, XMM, MXCSR);\n"
+        "                          with a name, print just that register\n"
+        "  setreg <name> <hexval>  set register (rax..r15/rip + eax/ax/al etc slices,\n"
+        "                          eflags, dr0-7, mxcsr; xmm0-15 = 32 hex chars high\n"
+        "                          first. slice writes are read-modify-write (high\n"
+        "                          bits kept). dr writes are raw: rejected while an\n"
+        "                          engine hw bp exists, and block hbp afterwards)\n"
         "  read <hexaddr> <size>   read memory (hex dump)\n"
         "  read u8|u16|u32|u64|ptr <addr>  typed read (single value)\n"
         "  read ansi|utf16 <addr> [n]  read string (default max 256)\n"
@@ -147,6 +154,7 @@ bool GleamDebugger::executeCommand(const std::string & cmdLine)
             return false;
     }
 
+    printAddrError(); // surface a concrete address-parse reason, if any
     printf("unknown or malformed command (try 'help')\n");
     fflush(stdout);
     return false;

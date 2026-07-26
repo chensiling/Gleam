@@ -218,6 +218,12 @@ Thread* GleamDebugger::currentThread()
         auto found = mProcess->threads.find(mSelectedThreadId);
         if(found != mProcess->threads.end())
             return found->second.get();
+        // A stale selection must never silently redirect commands at the
+        // event thread (P0-6): report and let callers refuse to act.
+        printf("selected thread %u no longer exists (use 'thread' to reselect)\n",
+               mSelectedThreadId);
+        fflush(stdout);
+        return nullptr;
     }
     return mThread;
 }
@@ -325,8 +331,18 @@ void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread,
 
 void GleamDebugger::cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
 {
+    // Module identity, authoritative first: the real path from the event's
+    // file handle (valid during this callback), then the loader list. The
+    // PE export-directory name is only an alias (bindModuleBreakpoints).
+    std::string name;
+    if(loadDll.hFile)
+    {
+        char path[MAX_PATH * 2] = "";
+        if(GetFinalPathNameByHandleA(loadDll.hFile, path, sizeof(path), VOLUME_NAME_DOS))
+            name = normalizeModuleName(path);
+    }
     // Logical breakpoints bind regardless of the breakon dll switch.
-    bindModuleBreakpoints((uint64_t)loadDll.lpBaseOfDll);
+    bindModuleBreakpoints((uint64_t)loadDll.lpBaseOfDll, name);
     if(!mBreakOnDll)
         return;
     char details[80];
@@ -350,22 +366,28 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
 }
 
 // Bind pending module-relative breakpoints whose module just loaded.
-void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase)
+// primaryName: authoritative identity (real path / loader list), possibly
+// empty. The export-directory name is tried only as a non-authoritative
+// alias. Symbol entries that fail to resolve stay pending and are retried
+// at the next module event or pause (rebindPendingBreakpoints).
+void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string & primaryName)
 {
     if(mLogicalBps.empty() || !mProcess)
         return;
-    // During the load event the loader-list APIs are still blind; the PE
-    // export directory carries the DLL's own name and needs no loader list.
-    std::string name = dllNameFromBase(moduleBase);
+    std::string name = primaryName;
     if(name.empty())
-        name = moduleNameFromBase(mProcess->hProcess, moduleBase); // fallback
-    name = normalizeModuleName(name);
-    if(name.empty())
-        return;
-    for(auto & lb : mLogicalBps)
+        name = moduleNameFromBase(mProcess->hProcess, moduleBase);
+    const std::string alias = normalizeModuleName(dllNameFromBase(moduleBase));
+    for(size_t i = 0; i < mLogicalBps.size(); )
     {
-        if(lb.boundAddr || lb.module != name)
+        auto & lb = mLogicalBps[i];
+        if(lb.boundAddr ||
+           (lb.module != name && (alias.empty() || lb.module != alias)) ||
+           (name.empty() && alias.empty()))
+        {
+            i++;
             continue;
+        }
         uint64_t addr = 0;
         if(!lb.symbol.empty())
         {
@@ -373,19 +395,38 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase)
             if(!addr) // dbghelp fallback (PDB-only symbols)
                 resolveModuleSymbol(lb.module + "!" + lb.symbol, addr);
             if(!addr)
-                continue; // stay pending (symbols may be unavailable)
+            {
+                i++;
+                continue; // stay pending, retried later
+            }
         }
         else
-            addr = moduleBase + lb.rva;
+        {
+            // RVA form: must stay inside the image.
+            uint64_t infoBase = 0;
+            uint32_t imageSize = 0;
+            if(!moduleInfoOf(lb.module, infoBase, imageSize) || lb.rva >= imageSize)
+            {
+                printf("event bp rejected module=%s rva=0x%llX (out of image)\n",
+                       lb.module.c_str(), (unsigned long long)lb.rva);
+                mLogicalBps.erase(mLogicalBps.begin() + i);
+                continue;
+            }
+            addr = moduleBase + lb.rva; // rva < SizeOfImage < 4GB: no wrap on x64
+        }
         if(!mProcess->SetBreakpoint(addr, lb.once))
+        {
+            i++;
             continue;
+        }
         lb.boundAddr = addr;
         lb.boundBase = moduleBase;
         if(lb.rule.condReg != RegId::Invalid || lb.rule.trace || !lb.rule.command.empty())
             mBpRules[addr] = lb.rule;
         printf("event bp bound module=%s address=0x%llX\n",
-               name.c_str(), (unsigned long long)addr);
+               lb.module.c_str(), (unsigned long long)addr);
         fflush(stdout);
+        i++;
     }
 }
 
@@ -423,7 +464,7 @@ void GleamDebugger::rebindPendingBreakpoints()
             continue;
         uint64_t base = 0;
         if(moduleBaseByName(lb.module, base))
-            bindModuleBreakpoints(base);
+            bindModuleBreakpoints(base, std::string());
     }
 }
 
@@ -434,12 +475,14 @@ void GleamDebugger::resetTransientState()
     mSelectedThreadId = 0;
     mLastExceptionValid = false;
     mPausedOnException = false;
+    mRawDrWritten = false;
     mWantsPause = false;
     mStepArmed = false;
     mStepOverArmed = false;
     mTraceActive = false;
     mStepOutActive = false;
     mStepOutPending = false;
+    mStepOutBpAddr = 0;
     mIgnoreHits.clear();
     mBpRules.clear();
     mPdataCache.clear();
@@ -506,6 +549,19 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
         if(info.singleshoot)
             mBpRules.erase(ruleIt);
     }
+    // A fired one-shot logical breakpoint is consumed: drop the logical
+    // entry so bl/restart/reload see the true state.
+    if(info.singleshoot)
+    {
+        for(size_t i = 0; i < mLogicalBps.size(); i++)
+        {
+            if(mLogicalBps[i].boundAddr == info.address)
+            {
+                mLogicalBps.erase(mLogicalBps.begin() + i);
+                break;
+            }
+        }
+    }
     uint32_t ignoreLeft = 0;
     bool hasIgnore = false;
     auto ignoreIt = mIgnoreHits.find(info.address);
@@ -528,10 +584,13 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
         return;
     }
 
-    // stepout engine: its internal one-shot breakpoints (call skips and loop
-    // fast-forwards) drive the next tick instead of pausing.
-    if(mStepOutActive && info.singleshoot)
+    // stepout engine: only the internal one-shot breakpoint at the exact
+    // recorded address may drive the next tick (S0-1). A user one-shot or a
+    // different address pauses normally; the stepout state stays alive.
+    if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
+       info.address == mStepOutBpAddr)
     {
+        mStepOutBpAddr = 0;
         stepOutTick();
         return;
     }
@@ -599,7 +658,16 @@ void GleamDebugger::cbStep()
             mWantsPause = true;
             return;
         }
-        currentThread()->StepInto(); // mStepArmed stays armed
+        Thread* traceThread = currentThread();
+        if(!traceThread)
+        {
+            mTraceActive = false;
+            mStepArmed = false;
+            emitStop("trace", "error steps=0");
+            mWantsPause = true;
+            return;
+        }
+        traceThread->StepInto(); // mStepArmed stays armed
         return;
     }
 
@@ -614,11 +682,51 @@ void GleamDebugger::cbStep()
     }
 }
 
+// Exception disposition policy (P0-3). See the rules comment in the header.
+GleamDebugger::ExPolicyOutput GleamDebugger::decideExPolicy(const ExPolicyInput & in)
+{
+    ExPolicyOutput out{};
+    if(in.filterHit)
+    {
+        const bool breakNow = (in.breakOn == 0 && in.firstChance) ||
+                              (in.breakOn == 1 && !in.firstChance);
+        out.pause = breakNow;
+        // Pause at second chance defaults to swallow; a no-break filter
+        // applies its configured disposition.
+        out.swallow = breakNow ? !in.firstChance : (in.handledBy == 1);
+    }
+    else
+    {
+        out.pause = !in.firstChance || in.breakOnException;
+        out.swallow = out.pause && !in.firstChance;
+    }
+    return out;
+}
+
 void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecord, bool firstChance)
 {
     mLastException = exceptionRecord;
     mLastExceptionValid = true;
     mLastExceptionFirstChance = firstChance;
+
+    // Raw DR mode (P0-6): a hardware breakpoint hit arrives as
+    // STATUS_SINGLE_STEP that the engine cannot attribute to any of its
+    // slots. Decode DR6 and report the slot instead of misclassifying it.
+    if(exceptionRecord.ExceptionCode == STATUS_SINGLE_STEP && mRawDrWritten && mThread)
+    {
+        Registers r(mThread->hThread);
+        const uint64_t dr6 = r.GetContext()->Dr6;
+        const int slot = (dr6 & 1) ? 0 : (dr6 & 2) ? 1 : (dr6 & 4) ? 2 : (dr6 & 8) ? 3 : -1;
+        char details[96];
+        if(slot >= 0)
+            sprintf_s(details, "raw-hardware slot=%d address=0x%p", slot, exceptionRecord.ExceptionAddress);
+        else
+            sprintf_s(details, "raw-hardware address=0x%p", exceptionRecord.ExceptionAddress);
+        mContinueStatus = DBG_CONTINUE; // single-step exceptions continue
+        emitStop("hardware", details);
+        mWantsPause = true;
+        return;
+    }
 
     // Our own break-in (triggered by "pause"). Identification, most precise
     // first: the stub's exception address, then the fallback thread's
@@ -643,47 +751,47 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
             CloseHandle(hThread);
         }
         emitStop("pause", nullptr);
+        abortStepOut("pause");
         mWantsPause = true;
         return;
     }
 
-    // Exception filters decide: break at this chance (overrides the breakon
-    // switch), or apply the configured disposition without pausing. "pass"
-    // keeps the engine default DBG_EXCEPTION_NOT_HANDLED (the debuggee's own
-    // handlers run); "swallow" is DBG_CONTINUE.
-    bool shouldPause = !firstChance || mBreakOnException;
+    // Policy decision (P0-3): filter lookup -> decideExPolicy, then act.
+    ExPolicyInput pi{ firstChance, false, 2, 0, mBreakOnException };
     auto filter = mExFilters.find(exceptionRecord.ExceptionCode);
     if(filter != mExFilters.end())
     {
-        const ExFilter & f = filter->second;
-        const bool breakNow = (f.breakOn == 0 && firstChance) || (f.breakOn == 1 && !firstChance);
-        if(breakNow)
-            shouldPause = true;
-        else
-        {
-            if(f.handledBy == 1)
-                mContinueStatus = DBG_CONTINUE;
-            printf("event exception code=0x%08lX action=%s\n",
-                   exceptionRecord.ExceptionCode,
-                   f.handledBy == 1 ? "swallowed" : "passed-to-debuggee");
-            fflush(stdout);
-            return;
-        }
+        pi.filterHit = true;
+        pi.breakOn = filter->second.breakOn;
+        pi.handledBy = filter->second.handledBy;
+    }
+    const auto policy = decideExPolicy(pi);
+    if(!policy.pause)
+    {
+        // "pass" keeps the engine default DBG_EXCEPTION_NOT_HANDLED (the
+        // debuggee's own handlers run); "swallow" is DBG_CONTINUE.
+        if(policy.swallow)
+            mContinueStatus = DBG_CONTINUE;
+        printf("event exception code=0x%08lX action=%s\n",
+               exceptionRecord.ExceptionCode,
+               policy.swallow ? "swallowed" : "passed-to-debuggee");
+        fflush(stdout);
+        return;
     }
 
-    // Second chance always pauses (last chance before the process dies);
-    // first chance follows the "breakon exception" switch.
-    if(shouldPause)
-    {
-        char details[128];
-        sprintf_s(details, "code=0x%08lX address=0x%p chance=%s",
-                  exceptionRecord.ExceptionCode,
-                  exceptionRecord.ExceptionAddress,
-                  firstChance ? "first" : "second");
-        emitStop("exception", details);
-        mPausedOnException = true;
-        mWantsPause = true;
-    }
+    // Second chance pauses with swallow as the default disposition (see
+    // decideExPolicy); "exception pass" is the explicit escape.
+    if(policy.swallow)
+        mContinueStatus = DBG_CONTINUE;
+    char details[128];
+    sprintf_s(details, "code=0x%08lX address=0x%p chance=%s",
+              exceptionRecord.ExceptionCode,
+              exceptionRecord.ExceptionAddress,
+              firstChance ? "first" : "second");
+    emitStop("exception", details);
+    abortStepOut("exception");
+    mPausedOnException = true;
+    mWantsPause = true;
 }
 
 void GleamDebugger::cbInternalError(const std::string & error)
@@ -736,6 +844,9 @@ void GleamDebugger::commandLoop()
 {
     // The stop record was already emitted by the triggering event; it is the
     // pause notification. Here we only consume commands.
+    // Symbols may have become available since the last event: retry pending
+    // logical breakpoints (PDB-only modules, deferred resolution).
+    rebindPendingBreakpoints();
     mIsPaused.store(true);
     for(;;)
     {
