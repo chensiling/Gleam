@@ -998,9 +998,7 @@ g
 bl
 g
 g
-g
-g
-g
+quit
 EOF
 chk "W1: noexp pending"            /tmp/gleam_W1.txt "breakpoint pending module=noexp rva=0x1000"
 chk "W1: noexp bound via path"     /tmp/gleam_W1.txt "event bp bound module=noexp address=0x"
