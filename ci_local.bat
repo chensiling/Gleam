@@ -14,8 +14,14 @@ set STAMP=%DATE:~0,4%%DATE:~5,2%%DATE:~8,2%_%TIME:~0,2%%TIME:~3,2%%TIME:~6,2%
 set STAMP=%STAMP: =0%
 set OUT=%LOGDIR%\%COMMIT%_%STAMP%
 mkdir %OUT% 2>nul
+set OUT_BASH=%OUT:\=/%
 
 echo [ci] log dir: %OUT%
+
+rem ---- record the exact source state the results belong to ----
+git -C %ROOT% rev-parse HEAD > %OUT%\commit.txt
+git -C %ROOT% rev-parse HEAD^{tree} >> %OUT%\commit.txt
+git -C %ROOT% status --porcelain >> %OUT%\commit.txt
 
 rem ---- stage 0: kill orphaned test processes (they lock the binaries) ----
 powershell -NoProfile -Command "Get-Process -Name TestTarget,ArgvTarget,BoundaryTarget,gleam -ErrorAction SilentlyContinue | Stop-Process -Force" >nul 2>&1
@@ -35,22 +41,26 @@ if errorlevel 1 ( echo [ci] FAIL: Release clean & exit /b 1 )
 if errorlevel 1 ( echo [ci] FAIL: Release build & exit /b 1 )
 
 rem ---- stage 3: full suite (Debug binaries) x3 ----
+rem Every run gets its own TDIR; artifacts live there from the start, so a
+rem failing run leaves its complete evidence behind automatically.
 for /l %%i in (1,1,3) do (
     echo [ci] suite run %%i/3 ...
-    %BASH% %ROOT%run_tests.sh > %OUT%\suite_debug_%%i.log 2>&1
-    if errorlevel 1 ( echo [ci] FAIL: suite run %%i & exit /b 1 )
-    mkdir %OUT%\artifacts_debug_%%i >nul 2>&1
-    copy /y %TEMP%\gleam_*.txt %OUT%\artifacts_debug_%%i\ >nul 2>&1
+    set TDIR=%OUT_BASH%/work_debug_%%i
+    mkdir %OUT%\work_debug_%%i 2>nul
+    pushd %ROOT%
+    %BASH% -c "TDIR='!TDIR!' bash run_tests.sh" > %OUT%\suite_debug_%%i.log 2>&1
+    popd
+    if errorlevel 1 ( echo [ci] FAIL: suite run %%i ^(artifacts: !TDIR!^) & exit /b 1 )
 )
 
 rem ---- stage 4: full suite (Release binaries) x1 ----
 echo [ci] suite run release ...
+set TDIR=%OUT_BASH%/work_release
+mkdir %OUT%\work_release 2>nul
 pushd %ROOT%
-%BASH% -c "GLEAM=./bin/Release/x64/Gleam.exe TARGET=bin/Release/x64/TestTarget.exe ATARGET=bin/Release/x64/ArgvTarget.exe BTARGET=bin/Release/x64/BoundaryTarget.exe bash run_tests.sh" > %OUT%\suite_release.log 2>&1
+%BASH% -c "TDIR='%TDIR%' GLEAM=./bin/Release/x64/Gleam.exe TARGET=bin/Release/x64/TestTarget.exe ATARGET=bin/Release/x64/ArgvTarget.exe BTARGET=bin/Release/x64/BoundaryTarget.exe bash run_tests.sh" > %OUT%\suite_release.log 2>&1
 popd
-if errorlevel 1 ( echo [ci] FAIL: release suite & exit /b 1 )
-mkdir %OUT%\artifacts_release >nul 2>&1
-copy /y %TEMP%\gleam_*.txt %OUT%\artifacts_release\ >nul 2>&1
+if errorlevel 1 ( echo [ci] FAIL: release suite ^(artifacts: %TDIR%^) & exit /b 1 )
 
 echo [ci] PASS: all stages green. Logs in %OUT%
 exit /b 0

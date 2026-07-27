@@ -445,29 +445,35 @@ void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
     while(units < maxLen && !terminated)
     {
         const uint64_t cur = addr + units * unit;
-        // Never cross a page boundary: the next page may be unreadable, and
-        // a spanning read fails as a whole even if this page is fine.
-        const size_t pageLeft = 0x1000 - (size_t)(cur & 0xFFF);
         size_t chunk = (std::min)((size_t)64, ((size_t)maxLen - (size_t)units) * unit);
-        chunk = (std::min)(chunk, pageLeft);
-        chunk -= chunk % unit; // whole code units only
-        if(chunk == 0)
+        chunk -= chunk % unit;
+        char buf[64];
+        // Whole-range first: a read may span pages when every byte is
+        // readable (ReadProcessMemory spans committed pages). Only on
+        // failure clip to the current page tail and retry; the next page
+        // is probed by the following iteration. A code unit may thus be
+        // assembled across a page boundary.
+        auto readChunk = [&](size_t & n) -> bool
         {
-            // Not even one full code unit fits before the page end. With
-            // nothing read yet that is an error, not "no NUL found".
+            if(mProcess->MemReadSafe(cur, buf, n))
+                return true;
+            size_t clipped = (std::min)(n, (size_t)(0x1000 - (cur & 0xFFF)));
+            clipped -= clipped % unit;
+            if(clipped == 0)
+                return false;
+            if(!mProcess->MemReadSafe(cur, buf, clipped))
+                return false;
+            n = clipped;
+            return true;
+        };
+        if(chunk == 0 || !readChunk(chunk))
+        {
             if(units == 0)
             {
                 printf("cannot read string at 0x%llX\n", addr);
                 fflush(stdout);
                 return;
             }
-            failed = true;
-            failedAt = cur;
-            break;
-        }
-        char buf[64];
-        if(!mProcess->MemReadSafe(cur, buf, chunk))
-        {
             failed = true;
             failedAt = cur;
             break;

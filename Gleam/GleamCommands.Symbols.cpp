@@ -429,7 +429,22 @@ bool GleamDebugger::ensureSymSession()
 
 void GleamDebugger::closeSymSession()
 {
-    if(mSymInitialized && mProcess)
+    if(!mProcess)
+    {
+        mSymLoadedBases.clear();
+        mSymInitialized = false;
+        return;
+    }
+    // Explicit SymLoadModuleEx loads pair with SymUnloadModule64 before the
+    // session goes down; the tracking set must never outlive the process
+    // (a new process may reuse the same DLL base).
+    for(uint64_t base : mSymLoadedBases)
+    {
+        if(mSymInitialized)
+            SymUnloadModule64(mProcess->hProcess, base);
+    }
+    mSymLoadedBases.clear();
+    if(mSymInitialized)
     {
         SymCleanup(mProcess->hProcess);
         mSymInitialized = false;

@@ -518,6 +518,7 @@ void GleamDebugger::resetTransientState()
     mIgnoreHits.clear();
     mBpRules.clear();
     mPdataCache.clear();
+    mSymLoadedBases.clear(); // explicit symbol loads die with the old process
     mHideOriginals.clear(); // old-process writes are meaningless now
     mOepBreakpoint = 0;
     mBreakInExpected = false;
@@ -628,14 +629,15 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
         return;
     }
     // Another thread tripped the internal breakpoint at that address. The
-    // engine consumes singleshoots unconditionally after this callback, so
-    // the bp is gone: re-arm it after the event (cbPostDebugEvent) and let
-    // the hit surface as a normal stop. stepout stays waiting, unconsumed.
+    // engine restores the original byte and re-executes it with an internal
+    // step AFTER this event, so arming a replacement now would make the
+    // non-owner trip it again. Two-stage: register here, arm at the NEXT
+    // event (cbPostDebugEvent). The hit surfaces as a normal stop.
     if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
        info.address == mStepOutBpAddr && mDebugEvent.dwThreadId != mStepOutTid)
     {
-        mStepOutRearm = mStepOutBpAddr;
-        printf("event stepout internal bp hit by non-owner tid=%u (re-armed)\n",
+        mStepOutRearmPending = mStepOutBpAddr;
+        printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
                mDebugEvent.dwThreadId);
         fflush(stdout);
         // fall through to normal reporting
@@ -671,8 +673,9 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
 
 void GleamDebugger::cbStep()
 {
-    // stepout engine: a step landed; inspect what is at GIP now.
-    if(mStepOutActive)
+    // stepout engine: a step landed on the OWNING thread; inspect what is
+    // at GIP now. Steps from other threads never drive the loop.
+    if(mStepOutActive && mDebugEvent.dwThreadId == mStepOutTid)
     {
         stepOutTick();
         return;
@@ -902,15 +905,27 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         mWantsPause = false;
         commandLoop();
     }
-    // A non-owner thread consumed our internal breakpoint; the engine has
-    // finished deleting it by now, so re-arm for the owning thread.
-    if(mStepOutRearm && mStepOutActive && mProcess)
+    // Two-stage re-arm for a non-owner-consumed internal breakpoint:
+    // stage 1 (this event) only defers; stage 2 (next event, after the
+    // engine's internal step has completed) writes the int3 back.
+    if(mStepOutRearmPending)
     {
-        mProcess->SetBreakpoint(mStepOutRearm, true);
+        mStepOutRearm = mStepOutRearmPending;
+        mStepOutRearmPending = 0;
+    }
+    else if(mStepOutRearm)
+    {
+        if(mStepOutActive && mProcess)
+        {
+            if(!mProcess->SetBreakpoint(mStepOutRearm, true))
+            {
+                printf("stepout error: failed to re-arm internal breakpoint at 0x%llX\n",
+                       (unsigned long long)mStepOutRearm);
+                stepOutFinish("error");
+            }
+        }
         mStepOutRearm = 0;
     }
-    else
-        mStepOutRearm = 0;
     // Consume deferred pause requests LAST, after marking ourselves
     // running-free: requests arriving after this point go straight to
     // forceBreakIn, so no request can be stranded between the two checks.

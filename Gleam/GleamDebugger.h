@@ -225,7 +225,8 @@ private:
     uint32_t mStepOutTid = 0;        // thread this stepout operation owns
     uint64_t mStepOutGen = 0;        // operation generation (per ret command)
     uint64_t mStepOutBpGen = 0;      // generation of the armed internal bp
-    GleeBug::ptr mStepOutRearm = 0;  // internal bp to re-arm after the event
+    GleeBug::ptr mStepOutRearmPending = 0; // non-owner consumed our bp (stage 1)
+    GleeBug::ptr mStepOutRearm = 0;        // arm at the NEXT event (stage 2)
     void stepOutTick();                 // inspect the current instruction, act
     void stepOutFinish(const char* reason);
     void abortStepOut(const char* why); // pause/exception/detach/restart cleanup
