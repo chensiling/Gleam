@@ -127,9 +127,9 @@ private:
     static bool registerByName(const std::string & name, RegId & reg);
     bool setRegisterExtended(const std::string & name, const std::string & valueText);
     void cmdPrintRegister(const std::string & name);
-    // Raw DR mode: set once the user writes dr0-7 directly (P0-6). Blocks
-    // engine hardware breakpoints and enables DR6 hit reporting.
-    bool mRawDrWritten = false;
+    // Raw DR mode, per thread (P0-6): TIDs whose DRs were written directly.
+    // Blocks engine hardware breakpoints and gates DR6 hit reporting.
+    std::set<uint32_t> mRawDrThreads;
     void cmdRegs();
     void cmdRead(uint64_t addr, uint64_t size);
     void cmdReadTyped(const char* type, uint64_t addr);          // u8/u16/u32/u64/ptr
@@ -178,6 +178,8 @@ private:
         uint64_t boundBase = 0;      // module base this binding belongs to
     };
     std::vector<LogicalBp> mLogicalBps;
+    // Insert or replace a logical entry with the same spec (dedupe).
+    void upsertLogicalBp(const LogicalBp & lb);
     // Parse "module!symbol" or "module+<hexrva>"; module part must look like
     // a module name (not a hex literal / not a pure expression).
     static bool parseLogicalSpec(const std::string & s, LogicalBp & out);
@@ -218,6 +220,8 @@ private:
     uint64_t mStepOutSteps = 0;
     uint64_t mStepOutMax = 0x40000;
     GleeBug::ptr mStepOutBpAddr = 0; // internal one-shot bp we are waiting on
+    uint32_t mStepOutTid = 0;        // thread this stepout operation owns
+    uint64_t mStepOutGen = 0;        // operation generation (per ret command)
     void stepOutTick();                 // inspect the current instruction, act
     void stepOutFinish(const char* reason);
     void abortStepOut(const char* why); // pause/exception/detach/restart cleanup
@@ -254,6 +258,9 @@ private:
     bool moduleBaseByName(const std::string & name, uint64_t & base);
     // Same, with image size (for RVA bounds checks).
     bool moduleInfoOf(const std::string & name, uint64_t & base, uint32_t & size);
+    // Image size read directly from the PE at base (no loader list needed;
+    // works during the DLL load event). 0 = cannot confirm.
+    uint32_t moduleImageSize(uint64_t base);
     // Resolve "module!symbol" through the dbghelp session.
     bool resolveModuleSymbol(const std::string & modSym, uint64_t & out);
     // Loader-list-independent module identity + export resolution (they work
@@ -281,15 +288,17 @@ private:
     enum class PdataCheck { HasRecord, NoRecord, Unknown };
     PdataCheck checkUnwindRecord(uint64_t rip);
 
-    // Exception disposition policy (P0-3), x64dbg-compatible. Pure decision
+    // Exception disposition policy (P0-3), x64dbg semantics. Pure decision
     // function so the full combination matrix is unit-testable ("selftest").
     // Rules:
-    //   filter hit, breakOn matches chance  -> pause (second chance: swallow default)
-    //   filter hit, no break                -> handledBy: pass (NOT_HANDLED) / swallow
-    //   filter miss, first chance           -> breakOnException ? pause (pass default) : silent pass
-    //   filter miss, second chance          -> pause; default disposition is SWALLOW
-    //     (DBG_CONTINUE) because passing NOT_HANDLED certainly kills the
-    //     process; "exception pass" is the explicit escape (warned).
+    //   filter hit, first chance  -> pause iff breakOn==first; disposition =
+    //     handledBy (pass = NOT_HANDLED, swallow = DBG_CONTINUE)
+    //   filter hit, second chance -> ONLY breakOn==never && handledBy==pass
+    //     may pass NOT_HANDLED without pausing (explicit: can kill the
+    //     process); every other combination pauses with swallow as default
+    //   filter miss, first chance -> breakOnException ? pause+pass : silent pass
+    //   filter miss, second chance -> pause with swallow default;
+    //     "exception pass" is the explicit escape (warned).
     struct ExPolicyInput
     {
         bool firstChance;

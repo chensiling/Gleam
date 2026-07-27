@@ -30,6 +30,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         uint64_t a = 0;
         if(!parseAddress(args[1], a))
         {
+            printAddrError();
             printf("usage: until <addr|module!symbol>\n");
             fflush(stdout);
             return CmdResult::Handled;
@@ -124,9 +125,20 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         // No stack analysis: works on FPO, packed code and shellcode.
         // Note: stops AFTER executing ret (in the caller) - unlike x64dbg's
         // rtr, which stops AT the ret instruction.
+        if(args.size() > 2)
+        {
+            printf("usage: ret [maxsteps-hex]\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        Thread* thread = currentThread();
+        if(!thread)
+            return CmdResult::Handled;
         mStepOutActive = true;
         mStepOutSteps = 0;
-        mStepOutMax = 0x40000; // S1-1: every operation starts from the default
+        mStepOutMax = 0x40000; // every operation starts from the default
+        mStepOutGen++;
+        mStepOutTid = thread->dwThreadId;
         if(args.size() == 2)
         {
             uint64_t maxSteps = 0;
@@ -274,6 +286,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         uint64_t a = 0;
         if(!parseAddress(args[1], a))
         {
+            printAddrError();
             printf("usage: free <addr>\n");
             fflush(stdout);
             return CmdResult::Handled;
@@ -289,6 +302,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         DWORD prot = 0;
         if(!parseAddress(args[1], a) || !parseHex(args[2], b) || b == 0)
         {
+            printAddrError();
             printf("usage: protect <addr> <hexsize> <rwx|rx|rw|r>\n");
             fflush(stdout);
             return CmdResult::Handled;
@@ -521,6 +535,7 @@ void GleamDebugger::stepOutTick()
         stepOutFinish("maxreached");
         return;
     }
+    mStepOutSteps++; // exactly once per tick
 
     Thread* thread = currentThread();
     if(!thread)
@@ -551,7 +566,6 @@ void GleamDebugger::stepOutTick()
     // ret / ret imm16 / rep ret / bnd ret: execute it, stop in the caller.
     if(insn.info.mnemonic == ZYDIS_MNEMONIC_RET)
     {
-        mStepOutSteps++;
         mStepOutPending = true;
         mStepArmed = true;
         thread->StepInto();
@@ -561,19 +575,34 @@ void GleamDebugger::stepOutTick()
     // call (direct/indirect, bnd/notrack): skip it at full speed.
     if(insn.info.mnemonic == ZYDIS_MNEMONIC_CALL)
     {
-        mStepOutSteps++;
-        if(mProcess->SetBreakpoint(gip + insn.info.length, true))
+        const uint64_t after = gip + insn.info.length;
+        // A user breakpoint already at the skip address: setting ours
+        // would steal their hit (one bp slot per address), and falling
+        // back to single stepping would walk INTO the callee - whose
+        // ret would then be misreported as the caller's return. Both
+        // are worse than stopping here with a clear error.
+        if(mProcess->breakpoints.find({ BreakpointType::Software, after }) !=
+           mProcess->breakpoints.end())
         {
-            // S0-1: record the address we are waiting on; only a hit at
-            // exactly this address may drive the next tick.
-            mStepOutBpAddr = gip + insn.info.length;
+            printf("stepout error: user breakpoint at 0x%llX blocks the call skip\n",
+                   (unsigned long long)after);
+            stepOutFinish("error");
             return;
         }
-        // Fall through to single stepping if the bp cannot be set.
+        if(!mProcess->SetBreakpoint(after, true))
+        {
+            printf("stepout error: cannot set call-skip breakpoint at 0x%llX\n",
+                   (unsigned long long)after);
+            stepOutFinish("error");
+            return;
+        }
+        // Only a hit at exactly this address, on the owning thread, may
+        // drive the next tick.
+        mStepOutBpAddr = after;
+        return;
     }
 
     // Default: single step.
-    mStepOutSteps++;
     mStepArmed = true;
     thread->StepInto();
 }

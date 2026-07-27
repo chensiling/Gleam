@@ -85,6 +85,20 @@ namespace
             { "cl", offsetof(CONTEXT, Rcx), 1, false }, { "dl", offsetof(CONTEXT, Rdx), 1, false },
             { "ah", offsetof(CONTEXT, Rax), 1, true }, { "bh", offsetof(CONTEXT, Rbx), 1, true },
             { "ch", offsetof(CONTEXT, Rcx), 1, true }, { "dh", offsetof(CONTEXT, Rdx), 1, true },
+            { "sil", offsetof(CONTEXT, Rsi), 1, false }, { "dil", offsetof(CONTEXT, Rdi), 1, false },
+            { "bpl", offsetof(CONTEXT, Rbp), 1, false }, { "spl", offsetof(CONTEXT, Rsp), 1, false },
+            { "r8d", offsetof(CONTEXT, R8), 4, false }, { "r9d", offsetof(CONTEXT, R9), 4, false },
+            { "r10d", offsetof(CONTEXT, R10), 4, false }, { "r11d", offsetof(CONTEXT, R11), 4, false },
+            { "r12d", offsetof(CONTEXT, R12), 4, false }, { "r13d", offsetof(CONTEXT, R13), 4, false },
+            { "r14d", offsetof(CONTEXT, R14), 4, false }, { "r15d", offsetof(CONTEXT, R15), 4, false },
+            { "r8w", offsetof(CONTEXT, R8), 2, false }, { "r9w", offsetof(CONTEXT, R9), 2, false },
+            { "r10w", offsetof(CONTEXT, R10), 2, false }, { "r11w", offsetof(CONTEXT, R11), 2, false },
+            { "r12w", offsetof(CONTEXT, R12), 2, false }, { "r13w", offsetof(CONTEXT, R13), 2, false },
+            { "r14w", offsetof(CONTEXT, R14), 2, false }, { "r15w", offsetof(CONTEXT, R15), 2, false },
+            { "r8b", offsetof(CONTEXT, R8), 1, false }, { "r9b", offsetof(CONTEXT, R9), 1, false },
+            { "r10b", offsetof(CONTEXT, R10), 1, false }, { "r11b", offsetof(CONTEXT, R11), 1, false },
+            { "r12b", offsetof(CONTEXT, R12), 1, false }, { "r13b", offsetof(CONTEXT, R13), 1, false },
+            { "r14b", offsetof(CONTEXT, R14), 1, false }, { "r15b", offsetof(CONTEXT, R15), 1, false },
         };
         for(const auto & s : kSlices)
         {
@@ -303,7 +317,14 @@ bool GleamDebugger::setRegisterExtended(const std::string & name, const std::str
     }
 
     if(t.kind == RegKind::Dr)
-        mRawDrWritten = true;
+    {
+        // Writing DR7=0 disarms the thread's raw breakpoints; anything
+        // else puts the thread in raw-DR mode.
+        if(t.index == 7 && v == 0)
+            mRawDrThreads.erase(thread->dwThreadId);
+        else
+            mRawDrThreads.insert(thread->dwThreadId);
+    }
     switch(t.kind)
     {
     case RegKind::Gpr:
@@ -419,7 +440,8 @@ void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
     std::string narrow; // ANSI bytes
     uint64_t units = 0;
     bool terminated = false;
-    uint64_t failedAt = 0; // 0 = no failed read
+    bool failed = false;      // a read failed (distinct from its address,
+    uint64_t failedAt = 0;    // which may legitimately be 0)
     while(units < maxLen && !terminated)
     {
         const uint64_t cur = addr + units * unit;
@@ -434,6 +456,7 @@ void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
         char buf[64];
         if(!mProcess->MemReadSafe(cur, buf, chunk))
         {
+            failed = true;
             failedAt = cur;
             break;
         }
@@ -454,7 +477,7 @@ void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
         }
         units += chunk / unit;
     }
-    if(units == 0 && failedAt)
+    if(units == 0 && failed)
     {
         printf("cannot read string at 0x%llX\n", addr);
         fflush(stdout);
@@ -482,7 +505,7 @@ void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
     printf("string at 0x%llX = \"%s\"", addr, text.c_str());
     if(terminated)
         printf("\n");
-    else if(failedAt)
+    else if(failed)
         printf(" (partial: read failed at 0x%llX)\n", failedAt);
     else
         printf(" (no NUL within limit)\n");
@@ -517,15 +540,19 @@ void GleamDebugger::cmdSaveMem(uint64_t addr, uint64_t size, const std::string &
         const uint64_t cur = addr + done;
         const size_t pageLeft = 0x1000 - (size_t)(cur & 0xFFF);
         const size_t n = (size_t)(std::min)((uint64_t)pageLeft, size - done);
-        if(!mProcess->MemReadSafe(cur, buf.data(), n))
+        uint64_t got = 0;
+        if(!mProcess->MemReadSafe(cur, buf.data(), n, &got) || got < n)
         {
-            memset(buf.data(), 0, n);
-            holeBytes += n;
+            // Preserve the successful prefix (if any); only the real
+            // failure range is zero-filled and reported as a hole.
+            const size_t prefix = got < n ? (size_t)got : 0;
+            memset(buf.data() + prefix, 0, n - prefix);
+            holeBytes += n - prefix;
             if(holes < 3)
             {
                 char tmp[64];
                 sprintf_s(tmp, "%s[0x%llX-0x%llX)", holes ? " " : "",
-                          (unsigned long long)cur, (unsigned long long)(cur + n));
+                          (unsigned long long)(cur + prefix), (unsigned long long)(cur + n));
                 holeRanges += tmp;
             }
             holes++;

@@ -384,6 +384,14 @@ bool GleamDebugger::moduleInfoOf(const std::string & name, uint64_t & base, uint
     return true;
 }
 
+uint32_t GleamDebugger::moduleImageSize(uint64_t base)
+{
+    if(!mProcess)
+        return 0;
+    auto pe = readPeDirectories(mProcess, base);
+    return pe.valid ? pe.sizeOfImage : 0;
+}
+
 bool GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & out)
 {
     if(!mProcess || !ensureSymSession())
@@ -1153,7 +1161,8 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
         T(rangeInImage(0, 100, 0), false);                   // zero-size image
         T(rangeInImage(60, 40, 100), true);                  // full tail range
         printf("selftest rangeInImage %d/%d ok\n", pass, total);
-        // P0-3 exception disposition policy: full table-driven matrix.
+        // Exception disposition policy: full table-driven matrix (x64dbg
+        // semantics; see decideExPolicy's rules comment).
         pass = total = 0;
         auto D = [](bool fc, bool hit, int bo, int hb, bool boe)
         {
@@ -1167,21 +1176,26 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
         // filter miss
         T(P(D(true, false, 2, 0, true), true, false), true);   // first + breakon on  -> pause/pass
         T(P(D(true, false, 2, 0, false), false, false), true); // first + breakon off -> silent pass
-        T(P(D(false, false, 2, 0, true), true, true), true);   // second              -> pause/swallow
-        T(P(D(false, false, 2, 0, false), true, true), true);  // second (breakon off)-> pause/swallow
-        // filter never
-        T(P(D(true, true, 2, 0, true), false, false), true);   // never pass, first
-        T(P(D(false, true, 2, 0, true), false, false), true);  // never pass, second (explicit: may die)
-        T(P(D(true, true, 2, 1, true), false, true), true);    // never swallow, first
-        T(P(D(false, true, 2, 1, true), false, true), true);   // never swallow, second
-        // filter breakOn=first
-        T(P(D(true, true, 0, 0, true), true, false), true);    // break first @first  -> pause/pass
-        T(P(D(false, true, 0, 0, true), false, false), true);  // break first @second -> disposition pass
-        T(P(D(false, true, 0, 1, true), false, true), true);   // break first @second -> disposition swallow
-        // filter breakOn=second
-        T(P(D(false, true, 1, 0, true), true, true), true);    // break second @second-> pause/swallow
-        T(P(D(true, true, 1, 0, true), false, false), true);   // break second @first -> disposition pass
-        T(P(D(true, true, 1, 1, true), false, true), true);    // break second @first -> disposition swallow
+        T(P(D(false, false, 2, 0, true), true, true), true);   // second               -> pause/swallow
+        T(P(D(false, false, 2, 0, false), true, true), true);  // second (breakon off) -> pause/swallow
+        // filter never+pass
+        T(P(D(true, true, 2, 0, true), false, false), true);   // first  -> no-pause pass
+        T(P(D(false, true, 2, 0, true), false, false), true);  // second -> explicit pass (may die)
+        // filter never+swallow
+        T(P(D(true, true, 2, 1, true), false, true), true);    // first  -> no-pause swallow
+        T(P(D(false, true, 2, 1, true), true, true), true);    // second -> pause/swallow
+        // filter break=first, pass
+        T(P(D(true, true, 0, 0, true), true, false), true);    // hit    -> pause/pass
+        T(P(D(false, true, 0, 0, true), true, true), true);    // miss   -> pause/swallow (NOT silent pass)
+        // filter break=first, swallow
+        T(P(D(true, true, 0, 1, true), true, true), true);     // hit    -> pause/swallow
+        T(P(D(false, true, 0, 1, true), true, true), true);    // miss   -> pause/swallow
+        // filter break=second, pass
+        T(P(D(false, true, 1, 0, true), true, true), true);    // hit    -> pause/swallow
+        T(P(D(true, true, 1, 0, true), false, false), true);   // miss   -> no-pause pass
+        // filter break=second, swallow
+        T(P(D(false, true, 1, 1, true), true, true), true);    // hit    -> pause/swallow
+        T(P(D(true, true, 1, 1, true), false, true), true);    // miss   -> no-pause swallow
         printf("selftest excpolicy %d/%d ok\n", pass, total);
         fflush(stdout);
         return CmdResult::Handled;

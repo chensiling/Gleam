@@ -12,7 +12,7 @@ Gleam 的定位类似 idalib 之于 IDA：调试能力以库/命令的形式存�
 - 地址表达式求值：寄存器、`module!symbol`、模块基址、`[expr]` 解引用、`+`/`-`、括号（所有地址类命令共用）
 - 完整执行控制：继续、单步、步过、执行到返回、运行中暂停、脱离
 - 状态读写：寄存器读写（GPR/EFLAGS/DR0-7/XMM0-15/MXCSR）、内存读写、反汇编（Zydis）
-- 真实栈帧枚举（`frames`）：RtlVirtualUnwind + 远程栈/展开数据本地镜像 + 自研 .pdata 查找（含链式/间接表项），只输出已验证帧
+- 栈帧枚举（`frames`）：RtlVirtualUnwind + 远程栈/展开数据本地镜像 + 自研 .pdata 查找（含链式/间接表项）。对正常 PE 模块（含 FPO）已验证正确；非模块内存（shellcode/RWX）的帧不可信，请用 `stackscan`
 - 进程信息：内存映射、模块列表、线程列表、栈回溯、栈扫描、内存模式搜索
 - 类型化内存读取（u8/u16/u32/u64/ptr、ANSI/UTF-16 字符串）与 `savemem` 原始内存导出（按页分块、失败页计洞）
 - 符号支持（dbghelp）：导入表枚举（含延迟导入）、导出表枚举（通配过滤）
@@ -108,8 +108,9 @@ gleam -a <pid>                 :: 附加到运行中的进程
   patches                 补丁列表
   restore <addr>          还原补丁
   stackscan [n]           栈扫描（标注疑似返回地址并解析符号）
-  frames [tid] [n]        真实栈帧枚举（StackWalk64 + 自研 .pdata 查找，
-                          只输出已验证帧，启发式猜测走 stackscan）
+  frames [tid] [n]        栈帧枚举（RtlVirtualUnwind + 自研 .pdata 查找；
+                          正常 PE 模块已验证，非模块内存的帧不可信，
+                          启发式猜测走 stackscan）
   bt                      栈回溯（RBP 链，零依赖兜底）
   exinfo                  最近异常信息
   threads                 线程列表

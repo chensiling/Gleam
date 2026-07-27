@@ -76,6 +76,24 @@ int main(int argc, char** argv)
         fflush(stdout);
     }
 
+    if(argc > 1 && !strcmp(argv[1], "dll2"))
+    {
+        // Load DLLs with no export table (identity must come from the real
+        // path / loader list, not the export dir) and a PDB-only symbol.
+        HMODULE noexp = LoadLibraryW(L"NoExp.dll");
+        printf("NOEXP_LOADED=%d\n", noexp != nullptr);
+        HMODULE late = LoadLibraryW(L"Late.dll");
+        printf("LATE_LOADED=%d\n", late != nullptr);
+        fflush(stdout);
+    }
+
+    if(argc > 1 && !strcmp(argv[1], "av"))
+    {
+        // Unhandled access violation: first chance, second chance, death.
+        *(volatile int*)nullptr = 0;
+        return 0;
+    }
+
     CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 
     printf("ISDEBUGGERPRESENT=%d\n", IsDebuggerPresent() ? 1 : 0);

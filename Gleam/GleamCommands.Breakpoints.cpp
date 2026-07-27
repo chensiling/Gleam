@@ -197,6 +197,26 @@ bool GleamDebugger::parseLogicalSpec(const std::string & s, LogicalBp & out)
     return true;
 }
 
+// Insert a logical entry, or replace the fields of an identical pending
+// one (same module+symbol/rva): duplicate specs share one entry so they
+// can never diverge into "one bound, one pending forever".
+void GleamDebugger::upsertLogicalBp(const LogicalBp & lb)
+{
+    for(auto & e : mLogicalBps)
+    {
+        if(!e.boundAddr && e.module == lb.module &&
+           e.symbol == lb.symbol && e.rva == lb.rva)
+        {
+            e.once = lb.once;
+            e.rule = lb.rule;
+            e.boundAddr = lb.boundAddr;
+            e.boundBase = lb.boundBase;
+            return;
+        }
+    }
+    mLogicalBps.push_back(lb);
+}
+
 GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<std::string> & args)
 {
     const std::string & cmd = args[0];
@@ -210,6 +230,8 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         LogicalBp lb;
         const bool resolved = parseAddress(args[1], a);
         const bool logical = parseLogicalSpec(args[1], lb);
+        if(logical && !resolved)
+            mAddrError.clear(); // the logical spec succeeded; don't leak the probe's error
         if(!resolved && !logical)
             return CmdResult::NotMine;
         bool once = false;
@@ -264,7 +286,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
                     lb.rule = rule;
                     lb.boundAddr = a;
                     moduleBaseByName(lb.module, lb.boundBase);
-                    mLogicalBps.push_back(lb);
+                    upsertLogicalBp(lb);
                 }
                 printf("%sbreakpoint set at 0x%llX\n", once ? "one-shot " : "", a);
             }
@@ -275,7 +297,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         {
             lb.once = once;
             lb.rule = rule;
-            mLogicalBps.push_back(lb);
+            upsertLogicalBp(lb);
             if(!lb.symbol.empty())
                 printf("breakpoint pending module=%s symbol=%s\n", lb.module.c_str(), lb.symbol.c_str());
             else
@@ -317,6 +339,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         LogicalBp spec;
         if(parseLogicalSpec(args[1], spec))
         {
+            mAddrError.clear(); // spec parsed; the probe's error must not leak
             for(auto it = mLogicalBps.begin(); it != mLogicalBps.end(); ++it)
             {
                 if(!it->boundAddr && it->module == spec.module &&
@@ -368,7 +391,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         {
             printf("usage: hbp <hexaddr> [x|w|rw] [1|2|4|8]\n");
         }
-        else if(mRawDrWritten)
+        else if(!mRawDrThreads.empty())
         {
             // P0-6 bidirectional conflict rule: raw DR state and engine
             // hardware breakpoints must never coexist.

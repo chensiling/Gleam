@@ -321,6 +321,7 @@ void GleamDebugger::cbCreateThreadEvent(const CREATE_THREAD_DEBUG_INFO & createT
 
 void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread, const Thread & thread)
 {
+    mRawDrThreads.erase(mDebugEvent.dwThreadId); // raw-DR ownership dies with the thread
     if(!mBreakOnThread)
         return;
     char details[64];
@@ -402,10 +403,17 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
         }
         else
         {
-            // RVA form: must stay inside the image.
-            uint64_t infoBase = 0;
-            uint32_t imageSize = 0;
-            if(!moduleInfoOf(lb.module, infoBase, imageSize) || lb.rva >= imageSize)
+            // RVA form: validate against the PE read directly at moduleBase
+            // (no loader-list dependency - the list is blind during the
+            // load event). If the PE cannot be read we cannot confirm yet:
+            // stay pending instead of rejecting a possibly-valid entry.
+            const uint32_t imageSize = moduleImageSize(moduleBase);
+            if(!imageSize)
+            {
+                i++;
+                continue;
+            }
+            if(lb.rva >= imageSize)
             {
                 printf("event bp rejected module=%s rva=0x%llX (out of image)\n",
                        lb.module.c_str(), (unsigned long long)lb.rva);
@@ -458,14 +466,19 @@ void GleamDebugger::rebindPendingBreakpoints()
 {
     if(mLogicalBps.empty() || !mProcess)
         return;
+    // Collect first: binding may erase entries, which would invalidate
+    // iteration over mLogicalBps.
+    std::vector<uint64_t> bases;
     for(const auto & lb : mLogicalBps)
     {
         if(lb.boundAddr)
             continue;
         uint64_t base = 0;
         if(moduleBaseByName(lb.module, base))
-            bindModuleBreakpoints(base, std::string());
+            bases.push_back(base);
     }
+    for(uint64_t base : bases)
+        bindModuleBreakpoints(base, std::string());
 }
 
 // Clear per-session state before a restart. See the policy comment in
@@ -475,7 +488,7 @@ void GleamDebugger::resetTransientState()
     mSelectedThreadId = 0;
     mLastExceptionValid = false;
     mPausedOnException = false;
-    mRawDrWritten = false;
+    mRawDrThreads.clear();
     mWantsPause = false;
     mStepArmed = false;
     mStepOverArmed = false;
@@ -585,10 +598,11 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
     }
 
     // stepout engine: only the internal one-shot breakpoint at the exact
-    // recorded address may drive the next tick (S0-1). A user one-shot or a
-    // different address pauses normally; the stepout state stays alive.
+    // recorded address, on the owning thread, may drive the next tick.
+    // A user one-shot or a different thread pauses normally; the stepout
+    // state stays alive.
     if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
-       info.address == mStepOutBpAddr)
+       info.address == mStepOutBpAddr && mDebugEvent.dwThreadId == mStepOutTid)
     {
         mStepOutBpAddr = 0;
         stepOutTick();
@@ -682,18 +696,37 @@ void GleamDebugger::cbStep()
     }
 }
 
-// Exception disposition policy (P0-3). See the rules comment in the header.
+// Exception disposition policy (P0-3), x64dbg semantics. Pure decision
+// function so the full combination matrix is unit-testable ("selftest").
+// Rules:
+//   filter hit, first chance  -> pause iff breakOn==first; disposition =
+//     handledBy (pass = NOT_HANDLED, swallow = DBG_CONTINUE)
+//   filter hit, second chance -> ONLY breakOn==never && handledBy==pass
+//     may pass NOT_HANDLED without pausing (explicit: can kill the
+//     process); every other combination pauses with swallow as default
+//   filter miss, first chance -> breakOnException ? pause+pass : silent pass
+//   filter miss, second chance -> pause with swallow default;
+//     "exception pass" is the explicit escape (warned).
 GleamDebugger::ExPolicyOutput GleamDebugger::decideExPolicy(const ExPolicyInput & in)
 {
     ExPolicyOutput out{};
     if(in.filterHit)
     {
-        const bool breakNow = (in.breakOn == 0 && in.firstChance) ||
-                              (in.breakOn == 1 && !in.firstChance);
-        out.pause = breakNow;
-        // Pause at second chance defaults to swallow; a no-break filter
-        // applies its configured disposition.
-        out.swallow = breakNow ? !in.firstChance : (in.handledBy == 1);
+        if(in.firstChance)
+        {
+            out.pause = in.breakOn == 0;
+            out.swallow = in.handledBy == 1;
+        }
+        else if(in.breakOn == 2 && in.handledBy == 0)
+        {
+            out.pause = false;  // explicit DoNotBreak + pass: may kill it
+            out.swallow = false;
+        }
+        else
+        {
+            out.pause = true;
+            out.swallow = true;
+        }
     }
     else
     {
@@ -711,21 +744,24 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
 
     // Raw DR mode (P0-6): a hardware breakpoint hit arrives as
     // STATUS_SINGLE_STEP that the engine cannot attribute to any of its
-    // slots. Decode DR6 and report the slot instead of misclassifying it.
-    if(exceptionRecord.ExceptionCode == STATUS_SINGLE_STEP && mRawDrWritten && mThread)
+    // slots. Only report it when the EVENT thread has raw DR writes and
+    // DR6 actually names a slot; anything else falls through to the
+    // normal exception policy.
+    if(exceptionRecord.ExceptionCode == STATUS_SINGLE_STEP && mThread &&
+       mRawDrThreads.count(mDebugEvent.dwThreadId))
     {
         Registers r(mThread->hThread);
         const uint64_t dr6 = r.GetContext()->Dr6;
         const int slot = (dr6 & 1) ? 0 : (dr6 & 2) ? 1 : (dr6 & 4) ? 2 : (dr6 & 8) ? 3 : -1;
-        char details[96];
         if(slot >= 0)
+        {
+            char details[96];
             sprintf_s(details, "raw-hardware slot=%d address=0x%p", slot, exceptionRecord.ExceptionAddress);
-        else
-            sprintf_s(details, "raw-hardware address=0x%p", exceptionRecord.ExceptionAddress);
-        mContinueStatus = DBG_CONTINUE; // single-step exceptions continue
-        emitStop("hardware", details);
-        mWantsPause = true;
-        return;
+            mContinueStatus = DBG_CONTINUE; // single-step exceptions continue
+            emitStop("hardware", details);
+            mWantsPause = true;
+            return;
+        }
     }
 
     // Our own break-in (triggered by "pause"). Identification, most precise

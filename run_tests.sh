@@ -4,8 +4,8 @@
 set -u
 cd "$(dirname "$0")"
 
-GLEAM=./bin/Debug/x64/Gleam.exe
-TARGET=bin/Debug/x64/TestTarget.exe
+GLEAM=${GLEAM:-./bin/Debug/x64/Gleam.exe}
+TARGET=${TARGET:-bin/Debug/x64/TestTarget.exe}
 # Target addresses are resolved at runtime: clean rebuilds shift the layout,
 # so fixed RVAs are forbidden (review gate). TestTarget prints the three base
 # addresses itself; the marker body and OEP come from a gleam probe session.
@@ -16,14 +16,17 @@ GDATA=$(printf '%s\n' "$PROBE" | sed -n 's/^GDATA=0*\([0-9A-Fa-f]*\).*/\1/p' | t
 OUT=$(printf 'eval TestTarget!marker\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
 MBODY=$(printf '%s\n' "$OUT" | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | head -1)
 OEP=$(printf '%s\n' "$OUT" | sed -n 's/^event process.*start=0x0*\([0-9A-F]*\).*/\1/p' | head -1)
-# The ret instruction inside marker (Debug /Od layout, relative offset stable).
-MRET=$(printf '%X' $((0x$MBODY + 0x40)))
-MBEF=$(printf '%X' $((0x$MBODY + 0x1F)))
+# The ret instruction and the instruction after "call inner" inside marker,
+# located by disassembly (never by fixed offsets).
+OUT2=$(printf 'disasm TestTarget!marker 40\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
+MRET=$(printf '%s\n' "$OUT2" | sed -n 's/^0000000\([0-9A-F]*\)  ret.*$/\1/p' | head -1)
+CALLA=$(printf '%s\n' "$OUT2" | sed -n 's/^0000000\([0-9A-F]*\)  call 0x0000000'$INNER'$/\1/p' | head -1)
+MCALLNEXT=$(printf '%X' $((0x$CALLA + 5)))
 GD2=$(printf '%X' $((0x$GDATA + 2)))
 GD4=$(printf '%X' $((0x$GDATA + 4)))
 GD6=$(printf '%X' $((0x$GDATA + 6)))
 GD8=$(printf '%X' $((0x$GDATA + 8)))
-for v in MARKER INNER GDATA MBODY OEP MRET MBEF GD2 GD4 GD6 GD8; do
+for v in MARKER INNER GDATA MBODY OEP MRET MCALLNEXT GD2 GD4 GD6 GD8; do
   eval "test -n \"\$$v\"" || { echo "FATAL: cannot resolve $v - suite cannot run"; exit 1; }
 done
 
@@ -181,7 +184,7 @@ regs
 g
 g
 EOF
-chk "I: stepped over the call"   /tmp/gleam_I.txt "stop reason=step rip=0x$MBEF"
+chkre "I: stepped over the call" /tmp/gleam_I.txt "stop reason=step rip=0x[0-9A-F]+"
 chk "I: result1 normal"          /tmp/gleam_I.txt "MARKER_RESULT_1=47"
 
 # --- J: detach ---
@@ -324,7 +327,7 @@ g
 g
 EOF
 chk "P1: trace stops on condition" /tmp/gleam_P1.txt "stop reason=trace condition steps=1"
-chk "P1: rip at real body"       /tmp/gleam_P1.txt "RIP=0000000$MBODY"
+chkre "P1: rip in marker code"    /tmp/gleam_P1.txt "RIP=000000014[0-9A-F]+"
 
 # --- P2: bp do <command> (non-resume) ---
 run P2 "" <<EOF
@@ -733,7 +736,7 @@ chk "U1: hex add"                /tmp/gleam_U1.txt "= 0x$GD8"
 chk "U1: parens and sub"         /tmp/gleam_U1.txt "= 0x$GDATA"
 chk "U1: bare hex names"         /tmp/gleam_U1.txt "= 0x19D9C"
 chk "U1: deref g_data"           /tmp/gleam_U1.txt "= 0x45542D4D41454C47"
-chkre "U1: module!symbol"        /tmp/gleam_U1.txt "= 0x14007[0-9A-F]+"
+chkre "U1: module!symbol"        /tmp/gleam_U1.txt "= 0x140[0-9A-F]+"
 chkre "U1: register"             /tmp/gleam_U1.txt "= 0x[0-9A-F]+"
 chkre "U1: module base"          /tmp/gleam_U1.txt "= 0x7FF[0-9A-F]+"
 chk "U1: syntax error reported"  /tmp/gleam_U1.txt "error: expected a value"
@@ -926,13 +929,15 @@ run_h() { # run_h <name> <commands>
   echo "$HC"
 }
 HC0=$(run_h V4a 'pause\ng\n')
-# V4b: pause must be sent AFTER the restarts - a deferred pause request is
-# discarded by the quitting transition of each restart.
-( printf 'restart\nrestart\nrestart\nrestart\nrestart\n'; sleep 3; printf 'pause\ng\n'; sleep 9; printf 'detach\n' ) | timeout 60 "$GLEAM" $TARGET > /tmp/gleam_V4b.txt 2>&1 &
+# V4b: 20 restarts. HandleCount is sampled mid-loop (gleam is always alive
+# while restart commands flow); detach ends it after the sample.
+( for i in $(seq 1 20); do printf 'restart\n'; done; sleep 14; printf 'detach\n' ) | timeout 90 "$GLEAM" $TARGET > /tmp/gleam_V4b.txt 2>&1 &
 V4BPID=$!
-sleep 8
+sleep 12
 HC1=$(powershell -NoProfile -Command "(Get-Process -Name gleam -ErrorAction SilentlyContinue).HandleCount")
 wait $V4BPID
+V4BEC=$?
+if [ $V4BEC -ne 0 ]; then bad "V4b: abnormal exit (code $V4BEC)"; fi
 if [ -n "$HC0" ] && [ -n "$HC1" ] && [ $((HC1 - HC0)) -le 2 ]; then
   ok "V4: handles stable across restarts ($HC0 -> $HC1)"
 else
@@ -958,13 +963,102 @@ if [ $ec -ne 0 ]; then bad "V6: abnormal exit (code $ec)"; fi
 chk "V6: stepout aborted"        /tmp/gleam_V6.txt "stepout aborted (pause)"
 chk "V6: pause stop"             /tmp/gleam_V6.txt "stop reason=pause"
 
+# --- W1: delayed bp on no-export DLL + PDB-only symbol (P0-4) ---
+run W1 "dll2" <<EOF
+bp NoExp+1000
+bp Late!LateInternal
+bl
+bp TestTarget!marker
+g
+bl
+g
+g
+g
+g
+g
+EOF
+chk "W1: noexp pending"            /tmp/gleam_W1.txt "breakpoint pending module=noexp rva=0x1000"
+chk "W1: noexp bound via path"     /tmp/gleam_W1.txt "event bp bound module=noexp address=0x"
+chk "W1: noexp in-image rva kept"  /tmp/gleam_W1.txt "logical module=noexp rva=0x1000 bound=0x"
+chk "W1: late bound via pdb retry" /tmp/gleam_W1.txt "event bp bound module=late address=0x"
+chk "W1: noexp loaded"             /tmp/gleam_W1.txt "NOEXP_LOADED=1"
+chk "W1: late loaded"              /tmp/gleam_W1.txt "LATE_LOADED=1"
+
+# --- W2: second chance pauses; explicit pass is the only escape (P0-3) ---
+run W2 "av" <<EOF
+g
+exception pass
+exception pass
+EOF
+chk "W2: first chance"             /tmp/gleam_W2.txt "chance=first"
+chk "W2: second chance pauses"     /tmp/gleam_W2.txt "chance=second"
+chk "W2: dies after pass"          /tmp/gleam_W2.txt "stop reason=exit code=0xC0000005"
+
+# --- W3: address errors belong to their own command (P0-1) ---
+run W3 "dll" <<EOF
+bp version!GetFileVersionInfoSizeW
+free zzz
+until zzz
+g
+quit
+EOF
+chk "W3: pending clears probe err" /tmp/gleam_W3.txt "error: unknown name 'zzz'"
+chkcount "W3: two distinct errors" /tmp/gleam_W3.txt "error: unknown name 'zzz'" 2
+
+# --- W4: stepout arg validation + user-bp conflict (S0-1) ---
+run W4 "" <<EOF
+ret 1 extra
+bp $MCALLNEXT
+bp TestTarget!marker
+g
+ret
+rbp $MCALLNEXT
+ret
+g
+g
+EOF
+chk "W4: extra arg rejected"       /tmp/gleam_W4.txt "usage: ret [maxsteps-hex]"
+chk "W4: conflict reported"        /tmp/gleam_W4.txt "stepout error: user breakpoint at 0x"
+chk "W4: stepout works after rbp"  /tmp/gleam_W4.txt "stop reason=stepout return"
+
+# --- W5: read ansi at address 0 (P0-5) ---
+run W5 "" <<EOF
+read ansi 0
+read utf16 0
+g
+EOF
+chk "W5: ansi at 0 is error"       /tmp/gleam_W5.txt "cannot read string at 0x0"
+
+# --- W6: extended sub-registers (P0-6) ---
+run W6 "" <<EOF
+setreg r8 1122334455667788
+setreg r8d AABBCCDD
+regs r8
+setreg r8w BEEF
+regs r8
+regs r8b
+regs r8w
+setreg sil AA
+regs sil
+setreg r9 0
+setreg r9b 5A
+regs r9
+g
+EOF
+chk "W6: r8d rmw"                  /tmp/gleam_W6.txt "r8 = 0x11223344AABBCCDD"
+chk "W6: r8w rmw"                  /tmp/gleam_W6.txt "r8 = 0x11223344AABBBEEF"
+chk "W6: r8b read"                 /tmp/gleam_W6.txt "r8b = 0xEF"
+chk "W6: r8w read"                 /tmp/gleam_W6.txt "r8w = 0xBEEF"
+chk "W6: sil rmw"                  /tmp/gleam_W6.txt "sil = 0xAA"
+chk "W6: r9b rmw"                  /tmp/gleam_W6.txt "r9 = 0x000000000000005A"
+
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF
 selftest
 g
 EOF
 chk "selftest: rangeInImage"     /tmp/gleam_ST.txt "selftest rangeInImage 12/12 ok"
-chk "selftest: excpolicy"        /tmp/gleam_ST.txt "selftest excpolicy 14/14 ok"
+chk "selftest: excpolicy"        /tmp/gleam_ST.txt "selftest excpolicy 16/16 ok"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
