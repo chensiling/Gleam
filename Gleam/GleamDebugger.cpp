@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <psapi.h>
+#include <dbghelp.h>
 
 using namespace GleeBug;
 
@@ -322,6 +323,9 @@ void GleamDebugger::cbCreateThreadEvent(const CREATE_THREAD_DEBUG_INFO & createT
 void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread, const Thread & thread)
 {
     mRawDrThreads.erase(mDebugEvent.dwThreadId); // raw-DR ownership dies with the thread
+    // The thread a stepout operation owns is gone: cancel it.
+    if(mStepOutActive && mDebugEvent.dwThreadId == mStepOutTid)
+        abortStepOut("thread exit");
     if(!mBreakOnThread)
         return;
     char details[64];
@@ -336,14 +340,16 @@ void GleamDebugger::cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
     // file handle (valid during this callback), then the loader list. The
     // PE export-directory name is only an alias (bindModuleBreakpoints).
     std::string name;
+    wchar_t wpath[MAX_PATH * 2] = L"";
     if(loadDll.hFile)
     {
         char path[MAX_PATH * 2] = "";
         if(GetFinalPathNameByHandleA(loadDll.hFile, path, sizeof(path), VOLUME_NAME_DOS))
             name = normalizeModuleName(path);
+        GetFinalPathNameByHandleW(loadDll.hFile, wpath, ARRAYSIZE(wpath), VOLUME_NAME_DOS);
     }
     // Logical breakpoints bind regardless of the breakon dll switch.
-    bindModuleBreakpoints((uint64_t)loadDll.lpBaseOfDll, name);
+    bindModuleBreakpoints((uint64_t)loadDll.lpBaseOfDll, name, wpath);
     if(!mBreakOnDll)
         return;
     char details[80];
@@ -356,6 +362,12 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
 {
     // Unbind keeps the logical entries: a reload re-binds them.
     unbindModuleBreakpoints((uint64_t)unloadDll.lpBaseOfDll);
+    // Pair the explicit symbol load, if any (stale symbols on reload).
+    if(mSymLoadedBases.erase((uint64_t)unloadDll.lpBaseOfDll) && mProcess)
+    {
+        ensureSymSession();
+        SymUnloadModule64(mProcess->hProcess, (DWORD64)unloadDll.lpBaseOfDll);
+    }
     // The module's cached .pdata is stale from here on.
     mPdataCache.erase((uint64_t)unloadDll.lpBaseOfDll);
     if(!mBreakOnDll)
@@ -371,7 +383,8 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
 // empty. The export-directory name is tried only as a non-authoritative
 // alias. Symbol entries that fail to resolve stay pending and are retried
 // at the next module event or pause (rebindPendingBreakpoints).
-void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string & primaryName)
+void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string & primaryName,
+                                          const wchar_t* imagePath)
 {
     if(mLogicalBps.empty() || !mProcess)
         return;
@@ -393,12 +406,14 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
         if(!lb.symbol.empty())
         {
             addr = findExportByName(moduleBase, lb.symbol);
-            if(!addr) // dbghelp fallback (PDB-only symbols)
+            if(!addr) // invade-session fallback (needs the loader list)
                 resolveModuleSymbol(lb.module + "!" + lb.symbol, addr);
+            if(!addr) // PDB-only fallback: load symbols from the file itself
+                addr = resolvePdbSymbol(moduleBase, imagePath, lb.symbol);
             if(!addr)
             {
                 i++;
-                continue; // stay pending, retried later
+                continue; // stay pending, retried at the next event/pause
             }
         }
         else
@@ -413,14 +428,14 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
                 i++;
                 continue;
             }
-            if(lb.rva >= imageSize)
+            if(lb.rva >= imageSize || moduleBase + lb.rva < moduleBase)
             {
                 printf("event bp rejected module=%s rva=0x%llX (out of image)\n",
                        lb.module.c_str(), (unsigned long long)lb.rva);
                 mLogicalBps.erase(mLogicalBps.begin() + i);
                 continue;
             }
-            addr = moduleBase + lb.rva; // rva < SizeOfImage < 4GB: no wrap on x64
+            addr = moduleBase + lb.rva;
         }
         if(!mProcess->SetBreakpoint(addr, lb.once))
         {
@@ -478,7 +493,11 @@ void GleamDebugger::rebindPendingBreakpoints()
             bases.push_back(base);
     }
     for(uint64_t base : bases)
-        bindModuleBreakpoints(base, std::string());
+    {
+        wchar_t wpath[MAX_PATH * 2] = L"";
+        GetModuleFileNameExW(mProcess->hProcess, (HMODULE)base, wpath, ARRAYSIZE(wpath));
+        bindModuleBreakpoints(base, std::string(), wpath);
+    }
 }
 
 // Clear per-session state before a restart. See the policy comment in
@@ -598,15 +617,28 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
     }
 
     // stepout engine: only the internal one-shot breakpoint at the exact
-    // recorded address, on the owning thread, may drive the next tick.
-    // A user one-shot or a different thread pauses normally; the stepout
-    // state stays alive.
+    // recorded address, on the owning thread, in the owning generation,
+    // may drive the next tick.
     if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
-       info.address == mStepOutBpAddr && mDebugEvent.dwThreadId == mStepOutTid)
+       info.address == mStepOutBpAddr && mDebugEvent.dwThreadId == mStepOutTid &&
+       mStepOutBpGen == mStepOutGen)
     {
         mStepOutBpAddr = 0;
         stepOutTick();
         return;
+    }
+    // Another thread tripped the internal breakpoint at that address. The
+    // engine consumes singleshoots unconditionally after this callback, so
+    // the bp is gone: re-arm it after the event (cbPostDebugEvent) and let
+    // the hit surface as a normal stop. stepout stays waiting, unconsumed.
+    if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
+       info.address == mStepOutBpAddr && mDebugEvent.dwThreadId != mStepOutTid)
+    {
+        mStepOutRearm = mStepOutBpAddr;
+        printf("event stepout internal bp hit by non-owner tid=%u (re-armed)\n",
+               mDebugEvent.dwThreadId);
+        fflush(stdout);
+        // fall through to normal reporting
     }
 
     // Conditional breakpoints, tracepoints and "do" commands may suppress
@@ -843,6 +875,16 @@ void GleamDebugger::cbPreDebugEvent(const DEBUG_EVENT & debugEvent)
 
 void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
 {
+    // Pending logical breakpoints retry at EVERY debug event opportunity
+    // (PDB-only symbols become resolvable as the loader proceeds).
+    for(const auto & lb : mLogicalBps)
+    {
+        if(!lb.boundAddr)
+        {
+            rebindPendingBreakpoints();
+            break;
+        }
+    }
     // Event-opportunity retry for break-in symbol resolution (rate-limited
     // logging; the pending state is simply "address still zero").
     if(!mExitThreadAddr.load() || !mDbgBreakInAddr.load())
@@ -860,6 +902,15 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         mWantsPause = false;
         commandLoop();
     }
+    // A non-owner thread consumed our internal breakpoint; the engine has
+    // finished deleting it by now, so re-arm for the owning thread.
+    if(mStepOutRearm && mStepOutActive && mProcess)
+    {
+        mProcess->SetBreakpoint(mStepOutRearm, true);
+        mStepOutRearm = 0;
+    }
+    else
+        mStepOutRearm = 0;
     // Consume deferred pause requests LAST, after marking ourselves
     // running-free: requests arriving after this point go straight to
     // forceBreakIn, so no request can be stranded between the two checks.

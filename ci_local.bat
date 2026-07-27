@@ -23,12 +23,14 @@ powershell -NoProfile -Command "Get-Process -Name TestTarget,ArgvTarget,Boundary
 rem ---- stage 1: clean rebuild Debug x64 ----
 echo [ci] clean rebuild Debug x64 ...
 %MSBUILD% %ROOT%GleeBug.sln -t:Clean -p:Configuration=Debug -p:Platform=x64 -m -v:m > %OUT%\build_clean_debug.log 2>&1
+if errorlevel 1 ( echo [ci] FAIL: Debug clean & exit /b 1 )
 %MSBUILD% %ROOT%GleeBug.sln -p:Configuration=Debug -p:Platform=x64 -m -v:m >> %OUT%\build_debug.log 2>&1
 if errorlevel 1 ( echo [ci] FAIL: Debug build & exit /b 1 )
 
 rem ---- stage 2: clean rebuild Release x64 ----
 echo [ci] clean rebuild Release x64 ...
 %MSBUILD% %ROOT%GleeBug.sln -t:Clean -p:Configuration=Release -p:Platform=x64 -m -v:m > %OUT%\build_clean_release.log 2>&1
+if errorlevel 1 ( echo [ci] FAIL: Release clean & exit /b 1 )
 %MSBUILD% %ROOT%GleeBug.sln -p:Configuration=Release -p:Platform=x64 -m -v:m >> %OUT%\build_release.log 2>&1
 if errorlevel 1 ( echo [ci] FAIL: Release build & exit /b 1 )
 
@@ -37,14 +39,18 @@ for /l %%i in (1,1,3) do (
     echo [ci] suite run %%i/3 ...
     %BASH% %ROOT%run_tests.sh > %OUT%\suite_debug_%%i.log 2>&1
     if errorlevel 1 ( echo [ci] FAIL: suite run %%i & exit /b 1 )
+    mkdir %OUT%\artifacts_debug_%%i >nul 2>&1
+    copy /y %TEMP%\gleam_*.txt %OUT%\artifacts_debug_%%i\ >nul 2>&1
 )
 
 rem ---- stage 4: full suite (Release binaries) x1 ----
 echo [ci] suite run release ...
 pushd %ROOT%
-%BASH% -c "GLEAM=./bin/Release/x64/Gleam.exe TARGET=bin/Release/x64/TestTarget.exe bash run_tests.sh" > %OUT%\suite_release.log 2>&1
+%BASH% -c "GLEAM=./bin/Release/x64/Gleam.exe TARGET=bin/Release/x64/TestTarget.exe ATARGET=bin/Release/x64/ArgvTarget.exe BTARGET=bin/Release/x64/BoundaryTarget.exe bash run_tests.sh" > %OUT%\suite_release.log 2>&1
 popd
 if errorlevel 1 ( echo [ci] FAIL: release suite & exit /b 1 )
+mkdir %OUT%\artifacts_release >nul 2>&1
+copy /y %TEMP%\gleam_*.txt %OUT%\artifacts_release\ >nul 2>&1
 
 echo [ci] PASS: all stages green. Logs in %OUT%
 exit /b 0

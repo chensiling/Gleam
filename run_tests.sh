@@ -6,6 +6,8 @@ cd "$(dirname "$0")"
 
 GLEAM=${GLEAM:-./bin/Debug/x64/Gleam.exe}
 TARGET=${TARGET:-bin/Debug/x64/TestTarget.exe}
+ATARGET=${ATARGET:-bin/Debug/x64/ArgvTarget.exe}
+BTARGET=${BTARGET:-bin/Debug/x64/BoundaryTarget.exe}
 # Target addresses are resolved at runtime: clean rebuilds shift the layout,
 # so fixed RVAs are forbidden (review gate). TestTarget prints the three base
 # addresses itself; the marker body and OEP come from a gleam probe session.
@@ -477,7 +479,7 @@ chk "R5: bridged originals kept" /tmp/gleam_R5.txt "47 4C 45 41"
 echo "== S1 =="
 S1OK=0
 for i in $(seq 1 25); do
-  out=$(printf 'g\npause\ndetach\n' | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  out=$(printf 'g\npause\ndetach\n' | timeout 20 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S1OK=$((S1OK+1)); else printf '%s' "$out" > /tmp/gleam_S1_fail_$i.txt; fi
@@ -489,7 +491,7 @@ if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK
 
 # --- T1: argv quoting matrix ---
 echo "== T1 =="
-timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe "" "a b" "$(printf 'x\ty')" "quote\"in" 'trail\' > /tmp/gleam_T1.txt 2>&1 <<EOF
+timeout 20 "$GLEAM" "$ATARGET" "" "a b" "$(printf 'x\ty')" "quote\"in" 'trail\' > /tmp/gleam_T1.txt 2>&1 <<EOF
 g
 EOF
 check_ec T1 $? /tmp/gleam_T1.txt
@@ -502,7 +504,7 @@ chk "T1: trailing backslash"     /tmp/gleam_T1.txt 'ARGV[5]=[trail\]'
 
 # --- T1c: argv backslash parity ---
 echo "== T1c =="
-timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe 'a\\' 'x\\"y' > /tmp/gleam_T1c.txt 2>&1 <<EOF
+timeout 20 "$GLEAM" "$ATARGET" 'a\\' 'x\\"y' > /tmp/gleam_T1c.txt 2>&1 <<EOF
 g
 EOF
 check_ec T1c $? /tmp/gleam_T1c.txt
@@ -511,7 +513,7 @@ chk "T1c: 2x backslash + quote"  /tmp/gleam_T1c.txt 'ARGV[2]=[x\\"y]'
 
 # --- T1b: argv unicode + backslash-before-quote ---
 echo "== T1b =="
-timeout 20 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/ArgvTarget.exe "中文路径" 'a\"b' > /tmp/gleam_T1b.txt 2>&1 <<EOF
+timeout 20 "$GLEAM" "$ATARGET" "中文路径" 'a\"b' > /tmp/gleam_T1b.txt 2>&1 <<EOF
 g
 EOF
 check_ec T1b $? /tmp/gleam_T1b.txt
@@ -523,7 +525,7 @@ chk "T1b: backslash before quote" /tmp/gleam_T1b.txt 'ARGV[2]=[a\"b]'
 
 # --- T2: cross-chunk instruction scan ---
 echo "== T2 =="
-timeout 30 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/BoundaryTarget.exe > /tmp/gleam_T2.txt 2>&1 <<EOF
+timeout 30 "$GLEAM" "$BTARGET" > /tmp/gleam_T2.txt 2>&1 <<EOF
 g
 xref 60000000
 xref 60100040
@@ -619,7 +621,7 @@ chk "T5c: loop result correct"   /tmp/gleam_T5c.txt "LOOP_RESULT=4999950000"
 echo "== S2 =="
 S2OK=0
 for i in $(seq 1 100); do
-  out=$(printf 'g\npause\ndetach\n' | timeout 30 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  out=$(printf 'g\npause\ndetach\n' | timeout 30 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S2OK=$((S2OK+1)); else printf '%s' "$out" > /tmp/gleam_S2_fail_$i.txt; fi
@@ -634,25 +636,25 @@ if [ "$S2OK" -eq 100 ]; then ok "S2: 100/100 pause injections"; else bad "S2: $S
 echo "== S3 =="
 S3OK=0
 for i in $(seq 1 100); do
-  printf 'quit\n' | timeout 10 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe > /dev/null 2>&1
+  printf 'quit\n' | timeout 10 "$GLEAM" "$TARGET" > /dev/null 2>&1
   [ $? -eq 0 ] && S3OK=$((S3OK+1))
 done
 if [ "$S3OK" -eq 100 ]; then ok "S3: 100/100 sessions exited"; else bad "S3: $S3OK/100 sessions exited"; fi
 
 # --- S3b: REPL stdin-open lifecycle (natural exit / detach / quit, with artifacts) ---
 echo "== S3b =="
-out=$({ printf 'g\n'; sleep 2; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+out=$({ printf 'g\n'; sleep 2; } | timeout 15 "$GLEAM" "$TARGET" 2>&1); ec=$?
 [ $ec -eq 0 ] && ok "S3b: natural exit with stdin open" || { printf '%s' "$out" > /tmp/gleam_S3b_exit.txt; bad "S3b: natural exit (code $ec)"; }
-out=$({ printf 'bp $MARKER\ng\ndetach\n'; sleep 2; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+out=$({ printf 'bp $MARKER\ng\ndetach\n'; sleep 2; } | timeout 15 "$GLEAM" "$TARGET" 2>&1); ec=$?
 [ $ec -eq 0 ] && ok "S3b: detach with stdin open" || { printf '%s' "$out" > /tmp/gleam_S3b_detach.txt; bad "S3b: detach (code $ec)"; }
-out=$({ printf 'quit\n'; sleep 2; } | timeout 15 ./bin/Debug/x64/Gleam.exe bin/Debug/x64/TestTarget.exe 2>&1); ec=$?
+out=$({ printf 'quit\n'; sleep 2; } | timeout 15 "$GLEAM" "$TARGET" 2>&1); ec=$?
 [ $ec -eq 0 ] && ok "S3b: quit with stdin open" || { printf '%s' "$out" > /tmp/gleam_S3b_quit.txt; bad "S3b: quit (code $ec)"; }
 
 # --- S4: runtime pause (delayed writer; pause sent while target RUNS free) ---
 echo "== S4 =="
 S4OK=0
 for i in $(seq 1 100); do
-  out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S4OK=$((S4OK+1)); else printf '%s' "$out" > /tmp/gleam_S4_fail_$i.txt; fi
@@ -668,7 +670,7 @@ if [ "$S4OK" -eq 100 ]; then ok "S4: 100/100 runtime pauses"; else bad "S4: $S4O
 echo "== S5 =="
 S5OK=0
 for i in $(seq 1 100); do
-  out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 ./bin/Debug/x64/Gleam.exe 'C:\Windows\notepad.exe' 2>&1)
+  out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   f=$(printf '%s' "$out" | grep -c 'breakin fail=')
@@ -919,16 +921,18 @@ chk "V3: raw hw hit"             /tmp/gleam_V3.txt "stop reason=hardware"
 chk "V3: slot decoded"           /tmp/gleam_V3.txt "raw-hardware slot=0"
 
 # --- V4: restart handle-count idempotence (P0-7) ---
-run_h() { # run_h <name> <commands>
+run_h() { # run_h <name> <commands>; prints "<handles> <exit-code>"
   local name=$1 cmds=$2
-  ( printf "$cmds"; sleep 9; printf 'detach\n' ) | timeout 60 "$GLEAM" $TARGET > /tmp/gleam_$name.txt 2>&1 &
+  ( printf "$cmds"; sleep 9; printf 'detach\n' ) | timeout 60 "$GLEAM" "$TARGET" > /tmp/gleam_$name.txt 2>&1 &
   local bgpid=$!
   sleep 6
   HC=$(powershell -NoProfile -Command "(Get-Process -Name gleam -ErrorAction SilentlyContinue).HandleCount")
   wait $bgpid
-  echo "$HC"
+  echo "$HC $?"
 }
-HC0=$(run_h V4a 'pause\ng\n')
+R=$(run_h V4a "bp $MARKER\ng\npause\ng\n")
+HC0=${R% *}; V4AEC=${R##* }
+if [ "$V4AEC" -ne 0 ]; then bad "V4a: abnormal exit (code $V4AEC)"; fi
 # V4b: 20 restarts. HandleCount is sampled mid-loop (gleam is always alive
 # while restart commands flow); detach ends it after the sample.
 ( for i in $(seq 1 20); do printf 'restart\n'; done; sleep 14; printf 'detach\n' ) | timeout 90 "$GLEAM" $TARGET > /tmp/gleam_V4b.txt 2>&1 &
@@ -943,6 +947,27 @@ if [ -n "$HC0" ] && [ -n "$HC1" ] && [ $((HC1 - HC0)) -le 2 ]; then
 else
   bad "V4: handle growth ($HC0 -> $HC1)"
 fi
+
+# --- V4c: attach/detach cycles + Init failure (handle ownership, P0-7) ---
+powershell -NoProfile -Command "Start-Process 'C:\Windows\notepad.exe'" > /dev/null 2>&1
+NPID=""
+for i in $(seq 1 10); do
+  NPID=$(powershell -NoProfile -Command "(Get-Process -Name notepad -ErrorAction SilentlyContinue | Select-Object -First 1).Id" 2>/dev/null)
+  [ -n "$NPID" ] && break
+  sleep 1
+done
+V4COK=0
+for i in $(seq 1 5); do
+  out=$(printf 'pause\ndetach\n' | timeout 15 "$GLEAM" -a $NPID 2>&1)
+  ec=$?
+  n=$(printf '%s' "$out" | grep -c 'stop reason=attach\|stop reason=pause')
+  [ $ec -eq 0 ] && [ "$n" -ge 1 ] && V4COK=$((V4COK+1))
+done
+powershell -NoProfile -Command "Stop-Process -Id $NPID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+if [ "$V4COK" -eq 5 ]; then ok "V4c: 5/5 attach-detach cycles"; else bad "V4c: $V4COK/5 attach-detach cycles"; fi
+timeout 10 "$GLEAM" C:\definitely\missing\target.exe > /tmp/gleam_V4d.txt 2>&1
+ec=$?
+if [ $ec -eq 1 ]; then ok "V4d: Init failure exits 1"; else bad "V4d: Init failure exit code $ec"; fi
 
 # --- V5: once logical bp consumed + RVA bounds (P0-4) ---
 run V5 "" <<EOF
@@ -1051,6 +1076,42 @@ chk "W6: r8b read"                 /tmp/gleam_W6.txt "r8b = 0xEF"
 chk "W6: r8w read"                 /tmp/gleam_W6.txt "r8w = 0xBEEF"
 chk "W6: sil rmw"                  /tmp/gleam_W6.txt "sil = 0xAA"
 chk "W6: r9b rmw"                  /tmp/gleam_W6.txt "r9 = 0x000000000000005A"
+
+# --- W7: PDB-only symbol binds at the load event itself (P0-4) ---
+run W7 "dll2" <<EOF
+bp Late!LateInternal
+g
+g
+g
+EOF
+chk "W7: bound at load event"    /tmp/gleam_W7.txt "event bp bound module=late address=0x"
+chk "W7: first call hit"         /tmp/gleam_W7.txt "stop reason=breakpoint"
+
+# --- W8: UTF-16 page tail (P0-5) ---
+timeout 30 "$GLEAM" "$BTARGET" > /tmp/gleam_W8.txt 2>&1 <<EOF
+g
+read utf16 60000FFF 1
+quit
+EOF
+ec=$?
+echo "== W8 =="
+if [ $ec -ne 0 ]; then bad "W8: abnormal exit (code $ec)"; fi
+chk "W8: page tail is error"     /tmp/gleam_W8.txt "cannot read string at 0x60000FFF"
+
+# --- W9: frames source labels (P0-2) ---
+timeout 30 "$GLEAM" "$BTARGET" > /tmp/gleam_W9.txt 2>&1 <<EOF
+g
+write 60000000 10 00 00 60 00 00 00 00
+setreg rsp 60000000
+setreg rip 60000000
+frames 0 4
+quit
+EOF
+ec=$?
+echo "== W9 =="
+if [ $ec -ne 0 ]; then bad "W9: abnormal exit (code $ec)"; fi
+chk "W9: untrusted label"        /tmp/gleam_W9.txt "source=untrusted"
+chk "W9: non-module marked"      /tmp/gleam_W9.txt "module=?"
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF

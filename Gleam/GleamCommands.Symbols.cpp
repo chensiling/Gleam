@@ -761,6 +761,35 @@ std::string GleamDebugger::dllNameFromBase(uint64_t base)
 // Resolve an exported function by walking the export table directly (same
 // reason as above: no loader-list or dbghelp dependency). Forwarded exports
 // return 0 (unresolved).
+// Resolve a PDB-only symbol by explicitly loading the module's symbols
+// from its file on disk. The invade-based dbghelp session depends on the
+// loader list, which is not yet linked during the DLL load event - this
+// path has no such dependency. Returns 0 when unresolvable.
+uint64_t GleamDebugger::resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol)
+{
+    if(!imagePath || !*imagePath || !ensureSymSession())
+        return 0;
+    if(!mSymLoadedBases.count(moduleBase))
+    {
+        if(!SymLoadModuleExW(mProcess->hProcess, NULL, imagePath, NULL,
+                             moduleBase, 0 /* size from image */, NULL, 0))
+            return 0;
+        mSymLoadedBases.insert(moduleBase);
+    }
+    char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
+    memset(buf, 0, sizeof(buf));
+    auto si = (SYMBOL_INFO*)buf;
+    si->SizeOfStruct = sizeof(SYMBOL_INFO);
+    si->MaxNameLen = MAX_SYM_NAME;
+    // Wide path -> UTF-8 for the module name in "module!symbol".
+    char narrow[MAX_PATH * 2] = "";
+    WideCharToMultiByte(CP_UTF8, 0, imagePath, -1, narrow, sizeof(narrow), nullptr, nullptr);
+    std::string modSym = normalizeModuleName(narrow) + "!" + symbol;
+    if(SymFromName(mProcess->hProcess, modSym.c_str(), si))
+        return si->Address;
+    return 0;
+}
+
 uint64_t GleamDebugger::findExportByName(uint64_t base, const std::string & name)
 {
     if(!mProcess)
@@ -925,6 +954,7 @@ void GleamDebugger::cmdFrames(uint32_t tid, uint64_t maxFrames)
 
     ensureSymSession(); // best effort; frames degrade to module+offset
     const char* stopReason = nullptr;
+    const char* source = "context"; // how the CURRENT rip was obtained
     uint64_t shown = 0;
     for(uint64_t n = 0; n < maxFrames; n++)
     {
@@ -951,9 +981,9 @@ void GleamDebugger::cmdFrames(uint32_t tid, uint64_t maxFrames)
                 symField = tmp;
             }
         }
-        printf("frame #%llu rip=0x%llX rsp=0x%llX module=%s%s source=unwind\n",
+        printf("frame #%llu rip=0x%llX rsp=0x%llX module=%s%s source=%s\n",
                (unsigned long long)n, (unsigned long long)rip, (unsigned long long)rsp,
-               modname.c_str(), symField.c_str());
+               modname.c_str(), symField.c_str(), source);
         fflush(stdout);
         shown++;
 
@@ -961,8 +991,10 @@ void GleamDebugger::cmdFrames(uint32_t tid, uint64_t maxFrames)
         RUNTIME_FUNCTION* rf = base ? findRuntimeFunction(rip) : nullptr;
         if(!rf)
         {
-            // No unwind info (leaf function, or code without .pdata such as
-            // shellcode): the x64 ABI leaf rule, rip = [rsp], rsp += 8.
+            // No unwind info: try the x64 ABI leaf rule, rip = [rsp],
+            // rsp += 8. Honest labels: only a verified module without a
+            // record is a "leaf"; anything else is "untrusted".
+            source = base ? "leaf" : "untrusted";
             uint64_t ret = 0;
             if(!mProcess->MemReadSafe(rsp, &ret, sizeof(ret)))
             {
@@ -975,6 +1007,7 @@ void GleamDebugger::cmdFrames(uint32_t tid, uint64_t maxFrames)
         }
         else
         {
+            source = "unwind";
             // Mirror the RVA span covering the function's code (prologue /
             // epilogue byte checks) and its UNWIND_INFO, then unwind with a
             // fake image base mapping the RVA span onto that buffer.

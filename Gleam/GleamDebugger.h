@@ -185,8 +185,10 @@ private:
     static bool parseLogicalSpec(const std::string & s, LogicalBp & out);
     // GleamDebugger.cpp: (un)bind on DLL load/unload events. The primary
     // module identity is the real path from the event's file handle (or the
-    // loader list); the export-directory name is only an alias.
-    void bindModuleBreakpoints(uint64_t moduleBase, const std::string & primaryName);
+    // loader list); the export-directory name is only an alias. imagePath
+    // (may be null) feeds the PDB-only fallback (SymLoadModuleEx).
+    void bindModuleBreakpoints(uint64_t moduleBase, const std::string & primaryName,
+                               const wchar_t* imagePath = nullptr);
     void unbindModuleBreakpoints(uint64_t moduleBase);
     // Try to bind every pending entry whose module is already loaded
     // (system/attach breakpoint time - covers the main module, which has no
@@ -222,6 +224,8 @@ private:
     GleeBug::ptr mStepOutBpAddr = 0; // internal one-shot bp we are waiting on
     uint32_t mStepOutTid = 0;        // thread this stepout operation owns
     uint64_t mStepOutGen = 0;        // operation generation (per ret command)
+    uint64_t mStepOutBpGen = 0;      // generation of the armed internal bp
+    GleeBug::ptr mStepOutRearm = 0;  // internal bp to re-arm after the event
     void stepOutTick();                 // inspect the current instruction, act
     void stepOutFinish(const char* reason);
     void abortStepOut(const char* why); // pause/exception/detach/restart cleanup
@@ -267,6 +271,12 @@ private:
     // during the DLL load event, when EnumProcessModules/dbghelp are blind).
     std::string dllNameFromBase(uint64_t base);
     uint64_t findExportByName(uint64_t base, const std::string & name);
+    // Resolve a PDB-only symbol by explicitly loading the module's symbols
+    // from its file on disk (works during the load event; the loader list
+    // is not needed). imagePath may be null when unknown.
+    uint64_t resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol);
+    // Bases we SymLoadModuleEx'd explicitly (for SymUnloadModule64 pairing).
+    std::set<uint64_t> mSymLoadedBases;
 
     // Expr.cpp: address expression evaluation. See the grammar comment there.
     bool evalExpression(const std::string & s, uint64_t & out, std::string & err);

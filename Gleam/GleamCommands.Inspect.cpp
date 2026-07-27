@@ -452,7 +452,19 @@ void GleamDebugger::cmdReadString(uint64_t addr, uint64_t maxLen, bool utf16)
         chunk = (std::min)(chunk, pageLeft);
         chunk -= chunk % unit; // whole code units only
         if(chunk == 0)
+        {
+            // Not even one full code unit fits before the page end. With
+            // nothing read yet that is an error, not "no NUL found".
+            if(units == 0)
+            {
+                printf("cannot read string at 0x%llX\n", addr);
+                fflush(stdout);
+                return;
+            }
+            failed = true;
+            failedAt = cur;
             break;
+        }
         char buf[64];
         if(!mProcess->MemReadSafe(cur, buf, chunk))
         {

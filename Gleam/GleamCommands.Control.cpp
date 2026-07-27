@@ -599,6 +599,7 @@ void GleamDebugger::stepOutTick()
         // Only a hit at exactly this address, on the owning thread, may
         // drive the next tick.
         mStepOutBpAddr = after;
+        mStepOutBpGen = mStepOutGen;
         return;
     }
 
