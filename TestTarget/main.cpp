@@ -94,6 +94,19 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if(argc > 1 && !strcmp(argv[1], "dll3"))
+    {
+        // Load -> unload -> reload: delayed-breakpoint unbind/re-bind cycle.
+        HMODULE late = LoadLibraryW(L"Late.dll");
+        printf("LATE1=%d\n", late != nullptr);
+        if(late)
+            FreeLibrary(late);
+        printf("LATE_UNLOADED=1\n");
+        late = LoadLibraryW(L"Late.dll");
+        printf("LATE2=%d\n", late != nullptr);
+        fflush(stdout);
+    }
+
     CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 
     printf("ISDEBUGGERPRESENT=%d\n", IsDebuggerPresent() ? 1 : 0);
@@ -118,6 +131,8 @@ int main(int argc, char** argv)
     printf("LOOPER=%p\n", (void*)&looper);
     fflush(stdout);
     uint64_t r3 = looper(100000);
+    printf("LOOP_RESULT=%llu\n", (unsigned long long)r3);
+    r3 = looper(100000);
     printf("LOOP_RESULT=%llu\n", (unsigned long long)r3);
 
     // A self-write so data breakpoints have something to catch.

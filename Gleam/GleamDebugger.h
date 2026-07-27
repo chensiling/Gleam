@@ -278,6 +278,9 @@ private:
     uint64_t resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol);
     // Bases we SymLoadModuleEx'd explicitly (for SymUnloadModule64 pairing).
     std::set<uint64_t> mSymLoadedBases;
+    // Real image paths learned at DLL load events, keyed by normalized
+    // module name: later events for the same module may have hFile == NULL.
+    std::map<std::string, std::wstring> mModulePaths;
 
     // Expr.cpp: address expression evaluation. See the grammar comment there.
     bool evalExpression(const std::string & s, uint64_t & out, std::string & err);

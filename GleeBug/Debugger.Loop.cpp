@@ -225,8 +225,9 @@ namespace GleeBug
                     Registers(mThread->hThread, CONTEXT_CONTROL).TrapFlag = false;
             }
 
-            // Handle safe stepping
-            if(IsDbgReplyLaterSupported && mDebugEvent.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT)
+            // Handle safe stepping (never during a detach: no new internal
+            // suspensions may be created once we are letting the target go)
+            if(!mDetach && IsDbgReplyLaterSupported && mDebugEvent.dwDebugEventCode != EXIT_THREAD_DEBUG_EVENT)
             {
                 // If TF is set (single step), then suspend all the other threads
                 if(mThread && mThread->isInternalStepping)
@@ -260,6 +261,17 @@ namespace GleeBug
 
             if(mDetach || mDetachAndBreak)
             {
+                // Leave no debugger-owned suspension behind: clear stepping
+                // state (no future safe-step suspensions) and resume every
+                // thread the safe-step mechanism suspended this round.
+                if(mThread)
+                {
+                    mThread->isInternalStepping = false;
+                    mThread->isSingleStepping = false;
+                }
+                for(auto & itr : SuspendedThreads)
+                    ResumeThread(itr.second);
+                SuspendedThreads.clear();
                 if(!UnsafeDetach())
                     cbInternalError("Debugger::Detach failed!");
                 break;

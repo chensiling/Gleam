@@ -20,8 +20,11 @@ echo [ci] log dir: %OUT%
 
 rem ---- record the exact source state the results belong to ----
 git -C %ROOT% rev-parse HEAD > %OUT%\commit.txt
-git -C %ROOT% rev-parse HEAD^{tree} >> %OUT%\commit.txt
+if errorlevel 1 ( echo [ci] FAIL: git HEAD & exit /b 1 )
+git -C %ROOT% rev-parse "HEAD^{tree}" >> %OUT%\commit.txt
+if errorlevel 1 ( echo [ci] FAIL: git tree & exit /b 1 )
 git -C %ROOT% status --porcelain >> %OUT%\commit.txt
+if errorlevel 1 ( echo [ci] FAIL: git status & exit /b 1 )
 
 rem ---- stage 0: kill orphaned test processes (they lock the binaries) ----
 powershell -NoProfile -Command "Get-Process -Name TestTarget,ArgvTarget,BoundaryTarget,gleam -ErrorAction SilentlyContinue | Stop-Process -Force" >nul 2>&1

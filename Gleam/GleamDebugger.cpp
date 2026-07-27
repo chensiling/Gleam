@@ -346,7 +346,8 @@ void GleamDebugger::cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
         char path[MAX_PATH * 2] = "";
         if(GetFinalPathNameByHandleA(loadDll.hFile, path, sizeof(path), VOLUME_NAME_DOS))
             name = normalizeModuleName(path);
-        GetFinalPathNameByHandleW(loadDll.hFile, wpath, ARRAYSIZE(wpath), VOLUME_NAME_DOS);
+        if(GetFinalPathNameByHandleW(loadDll.hFile, wpath, ARRAYSIZE(wpath), VOLUME_NAME_DOS) && !name.empty())
+            mModulePaths[name] = wpath; // later events for this DLL may have hFile == NULL
     }
     // Logical breakpoints bind regardless of the breakon dll switch.
     bindModuleBreakpoints((uint64_t)loadDll.lpBaseOfDll, name, wpath);
@@ -395,9 +396,24 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
     for(size_t i = 0; i < mLogicalBps.size(); )
     {
         auto & lb = mLogicalBps[i];
-        if(lb.boundAddr ||
-           (lb.module != name && (alias.empty() || lb.module != alias)) ||
-           (name.empty() && alias.empty()))
+        if(lb.boundAddr)
+        {
+            i++;
+            continue;
+        }
+        bool match = (!name.empty() && lb.module == name) ||
+                     (!alias.empty() && lb.module == alias);
+        // Symbol identity fallback: the event's hFile may be NULL and the
+        // DLL may have no export name either. If a pending entry's symbol
+        // resolves at this base, this event IS its module.
+        if(!match && name.empty() && alias.empty() && !lb.symbol.empty())
+        {
+            auto foundPath = mModulePaths.find(lb.module);
+            if(foundPath != mModulePaths.end() &&
+               resolvePdbSymbol(moduleBase, foundPath->second.c_str(), lb.symbol))
+                match = true;
+        }
+        if(!match)
         {
             i++;
             continue;
@@ -409,7 +425,16 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
             if(!addr) // invade-session fallback (needs the loader list)
                 resolveModuleSymbol(lb.module + "!" + lb.symbol, addr);
             if(!addr) // PDB-only fallback: load symbols from the file itself
-                addr = resolvePdbSymbol(moduleBase, imagePath, lb.symbol);
+            {
+                const wchar_t* path = imagePath && *imagePath ? imagePath : nullptr;
+                if(!path)
+                {
+                    auto found = mModulePaths.find(lb.module);
+                    if(found != mModulePaths.end())
+                        path = found->second.c_str();
+                }
+                addr = resolvePdbSymbol(moduleBase, path, lb.symbol);
+            }
             if(!addr)
             {
                 i++;
@@ -462,10 +487,16 @@ void GleamDebugger::unbindModuleBreakpoints(uint64_t moduleBase)
     {
         if(!lb.boundAddr || lb.boundBase != moduleBase)
             continue;
-        // The DLL is still mapped while the unload event is delivered, so the
-        // engine can restore the original bytes cleanly. A one-shot entry
-        // that already fired simply fails DeleteBreakpoint - harmless.
-        mProcess->DeleteBreakpoint(lb.boundAddr);
+        // The DLL is still mapped while the unload event is delivered, but
+        // only READS are guaranteed - restoring the original byte can fail.
+        // That failure is harmless (the mapping is going away anyway), so
+        // fall back to dropping the engine bookkeeping directly, or the
+        // stale entry blocks re-binding when the module reloads.
+        if(!mProcess->DeleteBreakpoint(lb.boundAddr))
+        {
+            mProcess->breakpoints.erase({ BreakpointType::Software, lb.boundAddr });
+            mProcess->softwareBreakpointReferences.erase(lb.boundAddr);
+        }
         mBpRules.erase(lb.boundAddr);
         printf("event bp unbound module=%s address=0x%llX\n",
                lb.module.c_str(), (unsigned long long)lb.boundAddr);

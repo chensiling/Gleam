@@ -134,6 +134,10 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         Thread* thread = currentThread();
         if(!thread)
             return CmdResult::Handled;
+        // A new ret replaces any in-flight stepout: delete its internal
+        // breakpoint and both re-arm stages first, or a stale int3 (or a
+        // re-arm of the OLD operation) would leak.
+        abortStepOut("new ret");
         mStepOutActive = true;
         mStepOutSteps = 0;
         mStepOutMax = 0x40000; // every operation starts from the default
@@ -505,18 +509,19 @@ void GleamDebugger::stepOutFinish(const char* reason)
 }
 
 // Abort an in-flight stepout: remove its internal one-shot breakpoint (if
-// armed) and clear all state. Called from pause/exception/detach paths.
+// armed) and clear all state, including the two-stage re-arm fields.
+// Called from pause/exception/detach/restart paths and before a new ret.
 void GleamDebugger::abortStepOut(const char* why)
 {
-    if(!mStepOutActive)
+    if(!mStepOutActive && !mStepOutRearmPending && !mStepOutRearm)
         return;
     if(mStepOutBpAddr && mProcess)
-    {
         mProcess->DeleteBreakpoint(mStepOutBpAddr);
-        mStepOutBpAddr = 0;
-    }
+    mStepOutBpAddr = 0;
     mStepOutActive = false;
     mStepOutPending = false;
+    mStepOutRearmPending = 0;
+    mStepOutRearm = 0;
     printf("stepout aborted (%s)\n", why);
     fflush(stdout);
 }

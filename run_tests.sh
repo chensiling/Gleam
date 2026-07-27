@@ -616,6 +616,7 @@ bp TestTarget!looper
 g
 ret 1000
 g
+g
 EOF
 chk "T5c: maxreached at limit"   ${TDIR}/gleam_T5c.txt "stop reason=stepout maxreached steps=4096"
 chk "T5c: loop result correct"   ${TDIR}/gleam_T5c.txt "LOOP_RESULT=4999950000"
@@ -930,7 +931,7 @@ chk "V3: slot decoded"           ${TDIR}/gleam_V3.txt "raw-hardware slot=0"
 # V4a: baseline handle count. The pause is sent DELAYED (S4-style), while
 # the target runs free after the marker breakpoint - a deferred pause sent
 # at the system stop can be lost while break-in symbols are unresolved.
-( printf "bp $MARKER\ng\n"; sleep 2; printf 'pause\n'; sleep 7; printf 'detach\n' ) | timeout 60 "$GLEAM" "$TARGET" > "${TDIR}/gleam_V4a.txt" 2>&1 &
+( printf "bp $MARKER\ng\ng\n"; sleep 2; printf 'pause\n'; sleep 7; printf 'detach\n' ) | timeout 60 "$GLEAM" "$TARGET" > "${TDIR}/gleam_V4a.txt" 2>&1 &
 V4APID=$!
 sleep 6
 HC0=$(powershell -NoProfile -Command "(Get-Process -Name gleam -ErrorAction SilentlyContinue).HandleCount")
@@ -1135,6 +1136,81 @@ if [ -n "$B1" ] && [ -n "$L1" ] && [ "$B1" -lt "$L1" ]; then
 else
   bad "W7b: session2 bind order ($B1 vs $L1)"
 fi
+
+# --- V4e: runtime pause -> detach must not leak suspended threads ---
+echo "== V4e =="
+V4EOK=0
+for i in $(seq 1 30); do
+  out=$(( printf 'bp TestTarget!looper\ng\nret 100000\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 "$GLEAM" "$TARGET" 2>&1)
+  ec=$?
+  n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
+  TPID=$(printf '%s' "$out" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+  # gleam has exited; the detached target must COMPLETE on its own (a
+  # thread left suspended would keep it alive forever).
+  done_ok=0
+  for w in 1 2 3 4 5; do
+    alive=$(powershell -NoProfile -Command "if(Get-Process -Id $TPID -ErrorAction SilentlyContinue) { 1 }" 2>/dev/null)
+    [ -z "$alive" ] && { done_ok=1; break; }
+    sleep 1
+  done
+  if [ $ec -eq 0 ] && [ "$n" -eq 1 ] && [ "$done_ok" -eq 1 ]; then
+    V4EOK=$((V4EOK+1))
+  else
+    printf '%s' "$out" > ${TDIR}/gleam_V4e_fail_$i.txt
+  fi
+  echo "iter=$i ec=$ec pause=$n done=$done_ok" >> "${TDIR}/pressure.log"
+done
+if [ "$V4EOK" -eq 30 ]; then
+  ok "V4e: 30/30 runtime pause->detach, target completes"
+else
+  bad "V4e: $V4EOK/30 runtime pause->detach"
+fi
+
+# --- W10: new ret after abort leaves no stale internal bp ---
+( printf 'bp TestTarget!looper\ng\nret 100000\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'bl\ng\nret 1000000\ng\nquit\n' ) | timeout 60 "$GLEAM" "$TARGET" > ${TDIR}/gleam_W10.txt 2>&1
+ec=$?
+echo "== W10 =="
+if [ $ec -ne 0 ]; then bad "W10: abnormal exit (code $ec)"; fi
+chk "W10: aborted on pause"        ${TDIR}/gleam_W10.txt "stepout aborted (pause)"
+chkcount "W10: no stale once bp"   ${TDIR}/gleam_W10.txt " once" 0
+chk "W10: new ret completes"       ${TDIR}/gleam_W10.txt "stop reason=stepout return"
+
+# --- W11: delayed bp unbind/re-bind across unload/reload ---
+run W11 "dll3" <<EOF
+bp Late!LateInternal
+g
+g
+g
+quit
+EOF
+chkcount "W11: bound twice"        ${TDIR}/gleam_W11.txt "event bp bound module=late" 2
+chk "W11: unbound on unload"       ${TDIR}/gleam_W11.txt "event bp unbound module=late"
+chkcount "W11: hit both instances" ${TDIR}/gleam_W11.txt "stop reason=breakpoint type=software" 2
+run W11b "dll3" <<EOF
+bp Late!NoSuchSymbol
+g
+quit
+EOF
+chkcount "W11b: bogus never binds" ${TDIR}/gleam_W11b.txt "event bp bound module=late" 0
+chk "W11b: session still clean"    ${TDIR}/gleam_W11b.txt "stop reason=exit"
+
+# --- W13: UTF-16 boundary matrix (P0-5) ---
+timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W13.txt 2>&1 <<EOF
+g
+read utf16 602FFFFF 2
+read utf16 602FFFFE 2
+read utf16 60000001 2
+write 60000000 3D D8 00 DE 00 00
+read utf16 60000000 4
+quit
+EOF
+ec=$?
+echo "== W13 =="
+if [ $ec -ne 0 ]; then bad "W13: abnormal exit (code $ec)"; fi
+chk "W13: unreadable next page -> error" ${TDIR}/gleam_W13.txt "cannot read string at 0x602FFFFF"
+chk "W13: prefix then partial"           ${TDIR}/gleam_W13.txt "(partial: read failed at 0x60300000)"
+chk "W13: odd address reads"             ${TDIR}/gleam_W13.txt "string at 0x60000001"
+chk "W13: surrogate pair"                ${TDIR}/gleam_W13.txt "😀"
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF
