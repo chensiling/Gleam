@@ -51,6 +51,31 @@ static DWORD WINAPI worker(LPVOID)
     return 0;
 }
 
+// "mtx" mode: a thread that never returns from its callee. stepout arms its
+// call-skip breakpoint after "call exitCallee" and resumes at full speed, but
+// the callee calls ExitThread - so the OWNER thread dies while the internal
+// breakpoint is still armed (the owner-exit abort path).
+__declspec(noinline) uint64_t exitCallee(uint64_t x)
+{
+    volatile uint64_t k = x;
+    if(k)
+        ExitThread(0);
+    return k;
+}
+
+__declspec(noinline) uint64_t exiter(uint64_t x)
+{
+    volatile uint64_t k = x;
+    k = exitCallee(k) + 1;
+    return k;
+}
+
+static DWORD WINAPI exitWorker(LPVOID)
+{
+    exiter(1);
+    return 0;
+}
+
 // "mt" mode: hammer marker() so stepout's internal call-skip breakpoint
 // gets hit by this (non-owner) thread while the main thread stepouts.
 static DWORD WINAPI busyWorker(LPVOID)
@@ -146,6 +171,22 @@ int main(int argc, char** argv)
         printf("DECOY_LOADED=%d\n", decoy != nullptr);
         late = LoadLibraryW(L"Late.dll");
         printf("LATE2=%d\n", late != nullptr);
+        fflush(stdout);
+    }
+
+    if(argc > 1 && !strcmp(argv[1], "mtx"))
+    {
+        // Owner-exit scenario: stepout on this thread, which dies inside its
+        // callee while the internal call-skip breakpoint is still armed.
+        printf("EXITER=%p\n", (void*)&exiter);
+        fflush(stdout);
+        HANDLE h = CreateThread(nullptr, 0, exitWorker, nullptr, 0, nullptr);
+        if(h)
+        {
+            WaitForSingleObject(h, 10000);
+            CloseHandle(h);
+        }
+        printf("EXITER_DONE=1\n");
         fflush(stdout);
     }
 

@@ -35,7 +35,14 @@ namespace GleeBug
             szCreateWithCmdLine = new wchar_t[size];
             swprintf_s(szCreateWithCmdLine, size, L"\"%s\" %s", szFilePath, szCommandLine);
             szCommandLineCreateProcess = szCreateWithCmdLine;
-            szFileNameCreateProcess = nullptr;
+            // Keep the application name explicit even with a command line: when
+            // it is null, CreateProcessW parses the path out of the command line
+            // itself and rejects relative paths written with forward slashes
+            // ("bin/x/t.exe arg" fails while the same launch without arguments
+            // succeeds). argv[0] still comes from the command line, so the
+            // debuggee sees exactly what it saw before. The no-ASLR hollowing
+            // path below also needs a real path here.
+            szFileNameCreateProcess = szFilePath;
         }
 
         auto creationFlags = DEBUG_PROCESS;

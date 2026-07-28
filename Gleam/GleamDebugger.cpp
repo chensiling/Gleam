@@ -544,9 +544,21 @@ void GleamDebugger::resetTransientState()
     mStepArmed = false;
     mStepOverArmed = false;
     mTraceActive = false;
+    // Every PER-OPERATION stepout field returns to its initial value. The old
+    // process is gone, so there is no int3 left to delete - only bookkeeping.
+    // mStepOutGen is deliberately NOT reset: it is a monotonic counter, and
+    // keeping it monotonic across sessions is what makes a stale generation
+    // impossible to mistake for the current one.
     mStepOutActive = false;
     mStepOutPending = false;
+    mStepOutSteps = 0;
+    mStepOutMax = 0x40000;
     mStepOutBpAddr = 0;
+    mStepOutBpOurs = false;
+    mStepOutTid = 0;
+    mStepOutBpGen = 0;
+    mStepOutRearmPending = 0;
+    mStepOutRearm = 0;
     mIgnoreHits.clear();
     mBpRules.clear();
     mPdataCache.clear();
@@ -600,8 +612,67 @@ void GleamDebugger::cbAttachBreakpoint()
     mWantsPause = true;
 }
 
+// Internal (stepout) breakpoint bookkeeping for a breakpoint hit.
+//
+// This MUST run before any user-visible state handling. The engine deletes a
+// one-shot breakpoint after this callback returns no matter which path the
+// callback took, so an early return (ignore counts, conditional rules) before
+// this point would leave mStepOutActive set while the physical int3 is gone -
+// the operation would then wait forever and the target runs to exit.
+//
+// Returns true when the OWNER consumed the hit: a tick was already driven and
+// the event must not surface as a user stop.
+bool GleamDebugger::handleStepOutBreakpoint(const BreakpointInfo & info)
+{
+    if(!mStepOutActive || !info.singleshoot || mStepOutBpAddr == 0 ||
+       info.address != mStepOutBpAddr)
+        return false;
+
+    // ANY hit at that address costs us the right to delete it: the engine
+    // deletes the one-shot after this callback, so from here on the address
+    // may carry a USER breakpoint instead. Clear ownership before branching,
+    // so no path can leave a stale delete right behind.
+    mStepOutBpOurs = false;
+
+    // Owner thread, owning generation: drive the next tick.
+    if(mDebugEvent.dwThreadId == mStepOutTid && mStepOutBpGen == mStepOutGen)
+    {
+        mStepOutBpAddr = 0;
+        stepOutTick();
+        return true;
+    }
+
+    // Another thread tripped the internal breakpoint at that address. The
+    // engine restores the original byte and re-executes it with an internal
+    // step AFTER this event, so arming a replacement now would make the
+    // non-owner trip it again. Two-stage: register here, arm at the NEXT
+    // event (cbPostDebugEvent). The hit surfaces as a normal stop.
+    if(mDebugEvent.dwThreadId != mStepOutTid)
+    {
+        mStepOutRearmPending = mStepOutBpAddr;
+        printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
+               mDebugEvent.dwThreadId);
+        fflush(stdout);
+        return false;
+    }
+
+    // Owner thread but a stale generation (defensive: a new operation always
+    // aborts the old one, which clears mStepOutBpAddr). The physical int3 is
+    // gone either way, so stop waiting on it instead of stranding the
+    // operation on a dead address; the hit surfaces as a normal stop.
+    mStepOutBpAddr = 0;
+    return false;
+}
+
 void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
 {
+    // stepout bookkeeping FIRST: the engine consumes the one-shot breakpoint
+    // regardless of how this callback exits, so ownership hand-off, tick
+    // advancement and deferred re-arming must not sit behind a user-state
+    // early return (ignore counts, conditional rules).
+    if(handleStepOutBreakpoint(info))
+        return;
+
     // Snapshot per-breakpoint state up front. One-shot hits must not leak
     // rules or ignore counts into a later breakpoint at the same address,
     // regardless of which exit path this callback takes.
@@ -648,34 +719,6 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
                (unsigned long long)info.address, ignoreLeft - 1);
         fflush(stdout);
         return;
-    }
-
-    // stepout engine: only the internal one-shot breakpoint at the exact
-    // recorded address, on the owning thread, in the owning generation,
-    // may drive the next tick.
-    if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
-       info.address == mStepOutBpAddr && mDebugEvent.dwThreadId == mStepOutTid &&
-       mStepOutBpGen == mStepOutGen)
-    {
-        mStepOutBpAddr = 0;
-        mStepOutBpOurs = false; // the engine consumed our one-shot
-        stepOutTick();
-        return;
-    }
-    // Another thread tripped the internal breakpoint at that address. The
-    // engine restores the original byte and re-executes it with an internal
-    // step AFTER this event, so arming a replacement now would make the
-    // non-owner trip it again. Two-stage: register here, arm at the NEXT
-    // event (cbPostDebugEvent). The hit surfaces as a normal stop.
-    if(mStepOutActive && info.singleshoot && mStepOutBpAddr != 0 &&
-       info.address == mStepOutBpAddr && mDebugEvent.dwThreadId != mStepOutTid)
-    {
-        mStepOutRearmPending = mStepOutBpAddr;
-        mStepOutBpOurs = false; // consumed by the non-owner hit
-        printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
-               mDebugEvent.dwThreadId);
-        fflush(stdout);
-        // fall through to normal reporting
     }
 
     // Conditional breakpoints, tracepoints and "do" commands may suppress

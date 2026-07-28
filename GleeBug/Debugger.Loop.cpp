@@ -34,18 +34,36 @@ namespace GleeBug
         std::unordered_set<uint64_t> DeferredExceptionThreads;
         bool IsDbgReplyLaterSupported = false;
 
-        // Unified suspension cleanup: every loop exit (detach, error break,
-        // natural end) must leave zero debugger-owned suspend counts behind.
-        // A failed ResumeThread is reported, never silently dropped.
-        const auto cleanupSuspensions = [this, &SuspendedThreads]()
+        // Single checked resume path for debugger-owned suspensions. Every site
+        // that ends an internal step (single-step arrival, owner thread exiting,
+        // detach, error break, natural loop end) goes through here so a failed
+        // ResumeThread is reported with tid + error code, never silently dropped
+        // leaving the target frozen.
+        //
+        // An entry holds the system-supplied thread handle from the debug event,
+        // which is only valid while the thread is still known to us: the system
+        // closes it once we continue past that thread's EXIT_THREAD, and all of
+        // a process's handles once we continue past its EXIT_PROCESS. Entries
+        // for threads we have already buried are therefore DISCARDED, not
+        // resumed - there is nothing left to unfreeze, and resuming would fail
+        // with ERROR_INVALID_HANDLE and report a bogus internal error on every
+        // normal teardown.
+        const auto resumeSuspendedThreads = [this, &SuspendedThreads, &ThreadBeingProcessed]()
         {
-            if(mThread)
-            {
-                mThread->isInternalStepping = false;
-                mThread->isSingleStepping = false;
-            }
             for(auto & itr : SuspendedThreads)
             {
+                bool stillKnown = false;
+                for(const auto & process : mProcesses)
+                {
+                    if(process.second->threads.count(itr.first) != 0)
+                    {
+                        stillKnown = true;
+                        break;
+                    }
+                }
+                if(!stillKnown)
+                    continue;
+
                 if(ResumeThread(itr.second) == (DWORD)-1)
                 {
                     char buf[128];
@@ -55,6 +73,21 @@ namespace GleeBug
                 }
             }
             SuspendedThreads.clear();
+            ThreadBeingProcessed = 0;
+        };
+
+        // Unified suspension cleanup for loop exits (detach, error break,
+        // natural end): resume everything, then drop the stepping flags so no
+        // trap flag survives us. Mid-loop resume sites must NOT use this - they
+        // still need isInternalStepping for the pending exceptionEvent dispatch.
+        const auto cleanupSuspensions = [this, &resumeSuspendedThreads]()
+        {
+            if(mThread)
+            {
+                mThread->isInternalStepping = false;
+                mThread->isSingleStepping = false;
+            }
+            resumeSuspendedThreads();
         };
 
         // Check if DBG_REPLY_LATER is supported based on Windows version (Windows 10, version 1507 or above)
@@ -130,12 +163,9 @@ namespace GleeBug
                 {
                     if(ThreadBeingProcessed != 0 && mDebugEvent.dwThreadId == ThreadBeingProcessed)
                     {
-                        // Resume the other threads since the thread being processed is exiting
-                        for(auto & itr : SuspendedThreads)
-                            ResumeThread(itr.second);
-
-                        SuspendedThreads.clear();
-                        ThreadBeingProcessed = 0;
+                        // Resume the other threads since the thread being processed
+                        // is exiting (checked resume: a failure is reported).
+                        resumeSuspendedThreads();
                     }
                 }
             }
@@ -210,12 +240,11 @@ namespace GleeBug
             case EXCEPTION_DEBUG_EVENT:
                 if(IsDbgReplyLaterSupported && mDebugEvent.u.Exception.ExceptionRecord.ExceptionCode == STATUS_SINGLE_STEP)
                 {
-                    // Resume the other threads since we are done processing the single step
-                    for(auto & itr : SuspendedThreads)
-                        ResumeThread(itr.second);
-
-                    SuspendedThreads.clear();
-                    ThreadBeingProcessed = 0;
+                    // Resume the other threads since we are done processing the
+                    // single step (checked resume: a failure is reported). The
+                    // stepping flags must survive here - exceptionEvent() below
+                    // still needs isInternalStepping to classify this event.
+                    resumeSuspendedThreads();
                 }
                 exceptionEvent(mDebugEvent.u.Exception);
                 break;

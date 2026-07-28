@@ -1200,24 +1200,8 @@ chkcount "W11b: bogus never binds" ${TDIR}/gleam_W11b.txt "event bp bound module
 chk "W11b: session still clean"    ${TDIR}/gleam_W11b.txt "stop reason=exit"
 
 # --- W13: UTF-16 boundary matrix (P0-5) ---
-timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W13.txt 2>&1 <<EOF
-g
-read utf16 602FFFFF 2
-read utf16 602FFFFE 2
-read utf16 60000001 2
-write 60000000 3D D8 00 DE 00 00
-read utf16 60000000 4
-quit
-EOF
-ec=$?
-echo "== W13 =="
-if [ $ec -ne 0 ]; then bad "W13: abnormal exit (code $ec)"; fi
-chk "W13: unreadable next page -> error" ${TDIR}/gleam_W13.txt "cannot read string at 0x602FFFFF"
-chk "W13: prefix then partial"           ${TDIR}/gleam_W13.txt "(partial: read failed at 0x60300000)"
-chk "W13: odd address reads"             ${TDIR}/gleam_W13.txt "string at 0x60000001"
-chk "W13: surrogate pair"                ${TDIR}/gleam_W13.txt "😀"
-
-# --- W13: UTF-16 boundary matrix (P0-5) ---
+# Single block: the full matrix. An earlier, shorter duplicate wrote the same
+# log file and was overwritten by this one - assertions must count once.
 timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W13.txt 2>&1 <<EOF
 g
 read utf16 602FFFFF 2
@@ -1245,11 +1229,14 @@ chk "W13: noaccess -> error"             ${TDIR}/gleam_W13.txt "cannot read stri
 chkcount "W13: restored -> readable"     ${TDIR}/gleam_W13.txt "string at 0x60000FFF = " 1
 
 # --- W14: stepout internal bp hit by a non-owner thread (S0-1) ---
+# Per-iteration verdict: every run must show ec=0 AND at least one non-owner
+# hit AND exactly one stepout return AND exactly one normal exit. Counting the
+# two kinds of evidence separately across runs would pass even if no single
+# run ever both saw a non-owner hit and completed.
 echo "== W14 =="
-W14HITS=0
-W14RET=0
+W14OK=0
 for i in $(seq 1 10); do
-  timeout 30 "$GLEAM" "$TARGET" mt > ${TDIR}/gleam_W14_$i.txt 2>&1 <<EOF
+  timeout 30 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14_$i.txt 2>&1 <<EOF
 bp TestTarget!marker once
 g
 ret
@@ -1271,31 +1258,317 @@ g
 g
 quit
 EOF
-  n=$(grep -c "hit by non-owner" ${TDIR}/gleam_W14_$i.txt)
-  r=$(grep -c "stop reason=stepout return" ${TDIR}/gleam_W14_$i.txt)
-  W14HITS=$((W14HITS+n))
-  W14RET=$((W14RET+r))
-  echo "iter=$i nonowner=$n stepoutret=$r" >> "${TDIR}/pressure.log"
+  ec=$?
+  n=$(grep -cF "hit by non-owner" ${TDIR}/gleam_W14_$i.txt)
+  r=$(grep -cF "stop reason=stepout return" ${TDIR}/gleam_W14_$i.txt)
+  x=$(grep -cF "stop reason=exit code=0x00000000" ${TDIR}/gleam_W14_$i.txt)
+  if [ $ec -eq 0 ] && [ "$n" -ge 1 ] && [ "$r" -eq 1 ] && [ "$x" -eq 1 ]; then
+    W14OK=$((W14OK+1))
+  else
+    cp ${TDIR}/gleam_W14_$i.txt ${TDIR}/gleam_W14_fail_$i.txt
+  fi
+  echo "W14 iter=$i ec=$ec nonowner=$n stepoutret=$r exit=$x" >> "${TDIR}/pressure.log"
 done
-if [ "$W14HITS" -ge 1 ]; then ok "W14: non-owner hit observed ($W14HITS/10)"; else bad "W14: no non-owner hit in 10 runs"; fi
-if [ "$W14RET" -ge 1 ]; then ok "W14: stepout completes after non-owner ($W14RET/10)"; else bad "W14: stepout never completed"; fi
+if [ "$W14OK" -eq 10 ]; then
+  ok "W14: 10/10 runs ec=0 + non-owner>=1 + exactly 1 return + clean exit"
+else
+  bad "W14: $W14OK/10 runs fully clean (see ${TDIR}/gleam_W14_fail_*.txt)"
+fi
 if grep -qE "stop reason=step " ${TDIR}/gleam_W14_*.txt; then
   bad "W14: spurious stop reason=step after abort"
 else
   ok "W14: no spurious step stops"
 fi
 
+# --- W14b: what may follow a non-owner stop (execution-control matrix) ---
+# At a non-owner stop the old stepout is still active with a deferred re-arm.
+# Each follow-up command must either complete it or abort it through the one
+# entry point - never leave a stale internal bp or emit a phantom step stop.
+# ec=0 for every case: a hang or crash here must not count as a pass.
+w14b() { # w14b <tag> <follow-up commands...>
+  local tag=$1; shift
+  local f=${TDIR}/gleam_W14b_$tag.txt
+  { printf 'bp TestTarget!marker once\ng\nret\n'
+    printf '%s\n' "$@"
+    printf 'bl\nquit\n'; } | timeout 40 "$GLEAM" $TARGET mt > $f 2>&1
+  local ec=$?
+  if [ $ec -ne 0 ]; then bad "W14b/$tag: abnormal exit (code $ec; see $f)"; return; fi
+  if grep -qF "hit by non-owner" $f; then
+    ok "W14b/$tag: reached a non-owner stop"
+  else
+    bad "W14b/$tag: no non-owner stop reached (see $f)"
+    return
+  fi
+  # No internal one-shot may outlive the operation: bl prints "once" for
+  # single-shot breakpoints, and the user bp in this scenario is "once" too -
+  # it is consumed at the first hit, well before these follow-ups.
+  if grep -qF " once" $f; then
+    bad "W14b/$tag: leftover one-shot breakpoint in bl (see $f)"
+  else
+    ok "W14b/$tag: no leftover internal bp"
+  fi
+}
+echo "== W14b =="
+w14b g        "g"
+w14b step     "step"
+w14b stepover "stepover"
+w14b tgo      "tgo rax!=0 100"
+w14b until    "until TestTarget!looper"
+w14b newret   "ret"
+# Aborting the old stepout must not delete a USER breakpoint - not the normal
+# one that happens to sit at the internal one-shot's own address, and not an
+# unrelated one-shot.
+#
+# The bp address matters. At a non-owner stop rip IS the call-skip address, so
+# a one-shot placed there is legitimately consumed by the following step's own
+# hit - "gone from bl" would then be correct behaviour and the assertion could
+# not tell that apart from a wrong delete. A one-shot is therefore placed at an
+# address the single step cannot reach (inner, called later), while the shared-
+# address case is covered by the normal bp, which no hit can consume.
+w14b_user() { # w14b_user <tag> <bp-addr> <bp-suffix>
+  local tag=$1; local addr=$2; local suffix=$3
+  local f=${TDIR}/gleam_W14c_$tag.txt
+  { printf 'bp TestTarget!marker once\ng\nret\n'
+    printf 'bp %s %s\nbl\nstep\nbl\nquit\n' "$addr" "$suffix"; } |
+    timeout 40 "$GLEAM" $TARGET mt > $f 2>&1
+  local ec=$?
+  if [ $ec -ne 0 ]; then bad "W14c/$tag: abnormal exit (code $ec; see $f)"; return; fi
+  if ! grep -qF "hit by non-owner" $f; then
+    bad "W14c/$tag: no non-owner stop reached (see $f)"
+    return
+  fi
+  # The abort happens between the two bl listings, so the user bp must appear
+  # in both. And it must not have been consumed by a hit in between either -
+  # that would make "listed twice" unreachable for the one-shot case anyway.
+  local n=$(grep -cF "0x$addr  software" $f)
+  if [ "$n" -eq 2 ]; then
+    ok "W14c/$tag: user bp survives the stepout abort"
+  else
+    bad "W14c/$tag: user bp listings=$n, want 2 (see $f)"
+  fi
+}
+echo "== W14c =="
+w14b_user shared "$MCALLNEXT" ""
+w14b_user once   "$INNER"     "once"
+
+# --- W14d: teardown paths at a non-owner stop (quit / restart / owner exit) ---
+# quit and restart must go through the SAME abort entry point as pause and
+# detach; the old operation may not re-arm, print or delete anything after it.
+echo "== W14d =="
+printf 'bp TestTarget!marker once\ng\nret\nquit\n' |
+  timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14d_quit.txt 2>&1
+ec=$?
+if [ $ec -ne 0 ]; then bad "W14d/quit: abnormal exit (code $ec)"; fi
+chk      "W14d/quit: non-owner stop reached" ${TDIR}/gleam_W14d_quit.txt "hit by non-owner"
+chkcount "W14d/quit: single unified abort"   ${TDIR}/gleam_W14d_quit.txt "stepout aborted (quit)" 1
+chkcount "W14d/quit: no re-arm after abort"  ${TDIR}/gleam_W14d_quit.txt "stepout internal bp re-armed" 0
+
+printf 'bp TestTarget!marker once\ng\nret\nrestart\nbl\ng\nquit\n' |
+  timeout 60 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14d_restart.txt 2>&1
+ec=$?
+if [ $ec -ne 0 ]; then bad "W14d/restart: abnormal exit (code $ec)"; fi
+chk      "W14d/restart: non-owner stop reached" ${TDIR}/gleam_W14d_restart.txt "hit by non-owner"
+chkcount "W14d/restart: single unified abort"   ${TDIR}/gleam_W14d_restart.txt "stepout aborted (restart)" 1
+# The new session starts from clean per-operation state: no stepout output, no
+# leftover breakpoint, and the target completes normally.
+chk      "W14d/restart: new session clean bl"   ${TDIR}/gleam_W14d_restart.txt "no breakpoints"
+chkcount "W14d/restart: no stale stepout stop"  ${TDIR}/gleam_W14d_restart.txt "stop reason=stepout" 0
+chk      "W14d/restart: target completes"       ${TDIR}/gleam_W14d_restart.txt "MARKER_RESULT_2=13"
+
+# Owner thread dies inside the callee while the internal bp is armed (mtx).
+printf 'bp TestTarget!exiter once\ng\nret\ng\nquit\n' |
+  timeout 40 "$GLEAM" $TARGET mtx > ${TDIR}/gleam_W14d_ownerexit.txt 2>&1
+ec=$?
+if [ $ec -ne 0 ]; then bad "W14d/ownerexit: abnormal exit (code $ec)"; fi
+chkcount "W14d/ownerexit: aborted on thread exit" ${TDIR}/gleam_W14d_ownerexit.txt "stepout aborted (thread exit)" 1
+chkcount "W14d/ownerexit: no phantom step stop"   ${TDIR}/gleam_W14d_ownerexit.txt "stop reason=step " 0
+chk      "W14d/ownerexit: target completes"       ${TDIR}/gleam_W14d_ownerexit.txt "EXITER_DONE=1"
+chk      "W14d/ownerexit: clean exit"             ${TDIR}/gleam_W14d_ownerexit.txt "stop reason=exit code=0x00000000"
+
 # --- W15: module identity via CodeView GUID (P0-4) ---
-run W15 "dll4" <<EOF
+# The bind log always prints the LOGICAL module name ("late"), so grepping for
+# "module=noexp" can never catch a mis-bind. Nor is an address-range test alone
+# enough: the decoy REUSES the base Late#1 just freed, so Late#1's legitimate
+# bind address also lies inside NoExp's range. The assertion must therefore be
+# ordered - a bind prints during the load event that produced it, immediately
+# before that event's stop line, so each bind pairs with exactly one load:
+#   load Late#1 -> bind | unload Late#1 -> unbind | load NoExp -> MUST NOT bind
+#   | load Late#2 -> bind
+# We record the real bases/ranges of all three images and prove: 2 binds total,
+# one paired with each Late load, ZERO paired with the decoy load, the two Late
+# bases differ, and no bind/hit that exists while the decoy is loaded falls in
+# the decoy's range.
+W15F=${TDIR}/gleam_W15.txt
+timeout 60 "$GLEAM" $TARGET dll4 > $W15F 2>&1 <<EOF
 bp Late!LateInternal
+breakon dll on
 g
+modules
 g
+modules
+g
+modules
+g
+modules
+g
+modules
+g
+modules
+g
+modules
+g
+modules
 selftest
 quit
 EOF
-chkcount "W15: no decoy binding"   ${TDIR}/gleam_W15.txt "event bp bound module=noexp" 0
-chk "W15: late binds twice"        ${TDIR}/gleam_W15.txt "event bp bound module=late"
-chk "W15: identity selftest"       ${TDIR}/gleam_W15.txt "selftest modid 2/2 ok"
+ec=$?
+echo "== W15 =="
+if [ $ec -ne 0 ]; then bad "W15: abnormal exit (code $ec; see $W15F)"; fi
+
+# Single pass over the log. A bind prints during the load event that produced
+# it (immediately before that event's stop line), so pending-bind -> next load
+# is an exact pairing. Image names come from the modules snapshots: the loader
+# list lags one event, and a base is named by the FIRST snapshot after its own
+# load - which is what disambiguates the decoy reusing Late#1's address.
+W15_EV=$(awk '
+  function h2d(s, i, c, n, d) {
+    s = toupper(s); n = 0
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1); d = index("0123456789ABCDEF", c) - 1
+      if (d < 0) return -1
+      n = n * 16 + d
+    }
+    return n
+  }
+  function hx(s) { sub(/^0x/, "", s); sub(/^0+/, "", s); if (s == "") s = "0"; return toupper(s) }
+  /^event bp bound module=late address=0x/ {
+    a = $0; sub(/.*address=/, "", a); sub(/ .*/, "", a)
+    binds++; bindAddr[binds] = hx(a); pending = binds; next
+  }
+  /^stop reason=dll op=load base=0x/ {
+    b = $0; sub(/.*base=/, "", b); sub(/ .*/, "", b)
+    loads++; loadBase[loads] = hx(b); loadName[loads] = ""; loadBind[loads] = 0
+    if (pending) { loadBind[loads] = pending; bindLoad[pending] = loads; pending = 0 }
+    next
+  }
+  NF == 3 && $1 ~ /^[0-9A-F]+$/ && $2 ~ /^[0-9A-F]+$/ {
+    b = hx($1)
+    for (i = 1; i <= loads; i++)
+      if (loadName[i] == "" && loadBase[i] == b) { loadName[i] = $3; loadSize[i] = hx($2) }
+    next
+  }
+  /^stop reason=breakpoint type=software address=0x/ {
+    a = $0; sub(/.*address=/, "", a); sub(/ .*/, "", a)
+    hits++; hitAddr[hits] = hx(a); hitLoad[hits] = loads; next
+  }
+  END {
+    latePairs = 0; decoyPairs = 0; decoyIdx = 0
+    for (i = 1; i <= loads; i++) {
+      if (loadName[i] == "Late.dll") {
+        if (loadBind[i]) latePairs++
+        if (!(loadBase[i] in lateBase)) { lateBase[loadBase[i]] = 1; lateBases++ }
+      }
+      if (loadName[i] == "NoExp.dll") {
+        if (loadBind[i]) decoyPairs++
+        if (!decoyIdx) { decoyIdx = i; dBase = h2d(loadBase[i]); dSize = h2d(loadSize[i]) }
+      }
+    }
+    # Binds/hits that exist while the decoy is loaded must not fall in its range.
+    bindInDecoy = 0; hitInDecoy = 0
+    if (decoyIdx) {
+      for (i = 1; i <= binds; i++) {
+        a = h2d(bindAddr[i])
+        if (bindLoad[i] >= decoyIdx && a >= dBase && a < dBase + dSize) bindInDecoy++
+      }
+      for (i = 1; i <= hits; i++) {
+        a = h2d(hitAddr[i])
+        if (hitLoad[i] >= decoyIdx && a >= dBase && a < dBase + dSize) hitInDecoy++
+      }
+    }
+    # Every hit must be at one of the bound addresses, and every bind hit once.
+    match_ok = (binds == hits) ? 1 : 0
+    for (i = 1; i <= binds; i++) {
+      n = 0
+      for (j = 1; j <= hits; j++) if (hitAddr[j] == bindAddr[i]) n++
+      if (n != 1) match_ok = 0
+    }
+    # Was the decoy image actually identified (base AND size)? Without this the
+    # two "zero inside the decoy range" checks would pass vacuously.
+    decoyFound = (decoyIdx && dSize > 0) ? 1 : 0
+    printf "%d %d %d %d %d %d %d %d %d\n",
+           binds, latePairs, decoyPairs, lateBases, bindInDecoy, hitInDecoy, hits,
+           match_ok, decoyFound
+    for (i = 1; i <= loads; i++)
+      printf "W15 load#%d base=%s name=%s size=%s bind=%s\n", i, loadBase[i],
+             loadName[i] == "" ? "?" : loadName[i],
+             loadSize[i] == "" ? "?" : loadSize[i],
+             loadBind[i] ? bindAddr[loadBind[i]] : "-" > "/dev/stderr"
+  }
+' "$W15F" 2>>"${TDIR}/pressure.log")
+read W15_BIND_N W15_LATEPAIRS W15_DECOYPAIRS W15_LATE_N W15_BINDINDECOY \
+     W15_HITINDECOY W15_HIT_N W15_HITSMATCH W15_DECOYFOUND <<EOT
+$W15_EV
+EOT
+
+# The decoy must have been identified by name AND size, otherwise the two
+# "nothing inside the decoy range" checks below would pass without testing
+# anything, and "zero binds at the NoExp load event" would be vacuous too.
+if [ "${W15_DECOYFOUND:-0}" -eq 1 ]; then
+  ok "W15: decoy image identified in the loader snapshots"
+else
+  bad "W15: NoExp.dll not identified by the parser (see ${TDIR}/pressure.log)"
+fi
+
+# Two Late loads at two DIFFERENT bases: the reload scenario only proves
+# something if the second load did not land back on the first base.
+if [ "${W15_LATE_N:-0}" -eq 2 ]; then
+  ok "W15: two distinct Late image bases observed"
+else
+  bad "W15: distinct Late bases=${W15_LATE_N:-0}, want 2 (see $W15F)"
+fi
+# Exactly two binds, no more: an extra bind means a wrong image was accepted.
+if [ "${W15_BIND_N:-0}" -eq 2 ]; then
+  ok "W15: exactly 2 binds"
+else
+  bad "W15: binds=${W15_BIND_N:-0}, want 2 (see $W15F)"
+fi
+# Both binds paired with a Late.dll LOAD event - the pairing is by event order,
+# not by address, so the decoy reusing Late#1's freed base cannot mask a
+# mis-bind (and cannot frame a correct one either).
+if [ "${W15_LATEPAIRS:-0}" -eq 2 ]; then
+  ok "W15: both binds paired with a Late load event"
+else
+  bad "W15: binds paired with Late loads=${W15_LATEPAIRS:-0}, want 2 (see $W15F)"
+fi
+# The decisive one: no bind may be attributed to the decoy's load event.
+if [ "${W15_DECOYPAIRS:-0}" -eq 0 ]; then
+  ok "W15: zero binds at the NoExp load event"
+else
+  bad "W15: ${W15_DECOYPAIRS} bind(s) at the NoExp load (see $W15F)"
+fi
+# Nothing bound or hit inside the decoy's live range while it is loaded.
+if [ "${W15_BINDINDECOY:-1}" -eq 0 ]; then
+  ok "W15: zero binds inside the live NoExp range"
+else
+  bad "W15: ${W15_BINDINDECOY} bind(s) inside the live NoExp range (see $W15F)"
+fi
+if [ "${W15_HITINDECOY:-1}" -eq 0 ]; then
+  ok "W15: zero hits inside the live NoExp range"
+else
+  bad "W15: ${W15_HITINDECOY} hit(s) inside the live NoExp range (see $W15F)"
+fi
+# Two hits, one per bound address: a hit at an address that was never bound (or
+# a bound address never hit) means the int3 went somewhere unintended.
+if [ "${W15_HIT_N:-0}" -eq 2 ] && [ "${W15_HITSMATCH:-0}" -eq 1 ]; then
+  ok "W15: 2 hits, one per bound address"
+else
+  bad "W15: hits=${W15_HIT_N:-0} match=${W15_HITSMATCH:-0}, want 2/1 (see $W15F)"
+fi
+chk "W15: decoy actually loaded"   $W15F "DECOY_LOADED=1"
+chk "W15: late reloaded"           $W15F "LATE2=1"
+# Supplementary only: the identity function's own unit check. It cannot stand
+# in for the event-level base verification above.
+chk "W15: identity selftest (aux)" $W15F "selftest modid 2/2 ok"
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF

@@ -179,6 +179,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     if(cmd == "quit")
     {
         mQuitting = true;
+        abortStepOut("quit"); // one abort entry point for every teardown path
         cleanupBreakInStub();
         Stop();
         return CmdResult::Resume;
@@ -199,6 +200,9 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         fflush(stdout);
         mRestartPending = true;
         mQuitting = true; // no pause injections during shutdown
+        // An in-flight stepout must not survive into the exit events or the
+        // next session: same abort entry point as pause/exception/detach/quit.
+        abortStepOut("restart");
         cleanupBreakInStub();
         Stop(); // the exit event ends Start(); main.cpp re-Inits
         return CmdResult::Resume;

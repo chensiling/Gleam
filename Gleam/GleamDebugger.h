@@ -232,7 +232,14 @@ private:
     GleeBug::ptr mStepOutRearm = 0;        // arm at the NEXT event (stage 2)
     void stepOutTick();                 // inspect the current instruction, act
     void stepOutFinish(const char* reason);
-    void abortStepOut(const char* why); // pause/exception/detach/restart cleanup
+    void abortStepOut(const char* why); // pause/exception/detach/quit/restart cleanup
+    // Internal-breakpoint bookkeeping. MUST run first in cbBreakpoint, before
+    // any user-state handling (ignore counts, rules): the engine deletes a
+    // one-shot breakpoint after the callback whatever path it takes, so an
+    // early return before this point strands the operation on a dead int3.
+    // Returns true when the owner consumed the hit (a tick was driven and the
+    // event must not surface as a user stop).
+    bool handleStepOutBreakpoint(const GleeBug::BreakpointInfo & info);
 
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();
