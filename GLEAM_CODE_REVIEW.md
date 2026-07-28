@@ -1,56 +1,51 @@
-# Gleam 设计说明：stepout（ret）全面重做
+# Gleam 第七轮复审修复报告
 
-日期：2026-07-25
-状态：设计定稿（替代此前所有 ret/stepout 实现）
+- 修复日期：2026-07-28
+- 当前代码基线：`916dd04afd2c80e656ca7c293928053c24aa4bc9`
+- 被修复基线：`c57d0ce`
+- 提交 tree：`87c25bb40351647aee681299a43c4b3ce21fa3d7`
+- 正式日志：`ci_logs/916dd04_20260728_181209/`
 
-## 为什么要推翻旧设计
+## 结论
 
-`ret`（执行到函数返回）在 Gleam 里先后有过四种实现，全部存在原理性缺陷：
+第六轮复审提出的 **1 高 + 4 中 + 1 低共 6 项**全部修复并有定向自动化留证。修复过程中另外定位到 **2 个引擎缺陷**（均不在原评审条目内，见下节）。
 
-1. **直接读 `[rsp]`**：函数建立栈帧后，`[rsp]` 是局部数据而不是返回地址。
-2. **RBP 帧链 `[rbp+8]`**：对省略帧指针（FPO）的函数失效；在 `ret` 指令处还会多跳一帧（此时 rbp 已恢复为调用者的值）。
-3. **向上栈扫描找"前一条是 call 的可执行值"**：栈是复用的，CRT/先前调用留下的过期返回地址会被误判；也无法区分"返回进当前函数"和"返回进调用者"。
-4. **`StackWalk64` 真展开（.pdata）**：对正常 PE 模块是对的，但**壳、shellcode、自写 RWX 区域根本没有展开数据**——而逆向的目标恰恰大量是这些。此时只能报错放弃，功能不成立。
+## 已修复问题
 
-结论：所有"先算出返回地址再下断"的路线，都有无法覆盖的场景。**不再计算返回地址**，改为纯粹的控制流方案。
+| 级别 | 问题 | 修复 | 验收留证 |
+|---|---|---|---|
+| 高 | **`ignore` 绕过 stepout 内部断点状态处理。** ignore-count 在所有权处理之前提前返回，而引擎在回调之后无条件消费一次性断点（`GleeBug/Debugger.Loop.Exception.cpp:76-77`），于是 `mStepOutActive` 为真而物理断点已不存在，目标静默跑到退出。 | 内部断点簿记抽为 `handleStepOutBreakpoint()`，作为 `cbBreakpoint` 的**第一条语句**执行，任何用户态处理（ignore/rule）都不可能在它之前返回；`mStepOutBpOurs = false` 提到 owner/non-owner 分支之上，任何线程命中即失去删除权。位置：`Gleam/GleamDebugger.cpp:615-665`。 | **W14e**（新增）：owner 与 non-owner 两档各叠加 `ignore 1`，断言 `stepout return` 恰好 1 次、簿记行出现在 `event ignored` 之前、`bl` 无残留、目标正常退出；owner 档连跑 5 轮逐轮判定。修复前该场景表现为出现 `event ignored` 且完全没有 `stepout return`。 |
+| 中 | **`quit`、`restart` 未走统一中止入口**，`resetTransientState()` 也漏清 5 个 per-operation 字段。 | 两个命令均调用 `abortStepOut("quit"/"restart")`（幂等，常规路径不产生多余输出）；`resetTransientState()` 清空全部 per-operation 字段，仅刻意保留单调的 `mStepOutGen`（附注释说明理由）。位置：`Gleam/GleamCommands.Control.cpp:179-207`、`Gleam/GleamDebugger.cpp:537-562`。 | **W14d**（新增）：在 non-owner 停止点分别执行 quit / restart / owner 线程退出。quit 与 restart 各恰好 1 次统一中止、0 次再武装；restart 后新会话 `no breakpoints`、0 次 `stop reason=stepout`、目标跑完；owner 退出档恰好 1 次 `stepout aborted (thread exit)`、0 次幻影 step 停止、干净退出。 |
+| 中 | **safe-step 两个恢复分支绕开统一检查**（owner 线程退出、single-step 到达处直接 `ResumeThread` 并忽略返回值）。 | 抽出带返回值检查的 `resumeSuspendedThreads()`（失败输出 TID + 系统错误码），两处裸恢复改为调用它；`cleanupSuspensions()` 在其之上叠加停步标志清理。**不能直接复用 `cleanupSuspensions`**：single-step 到达分支之后 `exceptionEvent()` 仍需要 `isInternalStepping` 来判别该事件（`GleeBug/Debugger.Loop.Exception.cpp:82`），已在代码注释中标注。位置：`GleeBug/Debugger.Loop.cpp:37-77、143-148、219-227`。 | W14/W14b/W14d/W14e 全程 0 次内部错误输出（含此前会误报的 teardown 路径，见下节引擎缺陷 2）。V4e 的 detach 后目标自行完成断言继续有效。 |
+| 中 | **W14 自动判定可能误通过，组合矩阵未补齐。**（两类证据不要求来自同一轮） | W14 改为**逐轮判定**：每轮同时要求 `ec=0`、non-owner ≥ 1、`stepout return` 恰好 1、正常退出恰好 1，失败轮原始日志另存 `gleam_W14_fail_$i.txt`，逐轮结构化行进 `pressure.log`。新增 **W14b** 执行控制矩阵（`g`/`step`/`stepover`/`tgo`/`until`/新 `ret`）与 **W14c** 用户断点矩阵。 | W14 10/10 逐轮全绿、无幻影 step 停止；W14b 6 档各断言 ec=0 + 到达 non-owner 停止 + `bl` 无 ` once` 残留。 |
+| 中 | **W15“无诱饵绑定”断言检查错对象**（绑定日志打印逻辑名 `late`，`module=noexp` 永远不会出现）。 | W15 重写为**事件配对**判定：单遍 awk 把每次绑定与它打印所在的那次加载事件配对，用 `modules` 快照给基址命名，输出 9 个字段。纯几何（地址区间）判定在此不成立——探针证实诱饵 NoExp **复用了 Late#1 刚释放的同一基址与同一大小**，Late#1 的合法绑定本就落在 NoExp 区间内，已在脚本注释中记录。位置：`run_tests.sh:1388` 起。 | W15 11 条断言：2 个互异 Late 基址、绑定恰好 2 次、2 次均配对到 Late 加载事件、**配对到诱饵加载事件 0 次**、诱饵活跃区间内绑定/命中均 0、2 次命中一一对应绑定地址；另加"诱饵映像确实被识别"守卫（否则两条区间断言会**空洞通过**）；`selftest modid 2/2` 标注 `(aux)` 仅作补充。实测配对：load#1 Late@7FFCE4CF0000→绑定，load#2 **NoExp@7FFCE4CF0000（同址同大小）→无绑定**，load#3 Late@7FFCE4B40000→绑定。 |
+| 低 | **W13 重复执行并覆盖同一日志。** | 删除较短的重复块，保留完整边界矩阵，并注释说明旧块写的是同一个日志文件。 | 断言不再重复计数。 |
 
-## 新设计：stepout 核心循环
+## 修复过程中新发现的引擎缺陷（不在原评审条目内）
 
-`stepout`（`ret` 命令）是一个在调试器核心内运行的单步循环，每次只检查**当前指令**（RIP 指向的指令），按三类特判处理：
+1. **`Debugger::Init` 带命令行时无法启动相对路径目标。** 有命令行时 `lpApplicationName` 被置 `nullptr`，交由 CreateProcessW 从 `"\"%s\" %s"` 里自行解析路径，对**使用正斜杠的相对路径**解析失败——`Gleam.exe bin/Debug/x64/TestTarget.exe dll4` 报 `failed to start debuggee`，而同一路径不带参数却能启动。已确认为**既有缺陷、非本轮回归**（用未改动的 11:45 Release 二进制复现）。CI 一直是绿的原因：`ci_local.bat` 经 `%BASH% -c` 转发，Git Bash 把未加引号的 `$TARGET` 重写成反斜杠路径，恰好绕开了该分支。修复：命令行存在时仍显式传 `szFilePath`（argv[0] 仍取自命令行，被调试方观察不到差异）。位置：`GleeBug/Debugger.cpp:35-45`。
+2. **统一恢复路径在正常 teardown 误报内部错误。** `SuspendedThreads` 里存的是调试事件给的系统句柄，一旦 continue 越过该线程的 EXIT_THREAD（或进程的 EXIT_PROCESS）即失效；新增的带检查恢复会对已埋葬的线程调用 `ResumeThread` 并以 `ERROR_INVALID_HANDLE`（6）报错。实测日志出现 `Debugger: ResumeThread failed for tid 22740 (error 6)`。修复：仅恢复仍在 `mProcesses` 线程表中的条目，已消失的条目直接丢弃（无对象可解冻）。位置：`GleeBug/Debugger.Loop.cpp:42-77`。修复后同场景内部错误 0 次（修复前 1 次）。
 
-| 当前指令 | 动作 | 语义 |
-|---|---|---|
-| `ret` / `ret imm16` | 结束循环，暂停 | 已位于调用者中，stepout 完成 |
-| `call` | 在下一条指令处下一次性断点，全速运行 | 跳过被调函数（不步进其内部几千条指令） |
-| 后向跳转（jcc/jmp 目标 < 当前地址） | 在循环出口（jcc 的下一条指令）下一次性断点，全速运行 | 循环体以原生速度执行完，不逐条观察迭代 |
-| 其他 | 单步（`StepInto`） | 正常推进 |
+## 测试设计教训（已固化在脚本注释中）
 
-循环在 `cbStep`（单步落点）和 `cbBreakpoint`（一次性断点命中）中交替驱动，全程在调试线程核心内，无命令往返。步数上限默认 0x40000，到限报告 `maxreached`。
+- **断言必须能区分"正确删除"与"错误删除"。** W14c 初版把一次性用户断点设在 non-owner 停止点的 `rip` 上，随后的 `step` 会**合法**消费它，"从 `bl` 消失"于是既可能是正确行为也可能是错误删除，断言无法判别。改为：一次性断点放在单步到不了的地址（`inner`），同址场景交给不会被命中消费的普通断点。
+- **"零命中"类断言必须配一条"对象确实存在"的守卫**，否则解析失败会让断言空洞通过（W15 的诱饵识别守卫）。
 
-**判定依据只有一条：RIP 处的字节解码出来是不是 `ret`**——不看栈、不看帧、不看展开数据。这是它与所有旧实现的本质区别。
+## 门禁结果
 
-## 为什么这个设计更好
+`ci_local.bat` 全阶段通过（`[ci] PASS: all stages green`）：
 
-- **绝对确定性**：FPO、壳、shellcode、自写 RWX 全部适用，不依赖任何元数据（PDB/.pdata/帧布局）
-- **没有误停风险**：旧实现的所有失败模式（假候选、帧链错位、展开缺数据）在原理上不存在
-- **循环快进**：后向跳转识别为循环回边后，循环以原生速度执行（状态完全正确），开销从"每指令一事件"降为"每循环一事件"。实测 100,000 次迭代的函数，stepout 只用 22 个事件完成
-- **call 跳过**：复用 stepover 已验证的一次性断点原语，避免步进 API 内部
+| 阶段 | 结果 |
+|---|---|
+| clean rebuild Debug x64 | 通过 |
+| clean rebuild Release x64 | 通过 |
+| Debug 套件 1/3 | 89 场景 296 断言，PASS=296 FAIL=0 |
+| Debug 套件 2/3 | 89 场景 296 断言，PASS=296 FAIL=0 |
+| Debug 套件 3/3 | 89 场景 296 断言，PASS=296 FAIL=0 |
+| Release 套件 1/1 | 89 场景 296 断言，PASS=296 FAIL=0 |
 
-## 已知边界（接受并文档化）
+四套日志中 `FAIL:` 行总数为 0；新增的 W14b/W14c/W14d/W14e 与重写后的 W15 在四套日志中均完整出现并全绿。
 
-1. **非 fall-through 的循环出口**：循环若通过 `break`/中间 `jmp` 从其他路径退出，快进断点不命中，可能冲过头。用步数上限和 `pause` 兜底
-2. **非 ret 的函数出口**：尾调用（`jmp target`）、`longjmp`、C++ 异常离开函数时不经过 `ret`，会走到上限。这些是控制流本质，不是实现缺陷
-3. **步数上限**：默认 0x40000，`ret <hexmax>` 可调
-4. `syscall` 等按普通指令单步处理（随内核往返后继续），不做特判
+## 最终判定
 
-## 废弃
-
-- `StackWalk64` 策略树（unwind/leaf/failed 三分支）已从 `ret` 命令移除；`stackWalkReturn`/`checkUnwindRecord` 代码保留，仅供后续 `bt`（栈回溯）升级时复用
-- 旧的 `(unwind)`/`(leaf)`/`(frame)`/`(stack scan)` 输出标签全部废弃，统一为 `stop reason=stepout return steps=N`
-
-## 验证
-
-- 入口/中段/`ret` 指令处三种位置的 stepout 均停在调用者下一条指令
-- Release/FPO 函数（无帧指针）同样正确
-- 含 100,000 次迭代循环的函数：快进完成，步数 ~22，结果正确
-- 全量测试套件（含本条场景 T5c）通过
+6 项全部关闭，另修 2 个引擎缺陷。累计 89 场景 296 断言；上一轮正式日志实测为 86 场景 261 断言（`ci_logs/c57d0ce_20260728_114407/`），本轮净增 3 个场景块（新增 W14b/W14c/W14d/W14e 四块，删除重复的 W13 块一块）与 35 条断言，无场景丢失。
