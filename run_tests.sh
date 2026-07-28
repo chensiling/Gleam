@@ -1285,8 +1285,8 @@ fi
 # Each follow-up command must either complete it or abort it through the one
 # entry point - never leave a stale internal bp or emit a phantom step stop.
 # ec=0 for every case: a hang or crash here must not count as a pass.
-w14b() { # w14b <tag> <follow-up commands...>
-  local tag=$1; shift
+w14b() { # w14b <tag> <expected-pattern> <follow-up commands...>
+  local tag=$1 expect=$2; shift 2
   local f=${TDIR}/gleam_W14b_$tag.txt
   { printf 'bp TestTarget!marker once\ng\nret\n'
     printf '%s\n' "$@"
@@ -1299,6 +1299,12 @@ w14b() { # w14b <tag> <follow-up commands...>
     bad "W14b/$tag: no non-owner stop reached (see $f)"
     return
   fi
+  # Each follow-up command must prove ITS OWN semantics, not just "no crash".
+  if grep -qF "$expect" $f; then
+    ok "W14b/$tag: follow-up output '$expect'"
+  else
+    bad "W14b/$tag: expected '$expect' (see $f)"
+  fi
   # No internal one-shot may outlive the operation: bl prints "once" for
   # single-shot breakpoints, and the user bp in this scenario is "once" too -
   # it is consumed at the first hit, well before these follow-ups.
@@ -1309,12 +1315,12 @@ w14b() { # w14b <tag> <follow-up commands...>
   fi
 }
 echo "== W14b =="
-w14b g        "g"
-w14b step     "step"
-w14b stepover "stepover"
-w14b tgo      "tgo rax!=0 100"
-w14b until    "until TestTarget!looper"
-w14b newret   "ret"
+w14b g        "stop reason=stepout return" g g g g g g g g g g g g g g g
+w14b step     "stop reason=step rip=" "step"
+w14b stepover "stop reason=step rip=" "stepover"
+w14b tgo      "stop reason=trace " "tgo rax!=0 100"
+w14b until    "stop reason=breakpoint" "until TestTarget!looper"
+w14b newret   "stop reason=stepout return" "ret"
 # Aborting the old stepout must not delete a USER breakpoint - not the normal
 # one that happens to sit at the internal one-shot's own address, and not an
 # unrelated one-shot.
@@ -1350,6 +1356,63 @@ w14b_user() { # w14b_user <tag> <bp-addr> <bp-suffix>
 echo "== W14c =="
 w14b_user shared "$MCALLNEXT" ""
 w14b_user once   "$INNER"     "once"
+
+# Same address as the internal one-shot: after the non-owner consumed it,
+# physical ownership is gone (mStepOutBpOurs=false), so a user "once" there
+# must hit as a NORMAL user breakpoint - never claimed as internal (C2).
+timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14c_sameaddr.txt 2>&1 <<EOF
+bp TestTarget!marker once
+g
+ret
+bp $MCALLNEXT once
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+bl
+quit
+EOF
+ec=$?
+echo "== W14c/sameaddr =="
+if [ $ec -ne 0 ]; then bad "W14c/sameaddr: abnormal exit (code $ec)"; fi
+# The user once must fire as a NORMAL user breakpoint (this line cannot come
+# from the internal one-shot, which reports through the stepout bookkeeping).
+chk "W14c/sameaddr: user once fires normally" ${TDIR}/gleam_W14c_sameaddr.txt "stop reason=breakpoint type=software address=0x$MCALLNEXT"
+chk "W14c/sameaddr: stepout completes" ${TDIR}/gleam_W14c_sameaddr.txt "stop reason=stepout return"
+# After the operation completes the last bl must be clean: neither the user
+# once (consumed by its own hit) nor the internal one (consumed by owner).
+chkcount "W14c/sameaddr: no leftover once" ${TDIR}/gleam_W14c_sameaddr.txt " once" 0
+
+# Abort path with a user once at the internal address: abortStepOut must NOT
+# delete it (ownership was lost at the non-owner hit), it must still fire.
+timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14c_abort.txt 2>&1 <<EOF
+bp TestTarget!marker once
+g
+ret
+bp $MCALLNEXT once
+bl
+ret
+g
+quit
+EOF
+ec=$?
+echo "== W14c/abort =="
+if [ $ec -ne 0 ]; then bad "W14c/abort: abnormal exit (code $ec)"; fi
+chk "W14c/abort: user once listed"   ${TDIR}/gleam_W14c_abort.txt "0x$MCALLNEXT  software int3"
+chk "W14c/abort: unified abort"        ${TDIR}/gleam_W14c_abort.txt "stepout aborted (new ret)"
+chk "W14c/abort: user once fires"      ${TDIR}/gleam_W14c_abort.txt "stop reason=breakpoint type=software address=0x$MCALLNEXT"
 
 # --- W14d: teardown paths at a non-owner stop (quit / restart / owner exit) ---
 # quit and restart must go through the SAME abort entry point as pause and
@@ -1419,21 +1482,26 @@ for i in $(seq 1 5); do
   ec=$?
   f=${TDIR}/gleam_W14e_mt_$i.txt
   r=$(grep -cF "stop reason=stepout return" $f)
-  ord=1
-  if grep -qF "event ignored address=0x$MCALLNEXT" $f; then
-    ig=$(grep -nF "event ignored address=0x$MCALLNEXT" $f | head -1 | cut -d: -f1)
-    no=$(grep -nF "hit by non-owner" $f | head -1 | cut -d: -f1)
-    if [ -z "$no" ] || [ "$no" -gt "$ig" ]; then ord=0; fi
+  no=$(grep -cF "hit by non-owner" $f)
+  ig=$(grep -cF "event ignored address=0x$MCALLNEXT" $f)
+  ex=$(grep -cF "stop reason=exit code=0x00000000" $f)
+  # Every object must EXIST before the order is judged - an absent non-owner
+  # or ignore line must fail, never pass vacuously.
+  ord=0
+  if [ "$no" -ge 1 ] && [ "$ig" -ge 1 ]; then
+    igo=$(grep -nF "event ignored address=0x$MCALLNEXT" $f | head -1 | cut -d: -f1)
+    noo=$(grep -nF "hit by non-owner" $f | head -1 | cut -d: -f1)
+    [ "$noo" -le "$igo" ] && ord=1
   fi
-  if [ $ec -eq 0 ] && [ "$r" -eq 1 ] && [ "$ord" -eq 1 ]; then
+  if [ $ec -eq 0 ] && [ "$r" -eq 1 ] && [ "$ord" -eq 1 ] && [ "$ex" -eq 1 ]; then
     W14EOK=$((W14EOK+1))
   else
     cp $f ${TDIR}/gleam_W14e_fail_$i.txt
   fi
-  echo "W14e iter=$i ec=$ec stepoutret=$r order_ok=$ord" >> "${TDIR}/pressure.log"
+  echo "W14e iter=$i ec=$ec stepoutret=$r nonowner=$no ignored=$ig order_ok=$ord exit=$ex" >> "${TDIR}/pressure.log"
 done
 if [ "$W14EOK" -eq 5 ]; then
-  ok "W14e: 5/5 runs ec=0 + exactly 1 return + bookkeeping before ignore"
+  ok "W14e: 5/5 runs ec=0 + exactly 1 return + bookkeeping before ignore + exit"
 else
   bad "W14e: $W14EOK/5 runs clean (see ${TDIR}/gleam_W14e_fail_*.txt)"
 fi

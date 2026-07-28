@@ -112,17 +112,16 @@ namespace GleeBug
                         cbInternalError("Debugger::Detach failed!");
                     break;
                 }
-#if 0
-                // Fix based on work by https://github.com/number201724
-                if(WaitForSingleObject(mMainProcess.hProcess, 0) == WAIT_OBJECT_0)
+                const DWORD waitError = GetLastError();
+                if(waitError != ERROR_SEM_TIMEOUT)
                 {
-                    mDebugEvent.dwDebugEventCode = EXIT_PROCESS_DEBUG_EVENT;
-                    mDebugEvent.dwProcessId = mMainProcess.dwProcessId;
-                    mDebugEvent.dwThreadId = mMainProcess.dwThreadId;
-                    if(!GetExitCodeProcess(mMainProcess.hProcess, &mDebugEvent.u.ExitProcess.dwExitCode))
-                        mDebugEvent.u.ExitProcess.dwExitCode = 0xFFFFFFFF;
+                    // A real API failure, not a timeout: report and bail out
+                    // (loop-end cleanupSuspensions still runs).
+                    char waitBuf[128];
+                    sprintf_s(waitBuf, "Debugger::WaitForDebugEvent failed (error %lu)", waitError);
+                    cbInternalError(waitBuf);
+                    break;
                 }
-#endif
                 else
                 {
                     // Do not expire deleted breakpoints while a breakpoint step-over is
@@ -307,7 +306,13 @@ namespace GleeBug
 
             //continue the debug event
             if(!ContinueDebugEvent(mDebugEvent.dwProcessId, mDebugEvent.dwThreadId, mContinueStatus))
+            {
+                char contBuf[160];
+                sprintf_s(contBuf, "Debugger::ContinueDebugEvent failed (error %lu, pid=%lu, tid=%lu)",
+                          GetLastError(), mDebugEvent.dwProcessId, mDebugEvent.dwThreadId);
+                cbInternalError(contBuf);
                 break;
+            }
             if(completingDeferredException)
                 DeferredExceptionThreads.erase(eventThreadKey);
 

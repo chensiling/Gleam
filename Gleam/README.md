@@ -165,7 +165,11 @@ echo bp 140070EC9 & echo g & echo regs & echo read 140190000 10 & echo g | gleam
 bash run_tests.sh
 ```
 
-68 个场景 180 项断言，覆盖断点、执行控制、内存/寄存器读写、反汇编、符号枚举、异常过滤与处置、脱离、跟踪、补丁全矩阵、argv 引用、跨块扫描、Release/FPO 栈展开、地址表达式、模块相对延迟断点、真实栈帧枚举、类型化内存、完整线程上下文、会话重启及压力（100 连发 pause 注入、100 会话）。`TestTarget` 等工程是被调试目标，固定基址保证地址稳定可断言。脚本在任一断言失败时以非零退出码结束。
+89 个场景 297 项断言，覆盖断点、执行控制、内存/寄存器读写、反汇编、符号枚举、异常过滤与处置、脱离、跟踪、补丁全矩阵、argv 引用、跨块扫描、Release/FPO 栈展开、地址表达式、模块相对延迟断点（含 DLL 身份验证与诱饵映像判别）、真实栈帧枚举、类型化内存、完整线程上下文、会话重启、stepout 内部断点所有权矩阵及压力（100 连发 pause 注入、100 会话）。`TestTarget` 等工程是被调试目标，链接为固定基址（`FixedBaseAddress`）。
+
+**脚本内不得出现固定 RVA**——这是复审门禁的明令要求，所有地址一律运行时解析（TestTarget 自己打印 MARKER/INNER/GDATA，其余走反汇编探针），因此改动被调试目标的源码后无需同步任何脚本常量。可用 `GLEAM`/`TARGET`/`ATARGET`/`BTARGET` 覆盖二进制路径，`TDIR` 指定每轮独立工件目录。脚本在任一断言失败时以非零退出码结束。
+
+完整门禁（clean rebuild Debug+Release、Debug 套件 ×3、Release 套件 ×1）用 `ci_local.bat`，日志落在 `ci_logs/<commit>_<timestamp>/`。
 
 ## 架构
 

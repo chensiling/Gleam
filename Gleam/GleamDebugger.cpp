@@ -624,8 +624,11 @@ void GleamDebugger::cbAttachBreakpoint()
 // the event must not surface as a user stop.
 bool GleamDebugger::handleStepOutBreakpoint(const BreakpointInfo & info)
 {
+    // The hit is ours only if it is still physically OUR breakpoint: after
+    // any consumption (mStepOutBpOurs=false) the address may carry a user
+    // breakpoint, which must keep its normal semantics.
     if(!mStepOutActive || !info.singleshoot || mStepOutBpAddr == 0 ||
-       info.address != mStepOutBpAddr)
+       !mStepOutBpOurs || info.address != mStepOutBpAddr)
         return false;
 
     // ANY hit at that address costs us the right to delete it: the engine
@@ -656,12 +659,12 @@ bool GleamDebugger::handleStepOutBreakpoint(const BreakpointInfo & info)
         return false;
     }
 
-    // Owner thread but a stale generation (defensive: a new operation always
-    // aborts the old one, which clears mStepOutBpAddr). The physical int3 is
-    // gone either way, so stop waiting on it instead of stranding the
-    // operation on a dead address; the hit surfaces as a normal stop.
+    // Owner thread but a stale generation: the physical bp is gone and the
+    // operation has nothing left to wait on. Finish with an error instead
+    // of leaving mStepOutActive set with no breakpoint behind it.
     mStepOutBpAddr = 0;
-    return false;
+    stepOutFinish("error");
+    return true; // consumed; stop record was emitted by stepOutFinish
 }
 
 void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
@@ -978,11 +981,6 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         resolveBreakInSymbols();
     }
 
-    if(mWantsPause && !mQuitting.load() && mProcess && mThread)
-    {
-        mWantsPause = false;
-        commandLoop();
-    }
     // Two-stage re-arm for a non-owner-consumed internal breakpoint:
     // stage 1 (this event) only defers; stage 2 (next event, after the
     // engine's internal step has completed) writes the int3 back.
@@ -1002,9 +1000,23 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
                 stepOutFinish("error");
             }
             else
+            {
                 mStepOutBpOurs = true; // physically ours again
+                printf("event stepout internal bp re-armed at 0x%llX\n",
+                       (unsigned long long)mStepOutRearm);
+                fflush(stdout);
+            }
         }
         mStepOutRearm = 0;
+    }
+
+    // Enter the command loop AFTER event-side work: a stop produced by the
+    // re-arm path above (e.g. a re-arm failure) must pause in THIS event,
+    // not after the event has already been continued.
+    if(mWantsPause && !mQuitting.load() && mProcess && mThread)
+    {
+        mWantsPause = false;
+        commandLoop();
     }
     // Consume deferred pause requests LAST, after marking ourselves
     // running-free: requests arriving after this point go straight to
