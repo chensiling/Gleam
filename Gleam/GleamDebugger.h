@@ -222,6 +222,9 @@ private:
     uint64_t mStepOutSteps = 0;
     uint64_t mStepOutMax = 0x40000;
     GleeBug::ptr mStepOutBpAddr = 0; // internal one-shot bp we are waiting on
+    bool mStepOutBpOurs = false;     // ...and it is still physically OURS
+                                     // (false after ANY hit at that address:
+                                     // it may carry a user bp from then on)
     uint32_t mStepOutTid = 0;        // thread this stepout operation owns
     uint64_t mStepOutGen = 0;        // operation generation (per ret command)
     uint64_t mStepOutBpGen = 0;      // generation of the armed internal bp
@@ -276,6 +279,8 @@ private:
     // from its file on disk (works during the load event; the loader list
     // is not needed). imagePath may be null when unknown.
     uint64_t resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol);
+    // Prove "loaded module == file on disk" via CodeView GUID+Age+SizeOfImage.
+    bool verifyModuleIdentity(uint64_t moduleBase, const wchar_t* imagePath);
     // Bases we SymLoadModuleEx'd explicitly (for SymUnloadModule64 pairing).
     std::set<uint64_t> mSymLoadedBases;
     // Real image paths learned at DLL load events, keyed by normalized

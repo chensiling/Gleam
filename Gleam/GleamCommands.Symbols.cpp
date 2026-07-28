@@ -101,6 +101,7 @@ namespace
         IMAGE_DATA_DIRECTORY delayImportDir{};
         IMAGE_DATA_DIRECTORY exceptionDir{};
         IMAGE_DATA_DIRECTORY exportDir{};
+        IMAGE_DATA_DIRECTORY debugDir{};
     };
 
     PeInfo readPeDirectories(Process* process, uint64_t base)
@@ -131,6 +132,7 @@ namespace
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
             info.exceptionDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
             info.exportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            info.debugDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
         }
         else if(magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
         {
@@ -144,6 +146,7 @@ namespace
             info.delayImportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
             info.exceptionDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
             info.exportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            info.debugDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
         }
         else
             return info;
@@ -776,6 +779,134 @@ std::string GleamDebugger::dllNameFromBase(uint64_t base)
 // Resolve an exported function by walking the export table directly (same
 // reason as above: no loader-list or dbghelp dependency). Forwarded exports
 // return 0 (unresolved).
+namespace
+{
+    struct CodeViewId
+    {
+        bool valid = false;
+        GUID guid{};
+        uint32_t age = 0;
+        uint32_t sizeOfImage = 0;
+    };
+
+    // Read the RSDS CodeView record from a module loaded in the debuggee.
+    CodeViewId codeViewFromModule(Process* process, uint64_t base)
+    {
+        CodeViewId id;
+        auto pe = readPeDirectories(process, base);
+        if(!pe.valid || !pe.debugDir.VirtualAddress ||
+           !rangeInImage(pe.debugDir.VirtualAddress, pe.debugDir.Size, pe.sizeOfImage))
+            return id;
+        IMAGE_DEBUG_DIRECTORY dir;
+        const uint32_t count = pe.debugDir.Size / (uint32_t)sizeof(dir);
+        for(uint32_t i = 0; i < count; i++)
+        {
+            if(!process->MemReadSafe(base + pe.debugDir.VirtualAddress + (uint64_t)i * sizeof(dir),
+                                     &dir, sizeof(dir)))
+                return id;
+            if(dir.Type != IMAGE_DEBUG_TYPE_CODEVIEW || dir.SizeOfData < 24 ||
+               !rangeInImage(dir.AddressOfRawData, 24, pe.sizeOfImage))
+                continue;
+            struct
+            {
+                char sig[4];
+                GUID guid;
+                uint32_t age;
+            } rsds;
+            if(!process->MemReadSafe(base + dir.AddressOfRawData, &rsds, sizeof(rsds)) ||
+               memcmp(rsds.sig, "RSDS", 4) != 0)
+                continue;
+            id.valid = true;
+            id.guid = rsds.guid;
+            id.age = rsds.age;
+            id.sizeOfImage = pe.sizeOfImage;
+            return id;
+        }
+        return id;
+    }
+
+    // Read the RSDS CodeView record from a PE file on disk.
+    CodeViewId codeViewFromFile(const wchar_t* path)
+    {
+        CodeViewId id;
+        // GetModuleFileNameExW returns native "\??\" paths; CreateFileW
+        // needs them gone (plain "C:\") or in extended form ("\\?\").
+        if(path[0] == L'\\' && path[1] == L'?' && path[2] == L'?' && path[3] == L'\\')
+            path += 4;
+        HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, 0, nullptr);
+        if(hFile == INVALID_HANDLE_VALUE)
+            return id;
+        HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        const uint8_t* view = hMap ? (const uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0) : nullptr;
+        if(view)
+        {
+            const uint64_t fileSize = GetFileSize(hFile, nullptr);
+            auto dos = (const IMAGE_DOS_HEADER*)view;
+            if(fileSize >= sizeof(IMAGE_DOS_HEADER) && dos->e_magic == IMAGE_DOS_SIGNATURE &&
+               (uint64_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) <= fileSize)
+            {
+                auto nt = (const IMAGE_NT_HEADERS64*)(view + dos->e_lfanew);
+                if(nt->Signature == IMAGE_NT_SIGNATURE &&
+                   nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                {
+                    // The debug directory's VirtualAddress is an RVA; map it
+                    // to a file offset through the section table.
+                    auto sec = (const IMAGE_SECTION_HEADER*)(
+                        (const uint8_t*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+                    auto rvaToOffset = [&](uint32_t rva) -> uint32_t
+                    {
+                        for(int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+                            if(rva >= sec[i].VirtualAddress &&
+                               rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+                                return sec[i].PointerToRawData + (rva - sec[i].VirtualAddress);
+                        return 0;
+                    };
+                    const auto & dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+                    const uint32_t dirOff = rvaToOffset(dd.VirtualAddress);
+                    const uint32_t count = dd.Size / (uint32_t)sizeof(IMAGE_DEBUG_DIRECTORY);
+                    for(uint32_t i = 0; i < count && !id.valid; i++)
+                    {
+                        if(!dirOff || (uint64_t)dirOff + (i + 1) * sizeof(IMAGE_DEBUG_DIRECTORY) > fileSize)
+                            break;
+                        auto dir = (const IMAGE_DEBUG_DIRECTORY*)(view + dirOff + i * sizeof(IMAGE_DEBUG_DIRECTORY));
+                        if(dir->Type != IMAGE_DEBUG_TYPE_CODEVIEW || dir->SizeOfData < 24 ||
+                           (uint64_t)dir->PointerToRawData + 24 > fileSize)
+                            continue;
+                        const uint8_t* rsds = view + dir->PointerToRawData;
+                        if(memcmp(rsds, "RSDS", 4) == 0)
+                        {
+                            id.valid = true;
+                            memcpy(&id.guid, rsds + 4, sizeof(GUID));
+                            memcpy(&id.age, rsds + 20, sizeof(uint32_t));
+                            id.sizeOfImage = nt->OptionalHeader.SizeOfImage;
+                        }
+                    }
+                }
+            }
+            UnmapViewOfFile(view);
+        }
+        if(hMap)
+            CloseHandle(hMap);
+        CloseHandle(hFile);
+        return id;
+    }
+}
+
+// Prove "this loaded module IS that file on disk" by comparing their
+// CodeView GUID+Age (and SizeOfImage). Never use symbol resolution as
+// proof - loading the file's symbols can be arranged for any image.
+bool GleamDebugger::verifyModuleIdentity(uint64_t moduleBase, const wchar_t* imagePath)
+{
+    auto remote = codeViewFromModule(mProcess, moduleBase);
+    auto file = codeViewFromFile(imagePath);
+    if(!remote.valid || !file.valid)
+        return false;
+    return remote.age == file.age &&
+           remote.sizeOfImage == file.sizeOfImage &&
+           memcmp(&remote.guid, &file.guid, sizeof(GUID)) == 0;
+}
+
 // Resolve a PDB-only symbol by explicitly loading the module's symbols
 // from its file on disk. The invade-based dbghelp session depends on the
 // loader list, which is not yet linked during the DLL load event - this
@@ -1245,6 +1376,24 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
         T(P(D(false, true, 1, 1, true), true, true), true);    // hit    -> pause/swallow
         T(P(D(true, true, 1, 1, true), false, true), true);    // miss   -> no-pause swallow
         printf("selftest excpolicy %d/%d ok\n", pass, total);
+        // Module identity check (needs Late.dll + NoExp.dll loaded: dll4).
+        {
+            uint64_t lateBase = 0, noexpBase = 0;
+            if(moduleBaseByName("late", lateBase) && moduleBaseByName("noexp", noexpBase))
+            {
+                wchar_t wpath[MAX_PATH * 2] = L"";
+                if(GetModuleFileNameExW(mProcess->hProcess, (HMODULE)lateBase, wpath, ARRAYSIZE(wpath)))
+                {
+                    int okc = 0;
+                    if(verifyModuleIdentity(lateBase, wpath))
+                        okc++; // the real module matches its file
+                    if(!verifyModuleIdentity(noexpBase, wpath))
+                        okc++; // a decoy must NOT match Late's file
+                    printf("selftest modid %d/2 ok\n", okc);
+                    fflush(stdout);
+                }
+            }
+        }
         fflush(stdout);
         return CmdResult::Handled;
     }

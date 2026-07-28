@@ -9,10 +9,23 @@ __declspec(align(16)) uint8_t g_data[16] = {
     0x53, 0x54, 0x2D, 0x44, 0x41, 0x54, 0x41, 0x21
 };
 
+// In "mt" mode the callee of marker() burns cycles ON THE MAIN THREAD ONLY,
+// so the owner's call stays in flight while busyWorker (fast inner) crosses
+// the internal breakpoint address many times.
+static bool g_slowInner = false;
+static DWORD g_mainTid = 0;
+static volatile LONG g_gate = 0; // 2 = main is inside its slow inner call
+
 // inner(41)=46; marker(41)=47. With /Od the first argument arrives in RCX.
 __declspec(noinline) uint64_t inner(uint64_t x)
 {
     volatile uint64_t k = x;
+    if(g_slowInner && GetCurrentThreadId() == g_mainTid)
+    {
+        InterlockedExchange(&g_gate, 2); // busyWorker may launch marker(1) now
+        for(volatile uint64_t i = 0; i < 10000000; i++)
+            k += 0;
+    }
     return k + 5;
 }
 
@@ -35,6 +48,20 @@ __declspec(noinline) uint64_t looper(uint64_t n)
 static DWORD WINAPI worker(LPVOID)
 {
     Sleep(60000);
+    return 0;
+}
+
+// "mt" mode: hammer marker() so stepout's internal call-skip breakpoint
+// gets hit by this (non-owner) thread while the main thread stepouts.
+static DWORD WINAPI busyWorker(LPVOID)
+{
+    // Launch marker(1) exactly when main is inside its slow inner call, so
+    // the internal call-skip breakpoint (marker body, after the call) is
+    // crossed while it is armed.
+    while(g_gate < 2)
+        Sleep(0);
+    for(int i = 0; i < 12; i++)
+        marker(1);
     return 0;
 }
 
@@ -107,7 +134,31 @@ int main(int argc, char** argv)
         fflush(stdout);
     }
 
-    CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+    if(argc > 1 && !strcmp(argv[1], "dll4"))
+    {
+        // Decoy test: Late unload -> NoExp decoy load -> Late reload.
+        HMODULE late = LoadLibraryW(L"Late.dll");
+        printf("LATE1=%d\n", late != nullptr);
+        if(late)
+            FreeLibrary(late);
+        printf("LATE_UNLOADED=1\n");
+        HMODULE decoy = LoadLibraryW(L"NoExp.dll");
+        printf("DECOY_LOADED=%d\n", decoy != nullptr);
+        late = LoadLibraryW(L"Late.dll");
+        printf("LATE2=%d\n", late != nullptr);
+        fflush(stdout);
+    }
+
+    if(argc > 1 && !strcmp(argv[1], "mt"))
+    {
+        // A second thread hammering marker(), so stepout's internal
+        // call-skip breakpoint can be hit by a non-owner thread.
+        g_slowInner = true;
+        g_mainTid = GetCurrentThreadId();
+        CreateThread(nullptr, 0, busyWorker, nullptr, 0, nullptr);
+    }
+    else
+        CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 
     printf("ISDEBUGGERPRESENT=%d\n", IsDebuggerPresent() ? 1 : 0);
     fflush(stdout);

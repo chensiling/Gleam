@@ -34,6 +34,29 @@ namespace GleeBug
         std::unordered_set<uint64_t> DeferredExceptionThreads;
         bool IsDbgReplyLaterSupported = false;
 
+        // Unified suspension cleanup: every loop exit (detach, error break,
+        // natural end) must leave zero debugger-owned suspend counts behind.
+        // A failed ResumeThread is reported, never silently dropped.
+        const auto cleanupSuspensions = [this, &SuspendedThreads]()
+        {
+            if(mThread)
+            {
+                mThread->isInternalStepping = false;
+                mThread->isSingleStepping = false;
+            }
+            for(auto & itr : SuspendedThreads)
+            {
+                if(ResumeThread(itr.second) == (DWORD)-1)
+                {
+                    char buf[128];
+                    sprintf_s(buf, "Debugger: ResumeThread failed for tid %u (error %lu)",
+                              itr.first, GetLastError());
+                    cbInternalError(buf);
+                }
+            }
+            SuspendedThreads.clear();
+        };
+
         // Check if DBG_REPLY_LATER is supported based on Windows version (Windows 10, version 1507 or above)
         // https://www.gaijin.at/en/infos/windows-version-numbers
         const uint32_t NtBuildNumber = *(uint32_t*)(0x7FFE0000 + 0x260);
@@ -261,24 +284,17 @@ namespace GleeBug
 
             if(mDetach || mDetachAndBreak)
             {
-                // Leave no debugger-owned suspension behind: clear stepping
-                // state (no future safe-step suspensions) and resume every
-                // thread the safe-step mechanism suspended this round.
-                if(mThread)
-                {
-                    mThread->isInternalStepping = false;
-                    mThread->isSingleStepping = false;
-                }
-                for(auto & itr : SuspendedThreads)
-                    ResumeThread(itr.second);
-                SuspendedThreads.clear();
+                // Leave no debugger-owned suspension behind (unified cleanup,
+                // also runs on the natural loop end below).
+                cleanupSuspensions();
                 if(!UnsafeDetach())
                     cbInternalError("Debugger::Detach failed!");
                 break;
             }
         }
 
-        //cleanup
+        //cleanup (unified: also covers error breaks and natural loop end)
+        cleanupSuspensions();
         mProcesses.clear();
         mProcess = nullptr;
         mIsDebugging = false;

@@ -35,6 +35,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             fflush(stdout);
             return CmdResult::Handled;
         }
+        abortStepOut("until"); // no stepout may survive a new run target
         if(!mProcess->SetBreakpoint(a, true))
         {
             printf("failed to set breakpoint at 0x%llX\n", a);
@@ -49,6 +50,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         Thread* thread = currentThread();
         if(!thread)
             return CmdResult::Handled;
+        abortStepOut("step"); // execution-control state machines are exclusive
         mStepArmed = true;
         thread->StepInto();
         return CmdResult::Resume;
@@ -87,6 +89,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         Thread* thread = currentThread();
         if(!thread)
             return CmdResult::Handled;
+        abortStepOut("tgo"); // tgo and stepout never run concurrently
         mTraceActive = true;
         mStepArmed = true;
         thread->StepInto();
@@ -107,6 +110,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         }
         // StepOver falls back to StepInto for non-call instructions; arm both
         // pause paths and let cbStep/cbBreakpoint disambiguate.
+        abortStepOut("stepover"); // execution-control state machines are exclusive
         mStepArmed = true;
         mStepOverArmed = true;
         mProcess->StepOver([this]()
@@ -316,9 +320,10 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         else if(args[3] == "rw") prot = PAGE_READWRITE;
         else if(args[3] == "r") prot = PAGE_READONLY;
         else if(args[3] == "x") prot = PAGE_EXECUTE;
+        else if(args[3] == "n") prot = PAGE_NOACCESS;
         else
         {
-            printf("usage: protect <addr> <hexsize> <rwx|rx|rw|r|x>\n");
+            printf("usage: protect <addr> <hexsize> <rwx|rx|rw|r|x|n>\n");
             fflush(stdout);
             return CmdResult::Handled;
         }
@@ -509,19 +514,24 @@ void GleamDebugger::stepOutFinish(const char* reason)
 }
 
 // Abort an in-flight stepout: remove its internal one-shot breakpoint (if
-// armed) and clear all state, including the two-stage re-arm fields.
-// Called from pause/exception/detach/restart paths and before a new ret.
+// still physically ours - never delete by address alone, the address may
+// now carry a USER breakpoint) and clear all state, including the two-stage
+// re-arm fields and the operation's generic stepping flags (a queued step
+// event must not become a user-visible "stop reason=step" after the abort).
 void GleamDebugger::abortStepOut(const char* why)
 {
     if(!mStepOutActive && !mStepOutRearmPending && !mStepOutRearm)
         return;
-    if(mStepOutBpAddr && mProcess)
+    if(mStepOutBpAddr && mStepOutBpOurs && mProcess)
         mProcess->DeleteBreakpoint(mStepOutBpAddr);
     mStepOutBpAddr = 0;
+    mStepOutBpOurs = false;
     mStepOutActive = false;
     mStepOutPending = false;
     mStepOutRearmPending = 0;
     mStepOutRearm = 0;
+    mStepArmed = false;
+    mStepOverArmed = false;
     printf("stepout aborted (%s)\n", why);
     fflush(stdout);
 }
@@ -602,9 +612,11 @@ void GleamDebugger::stepOutTick()
             return;
         }
         // Only a hit at exactly this address, on the owning thread, may
-        // drive the next tick.
+        // drive the next tick. Track physical ownership: after ANY hit
+        // there, the address may later carry a user breakpoint.
         mStepOutBpAddr = after;
         mStepOutBpGen = mStepOutGen;
+        mStepOutBpOurs = true;
         return;
     }
 

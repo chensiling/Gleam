@@ -931,6 +931,9 @@ chk "V3: slot decoded"           ${TDIR}/gleam_V3.txt "raw-hardware slot=0"
 # V4a: baseline handle count. The pause is sent DELAYED (S4-style), while
 # the target runs free after the marker breakpoint - a deferred pause sent
 # at the system stop can be lost while break-in symbols are unresolved.
+# V4a: baseline handle count (pure measurement; runtime pause->detach is
+# proven by V4e). The two g's leave gleam paused at the second marker hit
+# until the delayed detach, so the sample window is deterministic.
 ( printf "bp $MARKER\ng\ng\n"; sleep 2; printf 'pause\n'; sleep 7; printf 'detach\n' ) | timeout 60 "$GLEAM" "$TARGET" > "${TDIR}/gleam_V4a.txt" 2>&1 &
 V4APID=$!
 sleep 6
@@ -961,6 +964,8 @@ for i in $(seq 1 5); do
   out=$(printf 'pause\ndetach\n' | timeout 15 "$GLEAM" -a $NPID 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=attach\|stop reason=pause')
+  printf '%s\n' "$out" > ${TDIR}/gleam_V4c_$i.txt
+  echo "iter=$i pid=$NPID ec=$ec hits=$n" >> "${TDIR}/pressure.log"
   [ $ec -eq 0 ] && [ "$n" -ge 1 ] && V4COK=$((V4COK+1))
 done
 # Cleanup: kill only if the pid still maps to the expected image.
@@ -1211,6 +1216,86 @@ chk "W13: unreadable next page -> error" ${TDIR}/gleam_W13.txt "cannot read stri
 chk "W13: prefix then partial"           ${TDIR}/gleam_W13.txt "(partial: read failed at 0x60300000)"
 chk "W13: odd address reads"             ${TDIR}/gleam_W13.txt "string at 0x60000001"
 chk "W13: surrogate pair"                ${TDIR}/gleam_W13.txt "😀"
+
+# --- W13: UTF-16 boundary matrix (P0-5) ---
+timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W13.txt 2>&1 <<EOF
+g
+read utf16 602FFFFF 2
+read utf16 602FFFFE 2
+read utf16 60000001 2
+write 60000000 3D D8 00 DE 00 00
+read utf16 60000000 4
+write 6000003E 3D D8 00 DE 00 00
+read utf16 6000003E 2
+protect 60001000 1000 n
+read utf16 60000FFF 1
+protect 60001000 1000 rwx
+read utf16 60000FFF 1
+quit
+EOF
+ec=$?
+echo "== W13 =="
+if [ $ec -ne 0 ]; then bad "W13: abnormal exit (code $ec)"; fi
+chk "W13: unreadable next page -> error" ${TDIR}/gleam_W13.txt "cannot read string at 0x602FFFFF"
+chk "W13: prefix then partial"           ${TDIR}/gleam_W13.txt "(partial: read failed at 0x60300000)"
+chk "W13: odd address reads"             ${TDIR}/gleam_W13.txt "string at 0x60000001"
+chk "W13: surrogate pair"                ${TDIR}/gleam_W13.txt "😀"
+chk "W13: surrogate across chunk"        ${TDIR}/gleam_W13.txt "string at 0x6000003E = \"😀\""
+chk "W13: noaccess -> error"             ${TDIR}/gleam_W13.txt "cannot read string at 0x60000FFF"
+chkcount "W13: restored -> readable"     ${TDIR}/gleam_W13.txt "string at 0x60000FFF = " 1
+
+# --- W14: stepout internal bp hit by a non-owner thread (S0-1) ---
+echo "== W14 =="
+W14HITS=0
+W14RET=0
+for i in $(seq 1 10); do
+  timeout 30 "$GLEAM" "$TARGET" mt > ${TDIR}/gleam_W14_$i.txt 2>&1 <<EOF
+bp TestTarget!marker once
+g
+ret
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+quit
+EOF
+  n=$(grep -c "hit by non-owner" ${TDIR}/gleam_W14_$i.txt)
+  r=$(grep -c "stop reason=stepout return" ${TDIR}/gleam_W14_$i.txt)
+  W14HITS=$((W14HITS+n))
+  W14RET=$((W14RET+r))
+  echo "iter=$i nonowner=$n stepoutret=$r" >> "${TDIR}/pressure.log"
+done
+if [ "$W14HITS" -ge 1 ]; then ok "W14: non-owner hit observed ($W14HITS/10)"; else bad "W14: no non-owner hit in 10 runs"; fi
+if [ "$W14RET" -ge 1 ]; then ok "W14: stepout completes after non-owner ($W14RET/10)"; else bad "W14: stepout never completed"; fi
+if grep -qE "stop reason=step " ${TDIR}/gleam_W14_*.txt; then
+  bad "W14: spurious stop reason=step after abort"
+else
+  ok "W14: no spurious step stops"
+fi
+
+# --- W15: module identity via CodeView GUID (P0-4) ---
+run W15 "dll4" <<EOF
+bp Late!LateInternal
+g
+g
+selftest
+quit
+EOF
+chkcount "W15: no decoy binding"   ${TDIR}/gleam_W15.txt "event bp bound module=noexp" 0
+chk "W15: late binds twice"        ${TDIR}/gleam_W15.txt "event bp bound module=late"
+chk "W15: identity selftest"       ${TDIR}/gleam_W15.txt "selftest modid 2/2 ok"
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF

@@ -403,14 +403,15 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
         }
         bool match = (!name.empty() && lb.module == name) ||
                      (!alias.empty() && lb.module == alias);
-        // Symbol identity fallback: the event's hFile may be NULL and the
-        // DLL may have no export name either. If a pending entry's symbol
-        // resolves at this base, this event IS its module.
+        // Identity fallback for anonymous events (hFile NULL, no export
+        // name): prove the loaded module IS the pending entry's file by
+        // comparing CodeView GUID+Age - never by resolving a symbol (that
+        // can be arranged for any image).
         if(!match && name.empty() && alias.empty() && !lb.symbol.empty())
         {
             auto foundPath = mModulePaths.find(lb.module);
             if(foundPath != mModulePaths.end() &&
-               resolvePdbSymbol(moduleBase, foundPath->second.c_str(), lb.symbol))
+               verifyModuleIdentity(moduleBase, foundPath->second.c_str()))
                 match = true;
         }
         if(!match)
@@ -550,6 +551,7 @@ void GleamDebugger::resetTransientState()
     mBpRules.clear();
     mPdataCache.clear();
     mSymLoadedBases.clear(); // explicit symbol loads die with the old process
+    mModulePaths.clear();    // image paths are per-process-session
     mHideOriginals.clear(); // old-process writes are meaningless now
     mOepBreakpoint = 0;
     mBreakInExpected = false;
@@ -656,6 +658,7 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
        mStepOutBpGen == mStepOutGen)
     {
         mStepOutBpAddr = 0;
+        mStepOutBpOurs = false; // the engine consumed our one-shot
         stepOutTick();
         return;
     }
@@ -668,6 +671,7 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
        info.address == mStepOutBpAddr && mDebugEvent.dwThreadId != mStepOutTid)
     {
         mStepOutRearmPending = mStepOutBpAddr;
+        mStepOutBpOurs = false; // consumed by the non-owner hit
         printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
                mDebugEvent.dwThreadId);
         fflush(stdout);
@@ -954,6 +958,8 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
                        (unsigned long long)mStepOutRearm);
                 stepOutFinish("error");
             }
+            else
+                mStepOutBpOurs = true; // physically ours again
         }
         mStepOutRearm = 0;
     }
