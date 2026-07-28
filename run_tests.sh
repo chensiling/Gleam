@@ -1631,6 +1631,23 @@ EOF
 chk "selftest: rangeInImage"     ${TDIR}/gleam_ST.txt "selftest rangeInImage 12/12 ok"
 chk "selftest: excpolicy"        ${TDIR}/gleam_ST.txt "selftest excpolicy 16/16 ok"
 
+# --- suite-wide: no engine internal error in ANY scenario ---
+# cbInternalError is the engine's only channel for "a Windows API we depend on
+# failed" (ResumeThread, ContinueDebugEvent, Detach, WaitForDebugEvent lookup).
+# No scenario in this suite is supposed to produce one, and nothing else asserts
+# on them - so a new internal error could otherwise appear in every single log
+# and the suite would still be green. This sweep is what makes such a
+# regression fail the gate: it caught a bogus ERROR_INVALID_HANDLE reported on
+# every normal teardown by the checked-resume path.
+EV_ERR=$(grep -l 'event error msg=' ${TDIR}/gleam_*.txt 2>/dev/null | tr '\n' ' ')
+if [ -z "$EV_ERR" ]; then
+  ok "suite: no engine internal error in any scenario"
+else
+  bad "suite: engine internal error reported in: $EV_ERR"
+  grep -h 'event error msg=' ${TDIR}/gleam_*.txt 2>/dev/null | sort -u |
+    sed 's/^/    /' >> "${TDIR}/pressure.log"
+fi
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]
