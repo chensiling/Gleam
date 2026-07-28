@@ -1385,6 +1385,59 @@ chkcount "W14d/ownerexit: no phantom step stop"   ${TDIR}/gleam_W14d_ownerexit.t
 chk      "W14d/ownerexit: target completes"       ${TDIR}/gleam_W14d_ownerexit.txt "EXITER_DONE=1"
 chk      "W14d/ownerexit: clean exit"             ${TDIR}/gleam_W14d_ownerexit.txt "stop reason=exit code=0x00000000"
 
+# --- W14e: ignore count layered on the stepout internal bp (S0-1, HIGH) ---
+# The HIGH finding: cbBreakpoint() applied the user ignore count BEFORE the
+# stepout bookkeeping and returned early, while the engine deleted the one-shot
+# regardless - so the operation stayed "active" with no physical breakpoint and
+# the target ran to exit. "ignore" is a bare address->count map that needs no
+# user breakpoint at the address, which is exactly how it reaches the internal
+# one-shot. Both the owner and the non-owner hit must survive it.
+echo "== W14e =="
+printf 'bp TestTarget!marker once\ng\nignore %s 1\nret\nbl\ng\ng\n' "$MCALLNEXT" |
+  timeout 40 "$GLEAM" $TARGET > ${TDIR}/gleam_W14e_owner.txt 2>&1
+ec=$?
+if [ $ec -ne 0 ]; then bad "W14e/owner: abnormal exit (code $ec)"; fi
+chkcount "W14e/owner: stepout still returns"    ${TDIR}/gleam_W14e_owner.txt "stop reason=stepout return" 1
+# The internal one-shot is not a user breakpoint: its hit must be consumed by
+# the stepout bookkeeping, never by the user's ignore counter.
+chkcount "W14e/owner: internal hit not ignored" ${TDIR}/gleam_W14e_owner.txt "event ignored address=0x$MCALLNEXT" 0
+chk      "W14e/owner: no leftover internal bp"  ${TDIR}/gleam_W14e_owner.txt "no breakpoints"
+chk      "W14e/owner: target completes"         ${TDIR}/gleam_W14e_owner.txt "MARKER_RESULT_2=13"
+chk      "W14e/owner: clean exit"               ${TDIR}/gleam_W14e_owner.txt "stop reason=exit code=0x00000000"
+
+# Non-owner path: a worker thread may take the ignore instead. Whichever thread
+# it lands on, the internal bookkeeping for that hit must have printed BEFORE
+# "event ignored" (that ordering IS the fix), and stepout must still return
+# exactly once. An ignored hit with no bookkeeping line ahead of it is the
+# regression.
+W14EOK=0
+for i in $(seq 1 5); do
+  { printf 'bp TestTarget!marker once\ng\nignore %s 1\nret\n' "$MCALLNEXT"
+    for k in $(seq 1 16); do printf 'g\n'; done
+    printf 'quit\n'; } |
+    timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14e_mt_$i.txt 2>&1
+  ec=$?
+  f=${TDIR}/gleam_W14e_mt_$i.txt
+  r=$(grep -cF "stop reason=stepout return" $f)
+  ord=1
+  if grep -qF "event ignored address=0x$MCALLNEXT" $f; then
+    ig=$(grep -nF "event ignored address=0x$MCALLNEXT" $f | head -1 | cut -d: -f1)
+    no=$(grep -nF "hit by non-owner" $f | head -1 | cut -d: -f1)
+    if [ -z "$no" ] || [ "$no" -gt "$ig" ]; then ord=0; fi
+  fi
+  if [ $ec -eq 0 ] && [ "$r" -eq 1 ] && [ "$ord" -eq 1 ]; then
+    W14EOK=$((W14EOK+1))
+  else
+    cp $f ${TDIR}/gleam_W14e_fail_$i.txt
+  fi
+  echo "W14e iter=$i ec=$ec stepoutret=$r order_ok=$ord" >> "${TDIR}/pressure.log"
+done
+if [ "$W14EOK" -eq 5 ]; then
+  ok "W14e: 5/5 runs ec=0 + exactly 1 return + bookkeeping before ignore"
+else
+  bad "W14e: $W14EOK/5 runs clean (see ${TDIR}/gleam_W14e_fail_*.txt)"
+fi
+
 # --- W15: module identity via CodeView GUID (P0-4) ---
 # The bind log always prints the LOGICAL module name ("late"), so grepping for
 # "module=noexp" can never catch a mis-bind. Nor is an address-range test alone
