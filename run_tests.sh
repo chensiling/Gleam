@@ -1882,25 +1882,37 @@ else
   bad "W16/resume: pid query failure not surfaced (pid=$WPID)"
 fi
 
-# reply-later: deterministic deferral. In mt mode the main thread hammers a
-# breakpoint inside inner's slow loop (ILOOP, auto-continued via ignore) while
-# the busy worker hits the bp at inner's entry. The worker's hit pauses with
-# main's exception already pending; the post-event suspend makes the queued
-# exception arrive while ThreadBeingProcessed is the worker, so the engine
-# must reply DBG_REPLY_LATER - and that call fails.
-run W16_replylater "mt" <<EOF
-selftest failapi replylater
-bp 0x$ILOOP
-ignore 0x$ILOOP 200000000
-bp TestTarget!inner
-g
-g
-step
-g
-g
-quit
-EOF
-chkre     "W16/replylater: deferral happened" ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
+# reply-later: inject a DBG_REPLY_LATER continue failure. Both threads hammer
+# their own auto-continued breakpoint (ignore): main inside inner's slow loop
+# (ILOOP), the busy worker at inner's entry - tens of thousands of bp hits,
+# each one a potential deferral.
+#
+# HONEST LIMITATION: the deferral itself is a kernel DELIVERY-ORDER artifact -
+# it fires only when the kernel processes one thread's exception while the
+# other thread's exception is still queued (measured: 968k hits can pass
+# without a single deferral, because the resumed thread is frozen during the
+# whole ThreadBeingProcessed window and can only fault outside it). The
+# ordering cannot be forced from user mode, so the scenario retries bounded
+# times: each attempt either injects (and the handling is asserted on that
+# log) or times out (~15s, a plain miss); all attempts missing = FAIL. What
+# the gate proves is the HANDLING of the failure, never the race itself.
+rlLog=""
+for rlTry in 1 2 3 4 5; do
+  printf "selftest failapi replylater\nbp 0x$ILOOP\nignore 0x$ILOOP 200000000\nbp 0x$INNER\nignore 0x$INNER 200000000\ng\n" |
+    timeout 15 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W16_replylater.txt 2>&1
+  if grep -qE 'ContinueDebugEvent\(DBG_REPLY_LATER\) failed' ${TDIR}/gleam_W16_replylater.txt; then
+    rlLog="yes"
+    break
+  fi
+done
+echo "== W16/replylater =="
+if [ -z "$rlLog" ]; then
+  bad "W16/replylater: no deferral in 5 attempts (see ${TDIR}/gleam_W16_replylater.txt)"
+else
+  ok "W16/replylater: injected (attempt $rlTry)"
+fi
+chkre     "W16/replylater: main hammered"      ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
+chkre     "W16/replylater: worker hammered"    ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$INNER"
 chkre     "W16/replylater: precise error"     ${TDIR}/gleam_W16_replylater.txt '^event error msg="Debugger::ContinueDebugEvent\(DBG_REPLY_LATER\) failed \(error 5, pid=[0-9]+, tid=[0-9]+\)"'
 chkcount  "W16/replylater: exactly 1 error"   ${TDIR}/gleam_W16_replylater.txt 'event error msg=' 1
 chk       "W16/replylater: controlled exit"   ${TDIR}/gleam_W16_replylater.txt "[gleam] session finished"
