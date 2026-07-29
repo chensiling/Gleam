@@ -1,5 +1,6 @@
 #include "Debugger.h"
 #include "Debugger.Thread.Registers.h"
+#include <string>
 #include <unordered_set>
 
 #ifndef DBG_REPLY_LATER
@@ -54,7 +55,11 @@ namespace GleeBug
         // resume site (next step completion, detach cleanup, loop end). Only
         // successful resumes and confirmed-dead threads erase their entry -
         // this keeps the debugger-owned suspend count balanced.
-        const auto resumeSuspendedThreads = [this, &SuspendedThreads, &ThreadBeingProcessed]()
+        //
+        // Returns the number of threads that could NOT be resumed (entries
+        // left in SuspendedThreads), so detach/loop-end can verify the
+        // debugger-owned suspend count actually balanced out.
+        const auto resumeSuspendedThreads = [this, &SuspendedThreads, &ThreadBeingProcessed]() -> size_t
         {
             for(auto itr = SuspendedThreads.begin(); itr != SuspendedThreads.end(); )
             {
@@ -90,20 +95,22 @@ namespace GleeBug
                 }
             }
             ThreadBeingProcessed = 0;
+            return SuspendedThreads.size(); // leftover entries = unrestored
         };
 
         // Unified suspension cleanup for loop exits (detach, error break,
         // natural end): resume everything, then drop the stepping flags so no
         // trap flag survives us. Mid-loop resume sites must NOT use this - they
         // still need isInternalStepping for the pending exceptionEvent dispatch.
-        const auto cleanupSuspensions = [this, &resumeSuspendedThreads]()
+        // Returns the number of threads that could not be resumed.
+        const auto cleanupSuspensions = [this, &resumeSuspendedThreads]() -> size_t
         {
             if(mThread)
             {
                 mThread->isInternalStepping = false;
                 mThread->isSingleStepping = false;
             }
-            resumeSuspendedThreads();
+            return resumeSuspendedThreads();
         };
 
         // Single continue path so the fault-injection hook covers every
@@ -352,9 +359,33 @@ namespace GleeBug
 
             if(mDetach || mDetachAndBreak)
             {
-                // Leave no debugger-owned suspension behind (unified cleanup,
-                // also runs on the natural loop end below).
+                // NEVER detach with debugger-owned suspensions left behind:
+                // in an attach session the target would keep frozen threads
+                // after we are gone. Bounded retry first (transient failures
+                // clear within a few scheduler slices); if any thread still
+                // cannot be resumed, REFUSE the detach - the session stays
+                // alive and attached so the user can fix the cause and retry.
                 cleanupSuspensions();
+                for(int retry = 0; retry < 3 && !SuspendedThreads.empty(); retry++)
+                {
+                    Sleep(50);
+                    resumeSuspendedThreads();
+                }
+                if(!SuspendedThreads.empty())
+                {
+                    std::string msg = "Debugger::Detach refused: threads still suspended by us (tid";
+                    for(const auto & entry : SuspendedThreads)
+                    {
+                        char tidBuf[16];
+                        sprintf_s(tidBuf, " %u", entry.first);
+                        msg += tidBuf;
+                    }
+                    msg += ") - detach aborted, target left attached";
+                    cbInternalError(msg);
+                    mDetach = false;
+                    mDetachAndBreak = false;
+                    continue;
+                }
                 if(!UnsafeDetach())
                     cbInternalError("Debugger::Detach failed!");
                 break;
@@ -363,6 +394,23 @@ namespace GleeBug
 
         //cleanup (unified: also covers error breaks and natural loop end)
         cleanupSuspensions();
+        // Terminal resume-failure report: the loop is already over, so we
+        // cannot keep the session alive - but the leftover must never pass
+        // silently. (A launch target dies with us; an attach target is
+        // terminated by the OS while still attached, so nothing actually
+        // stays frozen - this is the honest audit trail.)
+        if(!SuspendedThreads.empty())
+        {
+            std::string msg = "Debugger: loop ended with threads still suspended by us (tid";
+            for(const auto & entry : SuspendedThreads)
+            {
+                char tidBuf[16];
+                sprintf_s(tidBuf, " %u", entry.first);
+                msg += tidBuf;
+            }
+            msg += ")";
+            cbInternalError(msg);
+        }
         mProcesses.clear();
         mProcess = nullptr;
         mIsDebugging = false;

@@ -365,6 +365,11 @@ private:
     bool mStepArmed = false;      // a user-requested step is in flight
     bool mStepOverArmed = false;  // a user-requested step-over is in flight
     std::atomic<bool> mQuitting{ false }; // detach/quit in flight: no injections
+    // Set by the "detach" command; cleared when the engine's refusal
+    // (unrestored suspensions) is detected or when the session ends. Needed
+    // because quit/restart also set mQuitting, and only detach can be
+    // refused (quit/restart terminate the target, so nothing stays frozen).
+    std::atomic<bool> mDetachInFlight{ false };
 
     // Serializes stub injection (forceBreakIn) against stub cleanup and the
     // quitting transition: an injection and a cleanup can never interleave.

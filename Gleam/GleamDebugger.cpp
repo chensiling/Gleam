@@ -572,6 +572,7 @@ void GleamDebugger::resetTransientState()
     mDbgBreakInAddr = 0;
     mExitThreadResolveAttempts = 0;
     mQuitting = false; // was set to shut the old session down cleanly
+    mDetachInFlight = false; // a new session has no detach in flight
     // Fault-injection hooks are per-process statics: clear them here so an
     // armed-but-never-fired hook cannot leak into the restarted session.
     // (A fired hook already disarmed itself - see failapi* in
@@ -968,6 +969,20 @@ void GleamDebugger::cbPreDebugEvent(const DEBUG_EVENT & debugEvent)
 
 void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
 {
+    // Detect a REFUSED detach: the engine cleared mDetach/mDetachAndBreak
+    // without ending the session (unrestored debugger-owned suspensions).
+    // The detach command set mQuitting, which suppresses the command loop -
+    // re-arm it so the user stays in control of the still-attached target.
+    // (quit/restart are not affected: they terminate the target, so the
+    // session is ending anyway.)
+    if(mDetachInFlight.load() && mIsDebugging && !mDetach && !mDetachAndBreak)
+    {
+        mDetachInFlight = false;
+        mQuitting = false;
+        printf("detach refused: target left attached (threads still suspended by us)\n");
+        fflush(stdout);
+    }
+
     // Pending logical breakpoints retry at EVERY debug event opportunity
     // (PDB-only symbols become resolvable as the loader proceeds).
     for(const auto & lb : mLogicalBps)

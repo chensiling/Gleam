@@ -60,6 +60,15 @@ namespace
         SetLastError(ERROR_ACCESS_DENIED);
         return (DWORD)-1;
     }
+
+    // Persistent variant ("selftest failapi resume always"): fails EVERY
+    // resume until "selftest failapi off" disarms it. Used to prove the
+    // detach-refusal path for permanently failing restores.
+    DWORD failapiResumeAlways(HANDLE)
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return (DWORD)-1;
+    }
 }
 
 namespace
@@ -1370,27 +1379,40 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
         cmdExports(args[1], args.size() == 3 ? args[2] : std::string());
         return CmdResult::Handled;
     }
-    if(cmd == "selftest" && args.size() == 3 && args[1] == "failapi")
+    if(cmd == "selftest" && (args.size() == 3 || args.size() == 4) && args[1] == "failapi")
     {
         // Arm an engine fault-injection hook (see GleeBug::Debugger::mTestHook*
         // and the failapi* functions at the top of this file). Used by the W16
         // gate scenarios to prove the loop's API-failure paths are handled.
         const std::string & which = args[2];
-        if(which == "wait")
-            mTestHookWaitForDebugEvent = &failapiWait;
-        else if(which == "continue")
-            mTestHookContinueDebugEvent = &failapiContinueNormal;
-        else if(which == "replylater")
-            mTestHookContinueDebugEvent = &failapiContinueReplyLater;
-        else if(which == "resume")
-            mTestHookResumeThread = &failapiResume;
-        else
+        if(which == "off")
         {
-            printf("usage: selftest failapi wait|continue|replylater|resume\n");
+            // Disarm everything (pairs with the persistent "always" variant).
+            mTestHookWaitForDebugEvent = nullptr;
+            mTestHookContinueDebugEvent = nullptr;
+            mTestHookResumeThread = nullptr;
+            printf("selftest failapi off\n");
             fflush(stdout);
             return CmdResult::Handled;
         }
-        printf("selftest failapi armed %s\n", which.c_str());
+        if(which == "wait" && args.size() == 3)
+            mTestHookWaitForDebugEvent = &failapiWait;
+        else if(which == "continue" && args.size() == 3)
+            mTestHookContinueDebugEvent = &failapiContinueNormal;
+        else if(which == "replylater" && args.size() == 3)
+            mTestHookContinueDebugEvent = &failapiContinueReplyLater;
+        else if(which == "resume" && args.size() == 3)
+            mTestHookResumeThread = &failapiResume;
+        else if(which == "resume" && args.size() == 4 && args[3] == "always")
+            mTestHookResumeThread = &failapiResumeAlways;
+        else
+        {
+            printf("usage: selftest failapi wait|continue|replylater|resume [always]|off\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        printf("selftest failapi armed %s%s\n", which.c_str(),
+               args.size() == 4 ? " always" : "");
         fflush(stdout);
         return CmdResult::Handled;
     }

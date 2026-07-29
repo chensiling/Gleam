@@ -1746,12 +1746,25 @@ chk "W15: identity selftest (aux)" $W15F "selftest modid 2/2 ok"
 # --- W16: engine API fault injection (selftest failapi) ---
 # The loop's wait/continue/reply-later/resume failure paths cannot be forced
 # from outside, so the engine exposes dormant test hooks
-# (GleeBug::Debugger::mTestHook*) that "selftest failapi" arms. Each hook
-# fails ONCE and disarms itself; session init clears any armed-but-unfired
-# hook. Every log is held to an EXACT internal-error count, so an extra
+# (GleeBug::Debugger::mTestHook*) that "selftest failapi" arms. Hooks fail
+# ONCE and disarm themselves (the "always" variant fails persistently until
+# "selftest failapi off"); session init clears any armed-but-unfired hook.
+# Every log is held to an EXACT internal-error count, so an extra
 # cleanup/handle/resume error can never hide behind the expected one - this
 # is also why the suite-wide sweep may keep excluding these logs.
 echo "== W16 =="
+
+# chk_pid_gone <desc> <file>: the target of a LAUNCH session must be gone
+# once gleam has exited (the OS terminates a debuggee whose debugger died).
+chk_pid_gone() {
+  local pid=$(sed -n 's/^event process op=create pid=\([0-9]*\).*/\1/p' "$2" | head -1)
+  sleep 1
+  if [ -n "$pid" ] && ! tasklist //FI "PID eq $pid" 2>/dev/null | grep -q " $pid "; then
+    ok "$1"
+  else
+    bad "$1 (pid=$pid still alive; see $2)"
+  fi
+}
 
 # wait: the first WaitForDebugEvent after arming fails -> error + loop break.
 run W16_wait "" <<EOF
@@ -1759,9 +1772,10 @@ selftest failapi wait
 bp TestTarget!marker once
 g
 EOF
-chk      "W16/wait: precise error"    ${TDIR}/gleam_W16_wait.txt 'event error msg="Debugger::WaitForDebugEvent failed (error 5)"'
-chkcount "W16/wait: exactly 1 error"  ${TDIR}/gleam_W16_wait.txt 'event error msg=' 1
-chk      "W16/wait: controlled exit"  ${TDIR}/gleam_W16_wait.txt "[gleam] session finished"
+chkre     "W16/wait: precise error"    ${TDIR}/gleam_W16_wait.txt '^event error msg="Debugger::WaitForDebugEvent failed \(error 5\)"'
+chkcount  "W16/wait: exactly 1 error"  ${TDIR}/gleam_W16_wait.txt 'event error msg=' 1
+chk       "W16/wait: controlled exit"  ${TDIR}/gleam_W16_wait.txt "[gleam] session finished"
+chk_pid_gone "W16/wait: no target residue" ${TDIR}/gleam_W16_wait.txt
 
 # continue: the normal ContinueDebugEvent of the next resume fails.
 run W16_continue "" <<EOF
@@ -1770,9 +1784,10 @@ g
 selftest failapi continue
 g
 EOF
-chk      "W16/continue: precise error"   ${TDIR}/gleam_W16_continue.txt 'event error msg="Debugger::ContinueDebugEvent failed (error 5'
-chkcount "W16/continue: exactly 1 error" ${TDIR}/gleam_W16_continue.txt 'event error msg=' 1
-chk      "W16/continue: controlled exit" ${TDIR}/gleam_W16_continue.txt "[gleam] session finished"
+chkre     "W16/continue: precise error"   ${TDIR}/gleam_W16_continue.txt '^event error msg="Debugger::ContinueDebugEvent failed \(error 5, pid=[0-9]+, tid=[0-9]+\)"'
+chkcount  "W16/continue: exactly 1 error" ${TDIR}/gleam_W16_continue.txt 'event error msg=' 1
+chk       "W16/continue: controlled exit" ${TDIR}/gleam_W16_continue.txt "[gleam] session finished"
+chk_pid_gone "W16/continue: no target residue" ${TDIR}/gleam_W16_continue.txt
 
 # resume: stepping in mt mode suspends the busy worker; resuming it after the
 # step fails ONCE. The failure must be reported, the loop must carry on (the
@@ -1792,7 +1807,7 @@ detach
 EOF
 WPID=$(sed -n 's/^event process op=create pid=\([0-9]*\).*/\1/p' ${TDIR}/gleam_W16_resume.txt | head -1)
 sleep 2
-chk      "W16/resume: precise error"     ${TDIR}/gleam_W16_resume.txt 'event error msg="Debugger: ResumeThread failed for tid'
+chkre    "W16/resume: precise error"     ${TDIR}/gleam_W16_resume.txt '^event error msg="Debugger: ResumeThread failed for tid [0-9]+ \(error 5\)"'
 chkcount "W16/resume: exactly 1 error"   ${TDIR}/gleam_W16_resume.txt 'event error msg=' 1
 chk      "W16/resume: loop continues"    ${TDIR}/gleam_W16_resume.txt "stop reason=step rip="
 chk      "W16/resume: detached"          ${TDIR}/gleam_W16_resume.txt "detaching..."
@@ -1821,10 +1836,11 @@ g
 g
 quit
 EOF
-chk      "W16/replylater: deferral happened" ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
-chk      "W16/replylater: precise error"     ${TDIR}/gleam_W16_replylater.txt 'event error msg="Debugger::ContinueDebugEvent(DBG_REPLY_LATER) failed (error 5'
-chkcount "W16/replylater: exactly 1 error"   ${TDIR}/gleam_W16_replylater.txt 'event error msg=' 1
-chk      "W16/replylater: controlled exit"   ${TDIR}/gleam_W16_replylater.txt "[gleam] session finished"
+chkre     "W16/replylater: deferral happened" ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
+chkre     "W16/replylater: precise error"     ${TDIR}/gleam_W16_replylater.txt '^event error msg="Debugger::ContinueDebugEvent\(DBG_REPLY_LATER\) failed \(error 5, pid=[0-9]+, tid=[0-9]+\)"'
+chkcount  "W16/replylater: exactly 1 error"   ${TDIR}/gleam_W16_replylater.txt 'event error msg=' 1
+chk       "W16/replylater: controlled exit"   ${TDIR}/gleam_W16_replylater.txt "[gleam] session finished"
+chk_pid_gone "W16/replylater: no target residue" ${TDIR}/gleam_W16_replylater.txt
 
 # restart: an armed-but-never-fired hook must not leak into the restarted
 # session (session init clears all hooks). The new session's step does real
@@ -1844,6 +1860,57 @@ chk      "W16/restart: hooked session armed" ${TDIR}/gleam_W16_restart.txt "self
 chkcount "W16/restart: zero injected errors" ${TDIR}/gleam_W16_restart.txt 'event error msg=' 0
 chk      "W16/restart: step works in new session" ${TDIR}/gleam_W16_restart.txt "stop reason=step rip="
 chk      "W16/restart: new session completes"     ${TDIR}/gleam_W16_restart.txt "MARKER_RESULT_2=13"
+
+# attach + PERMANENT resume failure: the detach must be REFUSED while any
+# debugger-owned suspension cannot be restored - an attached target keeps
+# running after we leave, so frozen threads would stay frozen forever. The
+# engine retries with a bound, then aborts the detach; gleam re-arms the
+# command loop; after disarming the fault, the second detach must succeed
+# and the target must stay ALIVE (a proper detach, not a termination).
+#
+# The suspension comes from the breakpoint re-execution machinery (internal
+# step suspends the other threads): the target's main thread calls
+# GetTickCount in a tight spin, so the first bp hit pauses quickly. The
+# "step" follow-up is what lets the post-event suspend fire (a "detach" at
+# the first pause would skip suspension entirely). Error count is NOT
+# asserted exactly here: the thread population of an attached foreign
+# process varies, only the injected-failure shape and the refusal chain are.
+"$TARGET" wait > ${TDIR}/gleam_W16_attach_target.txt 2>&1 &
+ATT_BG=$!
+sleep 1
+ATT_PID=$(cat /proc/$ATT_BG/winpid 2>/dev/null)
+if [ -z "$ATT_PID" ]; then
+  bad "W16/attach: cannot resolve target pid"
+else
+  printf 'selftest failapi resume always\nbp kernel32!GetTickCount\ng\nstep\ndetach\nselftest failapi off\ndetach\n' |
+    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_attach.txt 2>&1
+  ec=$?
+  echo "== W16/attach =="
+  if [ $ec -ne 0 ]; then bad "W16/attach: abnormal exit (code $ec; see ${TDIR}/gleam_W16_attach.txt)"; fi
+  chk      "W16/attach: persistent hook armed"  ${TDIR}/gleam_W16_attach.txt "selftest failapi armed resume always"
+  chkre    "W16/attach: resume failure (error 5)" ${TDIR}/gleam_W16_attach.txt '^event error msg="Debugger: ResumeThread failed for tid [0-9]+ \(error 5\)"'
+  chk      "W16/attach: engine refuses detach"  ${TDIR}/gleam_W16_attach.txt "Detach refused: threads still suspended by us"
+  chk      "W16/attach: command loop re-armed"  ${TDIR}/gleam_W16_attach.txt "detach refused: target left attached"
+  chkcount "W16/attach: two detach attempts"    ${TDIR}/gleam_W16_attach.txt "detaching..." 2
+  chkcount "W16/attach: single session end"     ${TDIR}/gleam_W16_attach.txt "[gleam] session finished" 1
+  # The refusal must precede the successful detach.
+  rLine=$(grep -nF "Detach refused" ${TDIR}/gleam_W16_attach.txt | head -1 | cut -d: -f1)
+  dLine=$(grep -nF "detaching..." ${TDIR}/gleam_W16_attach.txt | tail -1 | cut -d: -f1)
+  if [ -n "$rLine" ] && [ -n "$dLine" ] && [ "$rLine" -gt 0 ] && [ "$rLine" -lt "$dLine" ]; then
+    ok "W16/attach: refusal before successful detach"
+  else
+    bad "W16/attach: ordering wrong (refusal=$rLine, last detach=$dLine)"
+  fi
+  # A properly detached target is still running; kill it ourselves.
+  sleep 1
+  if tasklist //FI "PID eq $ATT_PID" 2>/dev/null | grep -q " $ATT_PID "; then
+    ok "W16/attach: target alive after detach"
+  else
+    bad "W16/attach: target pid=$ATT_PID gone (killed instead of detached?)"
+  fi
+  powershell -NoProfile -Command "Stop-Process -Id $ATT_PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  kill $ATT_BG 2>/dev/null
+fi
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF

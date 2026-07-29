@@ -195,6 +195,23 @@ int main(int argc, char** argv)
         fflush(stdout);
     }
 
+    if(argc > 1 && !strcmp(argv[1], "wait"))
+    {
+        // Long-lived, always-runnable target for attach scenarios: main spins
+        // (steppable at any moment), a second thread sleeps (a thread that
+        // can be frozen by a failed resume). Runs ~30s unless killed earlier.
+        CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
+        printf("WAIT_READY=1\n");
+        fflush(stdout);
+        DWORD start = GetTickCount();
+        volatile uint64_t k = 0;
+        while(GetTickCount() - start < 30000)
+            k += 0;
+        printf("WAIT_DONE=%llu\n", (unsigned long long)k);
+        fflush(stdout);
+        return 0;
+    }
+
     if(argc > 1 && !strcmp(argv[1], "mt"))
     {
         // A second thread hammering marker(), so stepout's internal
