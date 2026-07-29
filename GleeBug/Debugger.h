@@ -82,6 +82,16 @@ namespace GleeBug
         */
         void Start();
 
+        // Fault-injection hooks for front-end self-tests. Dormant (nullptr) in
+        // normal use: a hook, when set, is called INSTEAD of the matching
+        // Win32 API inside the debug loop and must follow the same contract
+        // (return value + SetLastError). Kept as plain pointers (not compiled
+        // out) so Debug and Release behave identically; the cost is one null
+        // check per call and only an explicit self-test command can arm them.
+        static BOOL(*mTestHookWaitForDebugEvent)(LPDEBUG_EVENT lpDebugEvent, DWORD dwMilliseconds);
+        static BOOL(*mTestHookContinueDebugEvent)(DWORD dwProcessId, DWORD dwThreadId, DWORD dwContinueStatus);
+        static DWORD(*mTestHookResumeThread)(HANDLE hThread);
+
     protected: //debug event callbacks
         /**
         \brief Generic pre debug event callback. Called before the event is internally processed. Provide an implementation to use this callback.

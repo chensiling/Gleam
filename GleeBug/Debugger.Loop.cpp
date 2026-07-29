@@ -64,7 +64,10 @@ namespace GleeBug
                 if(!stillKnown)
                     continue;
 
-                if(ResumeThread(itr.second) == (DWORD)-1)
+                const DWORD resumeResult = mTestHookResumeThread
+                                           ? mTestHookResumeThread(itr.second)
+                                           : ResumeThread(itr.second);
+                if(resumeResult == (DWORD)-1)
                 {
                     char buf[128];
                     sprintf_s(buf, "Debugger: ResumeThread failed for tid %u (error %lu)",
@@ -90,6 +93,15 @@ namespace GleeBug
             resumeSuspendedThreads();
         };
 
+        // Single continue path so the fault-injection hook covers every
+        // ContinueDebugEvent call site (normal continue and DBG_REPLY_LATER).
+        const auto continueDebugEvent = [this](DWORD dwProcessId, DWORD dwThreadId, DWORD dwContinueStatus) -> BOOL
+        {
+            if(mTestHookContinueDebugEvent)
+                return mTestHookContinueDebugEvent(dwProcessId, dwThreadId, dwContinueStatus);
+            return ContinueDebugEvent(dwProcessId, dwThreadId, dwContinueStatus);
+        };
+
         // Check if DBG_REPLY_LATER is supported based on Windows version (Windows 10, version 1507 or above)
         // https://www.gaijin.at/en/infos/windows-version-numbers
         const uint32_t NtBuildNumber = *(uint32_t*)(0x7FFE0000 + 0x260);
@@ -104,7 +116,10 @@ namespace GleeBug
         {
             //wait for a debug event
             mIsRunning = true;
-            if(!MyWaitForDebugEvent(&mDebugEvent, 100))
+            const BOOL waitOk = mTestHookWaitForDebugEvent
+                                ? mTestHookWaitForDebugEvent(&mDebugEvent, 100)
+                                : MyWaitForDebugEvent(&mDebugEvent, 100);
+            if(!waitOk)
             {
                 if(mDetach)
                 {
@@ -151,7 +166,7 @@ namespace GleeBug
                         // Reply to the event later and retain its ownership state until
                         // the same thread's event is processed normally.
                         DeferredExceptionThreads.insert(eventThreadKey);
-                        if(!ContinueDebugEvent(mDebugEvent.dwProcessId, mDebugEvent.dwThreadId, DBG_REPLY_LATER))
+                        if(!continueDebugEvent(mDebugEvent.dwProcessId, mDebugEvent.dwThreadId, DBG_REPLY_LATER))
                         {
                             char contBuf[160];
                             sprintf_s(contBuf, "Debugger::ContinueDebugEvent(DBG_REPLY_LATER) failed (error %lu, pid=%lu, tid=%lu)",
@@ -311,7 +326,7 @@ namespace GleeBug
             }
 
             //continue the debug event
-            if(!ContinueDebugEvent(mDebugEvent.dwProcessId, mDebugEvent.dwThreadId, mContinueStatus))
+            if(!continueDebugEvent(mDebugEvent.dwProcessId, mDebugEvent.dwThreadId, mContinueStatus))
             {
                 char contBuf[160];
                 sprintf_s(contBuf, "Debugger::ContinueDebugEvent failed (error %lu, pid=%lu, tid=%lu)",

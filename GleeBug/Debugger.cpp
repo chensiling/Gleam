@@ -4,6 +4,11 @@
 
 namespace GleeBug
 {
+    // Fault-injection hooks (see Debugger.h), dormant unless a self-test arms them.
+    BOOL(*Debugger::mTestHookWaitForDebugEvent)(LPDEBUG_EVENT, DWORD) = nullptr;
+    BOOL(*Debugger::mTestHookContinueDebugEvent)(DWORD, DWORD, DWORD) = nullptr;
+    DWORD(*Debugger::mTestHookResumeThread)(HANDLE) = nullptr;
+
     Debugger::Debugger()
     {
         mProcesses.clear();

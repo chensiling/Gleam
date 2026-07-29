@@ -31,7 +31,12 @@ GD2=$(printf '%X' $((0x$GDATA + 2)))
 GD4=$(printf '%X' $((0x$GDATA + 4)))
 GD6=$(printf '%X' $((0x$GDATA + 6)))
 GD8=$(printf '%X' $((0x$GDATA + 8)))
-for v in MARKER INNER GDATA MBODY LADDR OEP MRET MCALLNEXT GD2 GD4 GD6 GD8; do
+# inner's slow-loop body (main thread only in mt mode): the target of the
+# first backward jump inside inner, located by disassembly. Used by W16 to
+# make the main thread raise a constant stream of breakpoint exceptions.
+OUT3=$(printf 'disasm TestTarget!inner 60\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
+ILOOP=$(printf '%s\n' "$OUT3" | awk '$1 ~ /^0000000[0-9A-F]+$/ && $2 ~ /^j/ && $3 ~ /^0x0000000[0-9A-F]+$/ { a = strtonum("0x" $1); t = strtonum("0x" substr($3, 3)); if (t < a) { printf "%X", t; exit } }')
+for v in MARKER INNER GDATA MBODY LADDR OEP MRET MCALLNEXT GD2 GD4 GD6 GD8 ILOOP; do
   eval "test -n \"\$$v\"" || { echo "FATAL: cannot resolve $v - suite cannot run"; exit 1; }
 done
 
@@ -1388,21 +1393,24 @@ EOF
 ec=$?
 echo "== W14c/sameaddr =="
 if [ $ec -ne 0 ]; then bad "W14c/sameaddr: abnormal exit (code $ec)"; fi
-# The user once must fire as a NORMAL user breakpoint. A non-owner stop at the
-# same address prints the identical line, so the whole-file match proves
-# nothing. The only window in which a stop at 0x$MCALLNEXT can ONLY be the
-# user once is between "one-shot breakpoint set" (the user once became the
-# physical bp) and the next "re-armed" (the internal int3 is written back and
-# later hits are claimed as internal again).
-if awk -v set="one-shot breakpoint set at 0x$MCALLNEXT" \
+# The user once must fire as a NORMAL user breakpoint, EXACTLY ONCE, and must
+# never be claimed by the stepout bookkeeping. A non-owner stop at the same
+# address prints the identical stop line AND an internal-claim event, so the
+# whole-file match proves nothing. The only window in which a stop at
+# 0x$MCALLNEXT can ONLY be the user once is between "one-shot breakpoint set"
+# (the user once became the physical bp) and the next "re-armed" (the internal
+# int3 is written back and later hits are claimed as internal again).
+read -r wStop wInt < <(awk -v set="one-shot breakpoint set at 0x$MCALLNEXT" \
        -v hit="stop reason=breakpoint type=software address=0x$MCALLNEXT" \
-       'index($0, set)      { f=1; next }
-        f && /re-armed/     { exit }
-        f && index($0, hit) { found=1; exit }
-        END                 { exit !found }' ${TDIR}/gleam_W14c_sameaddr.txt; then
-  ok "W14c/sameaddr: user once fires normally"
+       'index($0, set)          { f=1; next }
+        f && /re-armed/         { exit }
+        f && index($0, hit)     { s++ }
+        f && /hit by non-owner/ { i++ }
+        END                     { print s+0, i+0 }' ${TDIR}/gleam_W14c_sameaddr.txt)
+if [ "$wStop" = "1" ] && [ "$wInt" = "0" ]; then
+  ok "W14c/sameaddr: user once fires once, no internal claim"
 else
-  bad "W14c/sameaddr: user once did not fire as a user breakpoint (see ${TDIR}/gleam_W14c_sameaddr.txt)"
+  bad "W14c/sameaddr: window stops=$wStop (want 1), internal claims=$wInt (want 0) (see ${TDIR}/gleam_W14c_sameaddr.txt)"
 fi
 chk "W14c/sameaddr: stepout completes" ${TDIR}/gleam_W14c_sameaddr.txt "stop reason=stepout return"
 # After the operation completes the last bl must be clean: neither the user
@@ -1419,6 +1427,7 @@ bp $MCALLNEXT once
 bl
 ret
 g
+bl
 quit
 EOF
 ec=$?
@@ -1426,18 +1435,35 @@ echo "== W14c/abort =="
 if [ $ec -ne 0 ]; then bad "W14c/abort: abnormal exit (code $ec)"; fi
 chk "W14c/abort: user once listed"   ${TDIR}/gleam_W14c_abort.txt "0x$MCALLNEXT  software int3"
 chk "W14c/abort: unified abort"        ${TDIR}/gleam_W14c_abort.txt "stepout aborted (new ret)"
-# The user once fires AFTER the abort - but the non-owner stop BEFORE the once
-# was set prints the identical line, so only matches after the
-# "one-shot breakpoint set" line count (after the abort there is no re-arm,
-# so any later hit at that address is the user once).
-if awk -v set="one-shot breakpoint set at 0x$MCALLNEXT" \
+# The user once fires AFTER the abort, EXACTLY ONCE, with no internal claim,
+# and the hit must come from the OWNER thread - the thread stopped at the
+# non-owner stop is the one that issues the new `ret`, so it IS the new
+# operation's owner. This is the deterministic owner-hit counterpart of
+# W14c/sameaddr (whose hit comes from the non-owner busyWorker): setting a bp
+# while the internal one is armed is unreachable in the command model (any
+# command window means the internal bp was already consumed), so owner vs
+# non-owner can only be distinguished AFTER ownership was lost.
+read -r wStop wInt wOwner < <(awk -v set="one-shot breakpoint set at 0x$MCALLNEXT" \
        -v hit="stop reason=breakpoint type=software address=0x$MCALLNEXT" \
-       'index($0, set)      { f=1; next }
-        f && index($0, hit) { found=1; exit }
-        END                 { exit !found }' ${TDIR}/gleam_W14c_abort.txt; then
-  ok "W14c/abort: user once fires"
+       '!f && index($0, hit) { if(owner == "" && match($0, /tid=[0-9]+/)) owner = substr($0, RSTART + 4, RLENGTH - 4) }
+        index($0, set)       { f = 1; next }
+        f && index($0, hit)  { s++
+                               if(owner != "" && match($0, /tid=[0-9]+/) && substr($0, RSTART + 4, RLENGTH - 4) == owner) o++ }
+        f && /hit by non-owner/ { i++ }
+        END                  { print s + 0, i + 0, o + 0 }' ${TDIR}/gleam_W14c_abort.txt)
+if [ "$wStop" = "1" ] && [ "$wInt" = "0" ] && [ "$wOwner" = "1" ]; then
+  ok "W14c/abort: owner hits the user once exactly once, no internal claim"
 else
-  bad "W14c/abort: user once did not fire (see ${TDIR}/gleam_W14c_abort.txt)"
+  bad "W14c/abort: post-set stops=$wStop (want 1), internal claims=$wInt (want 0), owner hits=$wOwner (want 1) (see ${TDIR}/gleam_W14c_abort.txt)"
+fi
+# The fired once is consumed: the second bl (after the hit) must not list it.
+read -r wOnce < <(awk '/stepout aborted \(new ret\)/ { f=1 }
+                       f && / once/                  { n++ }
+                       END                            { print n+0 }' ${TDIR}/gleam_W14c_abort.txt)
+if [ "$wOnce" = "0" ]; then
+  ok "W14c/abort: fired once gone from bl"
+else
+  bad "W14c/abort: $wOnce leftover once listing(s) after abort (see ${TDIR}/gleam_W14c_abort.txt)"
 fi
 
 # --- W14d: teardown paths at a non-owner stop (quit / restart / owner exit) ---
@@ -1717,6 +1743,69 @@ chk "W15: late reloaded"           $W15F "LATE2=1"
 # in for the event-level base verification above.
 chk "W15: identity selftest (aux)" $W15F "selftest modid 2/2 ok"
 
+# --- W16: engine API fault injection (selftest failapi) ---
+# The loop's wait/continue/reply-later/resume failure paths cannot be forced
+# from outside, so the engine exposes dormant test hooks
+# (GleeBug::Debugger::mTestHook*) that "selftest failapi" arms. Every
+# scenario must produce the precise error line and a controlled session end;
+# the suite-wide internal-error sweep EXCLUDES these logs on purpose.
+echo "== W16 =="
+
+# wait: the first WaitForDebugEvent after arming fails -> error + loop break.
+run W16_wait "" <<EOF
+selftest failapi wait
+bp TestTarget!marker once
+g
+EOF
+chk "W16/wait: precise error"    ${TDIR}/gleam_W16_wait.txt 'event error msg="Debugger::WaitForDebugEvent failed (error 5)"'
+chk "W16/wait: controlled exit"  ${TDIR}/gleam_W16_wait.txt "[gleam] session finished"
+
+# continue: the normal ContinueDebugEvent of the next resume fails.
+run W16_continue "" <<EOF
+bp TestTarget!marker once
+g
+selftest failapi continue
+g
+EOF
+chk "W16/continue: precise error"   ${TDIR}/gleam_W16_continue.txt 'event error msg="Debugger::ContinueDebugEvent failed (error 5'
+chk "W16/continue: controlled exit" ${TDIR}/gleam_W16_continue.txt "[gleam] session finished"
+
+# resume: stepping in mt mode suspends the busy worker; resuming it after the
+# step fails. The failure must be reported AND the loop must carry on (the
+# step stop still surfaces), because a resume failure is not fatal.
+run W16_resume "mt" <<EOF
+bp TestTarget!marker once
+g
+selftest failapi resume
+step
+quit
+EOF
+chk    "W16/resume: precise error"   ${TDIR}/gleam_W16_resume.txt 'event error msg="Debugger: ResumeThread failed for tid'
+chk    "W16/resume: loop continues"  ${TDIR}/gleam_W16_resume.txt "stop reason=step rip="
+chk    "W16/resume: controlled exit" ${TDIR}/gleam_W16_resume.txt "[gleam] session finished"
+
+# reply-later: deterministic deferral. In mt mode the main thread hammers a
+# breakpoint inside inner's slow loop (ILOOP, auto-continued via ignore) while
+# the busy worker hits the bp at inner's entry. The worker's hit pauses with
+# main's exception already pending; the post-event suspend makes the queued
+# exception arrive while ThreadBeingProcessed is the worker, so the engine
+# must reply DBG_REPLY_LATER - and that call fails.
+run W16_replylater "mt" <<EOF
+selftest failapi replylater
+bp 0x$ILOOP
+ignore 0x$ILOOP 200000000
+bp TestTarget!inner
+g
+g
+step
+g
+g
+quit
+EOF
+chk "W16/replylater: deferral happened" ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
+chk "W16/replylater: precise error"     ${TDIR}/gleam_W16_replylater.txt 'event error msg="Debugger::ContinueDebugEvent(DBG_REPLY_LATER) failed (error 5'
+chk "W16/replylater: controlled exit"   ${TDIR}/gleam_W16_replylater.txt "[gleam] session finished"
+
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF
 selftest
@@ -1733,7 +1822,10 @@ chk "selftest: excpolicy"        ${TDIR}/gleam_ST.txt "selftest excpolicy 16/16 
 # and the suite would still be green. This sweep is what makes such a
 # regression fail the gate: it caught a bogus ERROR_INVALID_HANDLE reported on
 # every normal teardown by the checked-resume path.
-EV_ERR=$(grep -l 'event error msg=' ${TDIR}/gleam_*.txt 2>/dev/null | tr '\n' ' ')
+#
+# W16 is EXCLUDED: those scenarios inject API failures on purpose
+# (selftest failapi) and assert the precise error lines themselves.
+EV_ERR=$(grep -l 'event error msg=' ${TDIR}/gleam_*.txt 2>/dev/null | grep -v 'gleam_W16' | tr '\n' ' ')
 if [ -z "$EV_ERR" ]; then
   ok "suite: no engine internal error in any scenario"
 else

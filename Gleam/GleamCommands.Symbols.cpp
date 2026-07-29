@@ -14,6 +14,48 @@
 
 using namespace GleeBug;
 
+#ifndef DBG_REPLY_LATER
+#define DBG_REPLY_LATER ((NTSTATUS)0x40010001L)
+#endif // DBG_REPLY_LATER
+
+namespace
+{
+    // Fault-injection hooks for "selftest failapi" (engine side:
+    // GleeBug::Debugger::mTestHook*). An armed hook makes the matching Win32
+    // API fail with ERROR_ACCESS_DENIED so the injected failure is
+    // recognizable in the error output. Hooks stay armed for the rest of the
+    // session; every test session is a fresh process, so no unarming exists.
+    BOOL failapiWait(LPDEBUG_EVENT, DWORD)
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+
+    // Fail only "normal" continues; DBG_REPLY_LATER passes through.
+    BOOL failapiContinueNormal(DWORD dwProcessId, DWORD dwThreadId, DWORD dwContinueStatus)
+    {
+        if(dwContinueStatus == (DWORD)DBG_REPLY_LATER)
+            return ContinueDebugEvent(dwProcessId, dwThreadId, dwContinueStatus);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+
+    // Fail only DBG_REPLY_LATER continues; normal ones pass through.
+    BOOL failapiContinueReplyLater(DWORD dwProcessId, DWORD dwThreadId, DWORD dwContinueStatus)
+    {
+        if(dwContinueStatus != (DWORD)DBG_REPLY_LATER)
+            return ContinueDebugEvent(dwProcessId, dwThreadId, dwContinueStatus);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return FALSE;
+    }
+
+    DWORD failapiResume(HANDLE)
+    {
+        SetLastError(ERROR_ACCESS_DENIED);
+        return (DWORD)-1;
+    }
+}
+
 namespace
 {
     struct ModuleInfo
@@ -1320,6 +1362,30 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
     if(cmd == "exports" && (args.size() == 2 || args.size() == 3))
     {
         cmdExports(args[1], args.size() == 3 ? args[2] : std::string());
+        return CmdResult::Handled;
+    }
+    if(cmd == "selftest" && args.size() == 3 && args[1] == "failapi")
+    {
+        // Arm an engine fault-injection hook (see GleeBug::Debugger::mTestHook*
+        // and the failapi* functions at the top of this file). Used by the W16
+        // gate scenarios to prove the loop's API-failure paths are handled.
+        const std::string & which = args[2];
+        if(which == "wait")
+            mTestHookWaitForDebugEvent = &failapiWait;
+        else if(which == "continue")
+            mTestHookContinueDebugEvent = &failapiContinueNormal;
+        else if(which == "replylater")
+            mTestHookContinueDebugEvent = &failapiContinueReplyLater;
+        else if(which == "resume")
+            mTestHookResumeThread = &failapiResume;
+        else
+        {
+            printf("usage: selftest failapi wait|continue|replylater|resume\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        printf("selftest failapi armed %s\n", which.c_str());
+        fflush(stdout);
         return CmdResult::Handled;
     }
     if(cmd == "selftest")
