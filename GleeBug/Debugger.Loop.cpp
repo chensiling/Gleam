@@ -384,6 +384,10 @@ namespace GleeBug
                     cbInternalError(msg);
                     mDetach = false;
                     mDetachAndBreak = false;
+                    // Report the refusal synchronously so the front-end can
+                    // re-arm command control NOW (a quiet target may never
+                    // produce another debug event to learn it from).
+                    cbDetachRefused(msg);
                     continue;
                 }
                 if(!UnsafeDetach())

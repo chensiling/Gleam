@@ -177,6 +177,12 @@ namespace GleeBug
         virtual void cbInternalError(const std::string & error) {};
 
         /**
+        \brief Detach-refused callback. Called synchronously when a requested detach is aborted because debugger-owned thread suspensions could not be restored (the session stays alive and attached). Provide an implementation to re-arm command control immediately - do NOT wait for the next debug event, a quiet target may never produce one.
+        \param info Human-readable details (thread ids that are still suspended).
+        */
+        virtual void cbDetachRefused(const std::string & info) {};
+
+        /**
         \brief Unhandled exception callback. Called after the exception event is processed. Provide an implementation to use this callback.
         \param exceptionRecord The exception record.
         \param firstChance True if the exception is a first chance exception, false otherwise.

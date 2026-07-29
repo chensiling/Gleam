@@ -1756,13 +1756,29 @@ echo "== W16 =="
 
 # chk_pid_gone <desc> <file>: the target of a LAUNCH session must be gone
 # once gleam has exited (the OS terminates a debuggee whose debugger died).
+#
+# pid_state <pid>: alive|gone|error. tasklist exits 0 with an INFO line when
+# the pid does not exist, so "no pid in output" means GONE - but a nonzero
+# exit (query itself broken) must surface as ERROR, never as a false "gone".
+pid_state() {
+  local out ec
+  out=$(${TASKLIST:-tasklist} //FI "PID eq $1" 2>&1); ec=$?
+  if [ $ec -ne 0 ]; then echo error; return; fi
+  if printf '%s\n' "$out" | grep -q " $1 "; then echo alive; else echo gone; fi
+}
+# pid_state self-checks: a forced query failure must read as "error" (never
+# a false "gone"), a certainly-dead pid as "gone" - otherwise the PID gate
+# below could pass on a broken tasklist.
+[ "$(TASKLIST=false pid_state 12345)" = "error" ] && ok "pid_state: query failure distinguished" || bad "pid_state: query failure not distinguished"
+[ "$(pid_state 39999999)" = "gone" ] && ok "pid_state: dead pid reads gone" || bad "pid_state: dead pid misread"
 chk_pid_gone() {
   local pid=$(sed -n 's/^event process op=create pid=\([0-9]*\).*/\1/p' "$2" | head -1)
   sleep 1
-  if [ -n "$pid" ] && ! tasklist //FI "PID eq $pid" 2>/dev/null | grep -q " $pid "; then
+  local st=$(pid_state "$pid")
+  if [ -n "$pid" ] && [ "$st" = "gone" ]; then
     ok "$1"
   else
-    bad "$1 (pid=$pid still alive; see $2)"
+    bad "$1 (pid=$pid state=$st; see $2)"
   fi
 }
 
@@ -1864,17 +1880,22 @@ chk      "W16/restart: new session completes"     ${TDIR}/gleam_W16_restart.txt 
 # attach + PERMANENT resume failure: the detach must be REFUSED while any
 # debugger-owned suspension cannot be restored - an attached target keeps
 # running after we leave, so frozen threads would stay frozen forever. The
-# engine retries with a bound, then aborts the detach; gleam re-arms the
-# command loop; after disarming the fault, the second detach must succeed
-# and the target must stay ALIVE (a proper detach, not a termination).
+# engine retries with a bound, then aborts the detach and reports it through
+# cbDetachRefused SYNCHRONOUSLY; gleam re-arms the command loop immediately
+# and forceBreakIn manufactures the event that re-enters it.
 #
-# The suspension comes from the breakpoint re-execution machinery (internal
-# step suspends the other threads): the target's main thread calls
-# GetTickCount in a tight spin, so the first bp hit pauses quickly. The
-# "step" follow-up is what lets the post-event suspend fire (a "detach" at
-# the first pause would skip suspension entirely). Error count is NOT
-# asserted exactly here: the thread population of an attached foreign
-# process varies, only the injected-failure shape and the refusal chain are.
+# The breakpoint is ONE-SHOT on purpose: after its single hit the target is
+# completely quiet (main spins, the worker is frozen), so the off + second
+# detach can only be processed if the refusal itself woke the command loop -
+# a persistent breakpoint would mask a missing synchronous report by
+# generating follow-up events. The suspension comes from the breakpoint
+# re-execution machinery (internal step suspends the other threads); the
+# "step" follow-up lets the post-event suspend fire (a "detach" at the
+# first pause would skip suspension entirely).
+#
+# Error assertions: every internal error in the log must match the whitelist
+# (injected resume failures with error 5, or the single expected refusal) -
+# anything else fails the gate even though the suite-wide sweep skips W16.
 "$TARGET" wait > ${TDIR}/gleam_W16_attach_target.txt 2>&1 &
 ATT_BG=$!
 sleep 1
@@ -1882,7 +1903,7 @@ ATT_PID=$(cat /proc/$ATT_BG/winpid 2>/dev/null)
 if [ -z "$ATT_PID" ]; then
   bad "W16/attach: cannot resolve target pid"
 else
-  printf 'selftest failapi resume always\nbp kernel32!GetTickCount\ng\nstep\ndetach\nselftest failapi off\ndetach\n' |
+  printf 'selftest failapi resume always\nbp kernel32!GetTickCount once\ng\nstep\ndetach\nselftest failapi off\ndetach\n' |
     timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_attach.txt 2>&1
   ec=$?
   echo "== W16/attach =="
@@ -1890,7 +1911,16 @@ else
   chk      "W16/attach: persistent hook armed"  ${TDIR}/gleam_W16_attach.txt "selftest failapi armed resume always"
   chkre    "W16/attach: resume failure (error 5)" ${TDIR}/gleam_W16_attach.txt '^event error msg="Debugger: ResumeThread failed for tid [0-9]+ \(error 5\)"'
   chk      "W16/attach: engine refuses detach"  ${TDIR}/gleam_W16_attach.txt "Detach refused: threads still suspended by us"
+  chkcount "W16/attach: exactly one refusal"    ${TDIR}/gleam_W16_attach.txt "Detach refused: threads still suspended by us" 1
   chk      "W16/attach: command loop re-armed"  ${TDIR}/gleam_W16_attach.txt "detach refused: target left attached"
+  # Whitelist: no internal error outside the two expected shapes.
+  wlBad=$(grep 'event error msg=' ${TDIR}/gleam_W16_attach.txt |
+          grep -cvE 'ResumeThread failed for tid [0-9]+ \(error 5\)|Debugger::Detach refused: threads still suspended by us')
+  if [ "$wlBad" -eq 0 ]; then
+    ok "W16/attach: all errors within whitelist"
+  else
+    bad "W16/attach: $wlBad unexpected internal error(s) (see ${TDIR}/gleam_W16_attach.txt)"
+  fi
   chkcount "W16/attach: two detach attempts"    ${TDIR}/gleam_W16_attach.txt "detaching..." 2
   chkcount "W16/attach: single session end"     ${TDIR}/gleam_W16_attach.txt "[gleam] session finished" 1
   # The refusal must precede the successful detach.
@@ -1901,12 +1931,13 @@ else
   else
     bad "W16/attach: ordering wrong (refusal=$rLine, last detach=$dLine)"
   fi
-  # A properly detached target is still running; kill it ourselves.
+  # A properly detached target is still running; kill it ourselves. The
+  # pid_state self-checks above prove "alive" is not a broken-query artifact.
   sleep 1
-  if tasklist //FI "PID eq $ATT_PID" 2>/dev/null | grep -q " $ATT_PID "; then
+  if [ "$(pid_state "$ATT_PID")" = "alive" ]; then
     ok "W16/attach: target alive after detach"
   else
-    bad "W16/attach: target pid=$ATT_PID gone (killed instead of detached?)"
+    bad "W16/attach: target pid=$ATT_PID state=$(pid_state "$ATT_PID") (killed instead of detached?)"
   fi
   powershell -NoProfile -Command "Stop-Process -Id $ATT_PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
   kill $ATT_BG 2>/dev/null

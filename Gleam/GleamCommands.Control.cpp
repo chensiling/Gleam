@@ -166,7 +166,6 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     if(cmd == "detach")
     {
         mQuitting = true;
-        mDetachInFlight = true; // the engine may REFUSE (see cbPostDebugEvent)
         abortStepOut("detach");
         // Reclaim stub resources left in the target before letting it go
         // (terminate -> wait -> close -> free, in that order).
