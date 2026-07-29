@@ -1746,9 +1746,11 @@ chk "W15: identity selftest (aux)" $W15F "selftest modid 2/2 ok"
 # --- W16: engine API fault injection (selftest failapi) ---
 # The loop's wait/continue/reply-later/resume failure paths cannot be forced
 # from outside, so the engine exposes dormant test hooks
-# (GleeBug::Debugger::mTestHook*) that "selftest failapi" arms. Every
-# scenario must produce the precise error line and a controlled session end;
-# the suite-wide internal-error sweep EXCLUDES these logs on purpose.
+# (GleeBug::Debugger::mTestHook*) that "selftest failapi" arms. Each hook
+# fails ONCE and disarms itself; session init clears any armed-but-unfired
+# hook. Every log is held to an EXACT internal-error count, so an extra
+# cleanup/handle/resume error can never hide behind the expected one - this
+# is also why the suite-wide sweep may keep excluding these logs.
 echo "== W16 =="
 
 # wait: the first WaitForDebugEvent after arming fails -> error + loop break.
@@ -1757,8 +1759,9 @@ selftest failapi wait
 bp TestTarget!marker once
 g
 EOF
-chk "W16/wait: precise error"    ${TDIR}/gleam_W16_wait.txt 'event error msg="Debugger::WaitForDebugEvent failed (error 5)"'
-chk "W16/wait: controlled exit"  ${TDIR}/gleam_W16_wait.txt "[gleam] session finished"
+chk      "W16/wait: precise error"    ${TDIR}/gleam_W16_wait.txt 'event error msg="Debugger::WaitForDebugEvent failed (error 5)"'
+chkcount "W16/wait: exactly 1 error"  ${TDIR}/gleam_W16_wait.txt 'event error msg=' 1
+chk      "W16/wait: controlled exit"  ${TDIR}/gleam_W16_wait.txt "[gleam] session finished"
 
 # continue: the normal ContinueDebugEvent of the next resume fails.
 run W16_continue "" <<EOF
@@ -1767,22 +1770,38 @@ g
 selftest failapi continue
 g
 EOF
-chk "W16/continue: precise error"   ${TDIR}/gleam_W16_continue.txt 'event error msg="Debugger::ContinueDebugEvent failed (error 5'
-chk "W16/continue: controlled exit" ${TDIR}/gleam_W16_continue.txt "[gleam] session finished"
+chk      "W16/continue: precise error"   ${TDIR}/gleam_W16_continue.txt 'event error msg="Debugger::ContinueDebugEvent failed (error 5'
+chkcount "W16/continue: exactly 1 error" ${TDIR}/gleam_W16_continue.txt 'event error msg=' 1
+chk      "W16/continue: controlled exit" ${TDIR}/gleam_W16_continue.txt "[gleam] session finished"
 
 # resume: stepping in mt mode suspends the busy worker; resuming it after the
-# step fails. The failure must be reported AND the loop must carry on (the
-# step stop still surfaces), because a resume failure is not fatal.
+# step fails ONCE. The failure must be reported, the loop must carry on (the
+# step stop still surfaces) and - because the engine keeps failed suspension
+# entries and retries at the next resume site - the detach cleanup must
+# resume the frozen thread for real. Proof is thread-level: the busy worker
+# only prints BUSYWORKER_DONE=1 if it actually ran to its end (process exit
+# alone cannot prove it - ExitProcess also kills frozen threads). The target
+# inherits gleam's stdout, so its output keeps landing in the log after the
+# debugger is gone; give it a moment before checking.
 run W16_resume "mt" <<EOF
 bp TestTarget!marker once
 g
 selftest failapi resume
 step
-quit
+detach
 EOF
-chk    "W16/resume: precise error"   ${TDIR}/gleam_W16_resume.txt 'event error msg="Debugger: ResumeThread failed for tid'
-chk    "W16/resume: loop continues"  ${TDIR}/gleam_W16_resume.txt "stop reason=step rip="
-chk    "W16/resume: controlled exit" ${TDIR}/gleam_W16_resume.txt "[gleam] session finished"
+WPID=$(sed -n 's/^event process op=create pid=\([0-9]*\).*/\1/p' ${TDIR}/gleam_W16_resume.txt | head -1)
+sleep 2
+chk      "W16/resume: precise error"     ${TDIR}/gleam_W16_resume.txt 'event error msg="Debugger: ResumeThread failed for tid'
+chkcount "W16/resume: exactly 1 error"   ${TDIR}/gleam_W16_resume.txt 'event error msg=' 1
+chk      "W16/resume: loop continues"    ${TDIR}/gleam_W16_resume.txt "stop reason=step rip="
+chk      "W16/resume: detached"          ${TDIR}/gleam_W16_resume.txt "detaching..."
+chk      "W16/resume: frozen thread resumed and completed" ${TDIR}/gleam_W16_resume.txt "BUSYWORKER_DONE=1"
+if [ -n "$WPID" ] && ! tasklist //FI "PID eq $WPID" 2>/dev/null | grep -q " $WPID "; then
+  ok "W16/resume: target process exited on its own"
+else
+  bad "W16/resume: target pid=$WPID did not exit (see ${TDIR}/gleam_W16_resume.txt)"
+fi
 
 # reply-later: deterministic deferral. In mt mode the main thread hammers a
 # breakpoint inside inner's slow loop (ILOOP, auto-continued via ignore) while
@@ -1802,9 +1821,29 @@ g
 g
 quit
 EOF
-chk "W16/replylater: deferral happened" ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
-chk "W16/replylater: precise error"     ${TDIR}/gleam_W16_replylater.txt 'event error msg="Debugger::ContinueDebugEvent(DBG_REPLY_LATER) failed (error 5'
-chk "W16/replylater: controlled exit"   ${TDIR}/gleam_W16_replylater.txt "[gleam] session finished"
+chk      "W16/replylater: deferral happened" ${TDIR}/gleam_W16_replylater.txt "event ignored address=0x$ILOOP"
+chk      "W16/replylater: precise error"     ${TDIR}/gleam_W16_replylater.txt 'event error msg="Debugger::ContinueDebugEvent(DBG_REPLY_LATER) failed (error 5'
+chkcount "W16/replylater: exactly 1 error"   ${TDIR}/gleam_W16_replylater.txt 'event error msg=' 1
+chk      "W16/replylater: controlled exit"   ${TDIR}/gleam_W16_replylater.txt "[gleam] session finished"
+
+# restart: an armed-but-never-fired hook must not leak into the restarted
+# session (session init clears all hooks). The new session's step does real
+# safe-step suspend/resume work, so a leaked resume hook would print an
+# error here.
+run W16_restart "" <<EOF
+selftest failapi resume
+restart
+bp TestTarget!marker once
+g
+step
+g
+g
+quit
+EOF
+chk      "W16/restart: hooked session armed" ${TDIR}/gleam_W16_restart.txt "selftest failapi armed resume"
+chkcount "W16/restart: zero injected errors" ${TDIR}/gleam_W16_restart.txt 'event error msg=' 0
+chk      "W16/restart: step works in new session" ${TDIR}/gleam_W16_restart.txt "stop reason=step rip="
+chk      "W16/restart: new session completes"     ${TDIR}/gleam_W16_restart.txt "MARKER_RESULT_2=13"
 
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF

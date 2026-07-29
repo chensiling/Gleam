@@ -48,34 +48,47 @@ namespace GleeBug
         // resumed - there is nothing left to unfreeze, and resuming would fail
         // with ERROR_INVALID_HANDLE and report a bogus internal error on every
         // normal teardown.
+        //
+        // A FAILED resume must NOT drop the entry: the thread is still frozen
+        // by our suspension, so the record is kept and retried at the next
+        // resume site (next step completion, detach cleanup, loop end). Only
+        // successful resumes and confirmed-dead threads erase their entry -
+        // this keeps the debugger-owned suspend count balanced.
         const auto resumeSuspendedThreads = [this, &SuspendedThreads, &ThreadBeingProcessed]()
         {
-            for(auto & itr : SuspendedThreads)
+            for(auto itr = SuspendedThreads.begin(); itr != SuspendedThreads.end(); )
             {
                 bool stillKnown = false;
                 for(const auto & process : mProcesses)
                 {
-                    if(process.second->threads.count(itr.first) != 0)
+                    if(process.second->threads.count(itr->first) != 0)
                     {
                         stillKnown = true;
                         break;
                     }
                 }
                 if(!stillKnown)
+                {
+                    itr = SuspendedThreads.erase(itr);
                     continue;
+                }
 
                 const DWORD resumeResult = mTestHookResumeThread
-                                           ? mTestHookResumeThread(itr.second)
-                                           : ResumeThread(itr.second);
+                                           ? mTestHookResumeThread(itr->second)
+                                           : ResumeThread(itr->second);
                 if(resumeResult == (DWORD)-1)
                 {
                     char buf[128];
                     sprintf_s(buf, "Debugger: ResumeThread failed for tid %u (error %lu)",
-                              itr.first, GetLastError());
+                              itr->first, GetLastError());
                     cbInternalError(buf);
+                    ++itr; // keep the entry: retried at the next resume site
+                }
+                else
+                {
+                    itr = SuspendedThreads.erase(itr);
                 }
             }
-            SuspendedThreads.clear();
             ThreadBeingProcessed = 0;
         };
 

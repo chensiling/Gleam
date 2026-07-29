@@ -87,6 +87,11 @@ static DWORD WINAPI busyWorker(LPVOID)
         Sleep(0);
     for(int i = 0; i < 12; i++)
         marker(1);
+    // Thread-level completion marker: proves this thread actually resumed and
+    // ran to its end (process exit alone cannot - ExitProcess also kills
+    // frozen threads). W16's resume-failure injection asserts on this line.
+    printf("BUSYWORKER_DONE=1\n");
+    fflush(stdout);
     return 0;
 }
 

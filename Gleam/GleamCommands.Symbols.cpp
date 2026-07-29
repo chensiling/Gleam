@@ -22,35 +22,41 @@ namespace
 {
     // Fault-injection hooks for "selftest failapi" (engine side:
     // GleeBug::Debugger::mTestHook*). An armed hook makes the matching Win32
-    // API fail with ERROR_ACCESS_DENIED so the injected failure is
-    // recognizable in the error output. Hooks stay armed for the rest of the
-    // session; every test session is a fresh process, so no unarming exists.
+    // API fail ONCE with ERROR_ACCESS_DENIED (so the injected failure is
+    // recognizable in the error output) and then disarms itself: a failure
+    // must never leak into the rest of the session, and a following resume
+    // retry must be able to succeed. Session init also clears all hooks, so
+    // an armed-but-never-fired hook cannot pollute a restarted session.
     BOOL failapiWait(LPDEBUG_EVENT, DWORD)
     {
+        GleeBug::Debugger::mTestHookWaitForDebugEvent = nullptr;
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
 
-    // Fail only "normal" continues; DBG_REPLY_LATER passes through.
+    // Fail only the next "normal" continue; DBG_REPLY_LATER passes through.
     BOOL failapiContinueNormal(DWORD dwProcessId, DWORD dwThreadId, DWORD dwContinueStatus)
     {
         if(dwContinueStatus == (DWORD)DBG_REPLY_LATER)
             return ContinueDebugEvent(dwProcessId, dwThreadId, dwContinueStatus);
+        GleeBug::Debugger::mTestHookContinueDebugEvent = nullptr;
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
 
-    // Fail only DBG_REPLY_LATER continues; normal ones pass through.
+    // Fail only the next DBG_REPLY_LATER continue; normal ones pass through.
     BOOL failapiContinueReplyLater(DWORD dwProcessId, DWORD dwThreadId, DWORD dwContinueStatus)
     {
         if(dwContinueStatus != (DWORD)DBG_REPLY_LATER)
             return ContinueDebugEvent(dwProcessId, dwThreadId, dwContinueStatus);
+        GleeBug::Debugger::mTestHookContinueDebugEvent = nullptr;
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
 
     DWORD failapiResume(HANDLE)
     {
+        GleeBug::Debugger::mTestHookResumeThread = nullptr;
         SetLastError(ERROR_ACCESS_DENIED);
         return (DWORD)-1;
     }

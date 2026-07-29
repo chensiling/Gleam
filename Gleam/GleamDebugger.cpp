@@ -572,6 +572,13 @@ void GleamDebugger::resetTransientState()
     mDbgBreakInAddr = 0;
     mExitThreadResolveAttempts = 0;
     mQuitting = false; // was set to shut the old session down cleanly
+    // Fault-injection hooks are per-process statics: clear them here so an
+    // armed-but-never-fired hook cannot leak into the restarted session.
+    // (A fired hook already disarmed itself - see failapi* in
+    // GleamCommands.Symbols.cpp.)
+    mTestHookWaitForDebugEvent = nullptr;
+    mTestHookContinueDebugEvent = nullptr;
+    mTestHookResumeThread = nullptr;
     if(!mPatches.empty())
     {
         // Patches never auto-reapply: the new process must be re-examined
