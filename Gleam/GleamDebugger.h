@@ -53,6 +53,10 @@ public:
     // Terminate the stub thread, wait for it to die, close the handle, and
     // only then free the page - never free memory a stub thread may run on.
     void cleanupBreakInStub();
+    // Completes a deferred detach once the break-in stub thread is confirmed
+    // dead: frees the stub page, then Detach(); refuses (stays attached)
+    // when the page cannot be freed.
+    void finishDeferredDetach();
 
     // "restart" support (main.cpp drives the re-Init + Start loop).
     void setLaunched(bool launched) { mHasLaunchInfo = launched; }
@@ -359,6 +363,10 @@ private:
     std::atomic<bool> mPauseAfterResume{ false }; // "pause" arrived while paused
     std::atomic<HANDLE> mBreakInStubThread{ nullptr }; // injected int3-stub thread
     std::atomic<void*> mBreakInStubPage{ nullptr };    // page backing the stub
+    std::atomic<uint32_t> mBreakInStubTid{ 0 };        // tid of the stub thread (death confirmation)
+    // detach deferred until the break-in stub thread is confirmed dead and
+    // its page is freed (never detach leaving a remote RWX page behind).
+    bool mDetachAfterStubCleanup = false;
     std::atomic<uint64_t> mExitThreadAddr{ 0 };        // kernel32!ExitThread in the debuggee
     std::atomic<uint64_t> mDbgBreakInAddr{ 0 };        // ntdll!DbgUiRemoteBreakin (fallback break-in identity)
     uint32_t mExitThreadResolveAttempts = 0;           // rate-limit retry logging

@@ -1782,6 +1782,46 @@ chk_pid_gone() {
   fi
 }
 
+# VirtualQueryEx helper for the W16/attach MEM_FREE proof: prints STATE=<n>
+# for (pid, address); 0x10000 (65536) = MEM_FREE. Kept as a file so bash
+# quoting cannot mangle the C# source.
+cat > ${TDIR}/vq.ps1 <<'PSEOF'
+param([uint32]$TargetPid, [uint64]$Addr)
+$src = @'
+using System;
+using System.Runtime.InteropServices;
+public static class VQ
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MBI
+    {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public uint AllocationProtect;
+        public IntPtr RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+    [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern UIntPtr VirtualQueryEx(IntPtr h, IntPtr addr, out MBI mbi, UIntPtr len);
+    public static uint StateOf(uint pid, ulong addr)
+    {
+        IntPtr h = OpenProcess(0x0400, false, pid); // PROCESS_QUERY_INFORMATION
+        if(h == IntPtr.Zero) return 0xFFFFFFF1;
+        MBI m;
+        UIntPtr r = VirtualQueryEx(h, new IntPtr((long)addr), out m, (UIntPtr)Marshal.SizeOf(typeof(MBI)));
+        CloseHandle(h);
+        if(r == UIntPtr.Zero) return 0xFFFFFFF2;
+        return m.State;
+    }
+}
+'@
+Add-Type -TypeDefinition $src
+"STATE=$([VQ]::StateOf($TargetPid, $Addr))"
+PSEOF
+
 # wait: the first WaitForDebugEvent after arming fails -> error + loop break.
 run W16_wait "" <<EOF
 selftest failapi wait
@@ -1828,10 +1868,18 @@ chkcount "W16/resume: exactly 1 error"   ${TDIR}/gleam_W16_resume.txt 'event err
 chk      "W16/resume: loop continues"    ${TDIR}/gleam_W16_resume.txt "stop reason=step rip="
 chk      "W16/resume: detached"          ${TDIR}/gleam_W16_resume.txt "detaching..."
 chk      "W16/resume: frozen thread resumed and completed" ${TDIR}/gleam_W16_resume.txt "BUSYWORKER_DONE=1"
-if [ -n "$WPID" ] && ! tasklist //FI "PID eq $WPID" 2>/dev/null | grep -q " $WPID "; then
+WPSTATE=$(pid_state "$WPID")
+if [ -n "$WPID" ] && [ "$WPSTATE" = "gone" ]; then
   ok "W16/resume: target process exited on its own"
 else
-  bad "W16/resume: target pid=$WPID did not exit (see ${TDIR}/gleam_W16_resume.txt)"
+  bad "W16/resume: target pid=$WPID state=$WPSTATE (see ${TDIR}/gleam_W16_resume.txt)"
+fi
+# A broken tasklist must FAIL this scenario, not pass it: with the query
+# forced to fail, the same pid check yields "error", never "gone".
+if [ -n "$WPID" ] && [ "$(TASKLIST=false pid_state "$WPID")" = "error" ]; then
+  ok "W16/resume: pid query failure would fail the gate"
+else
+  bad "W16/resume: pid query failure not surfaced (pid=$WPID)"
 fi
 
 # reply-later: deterministic deferral. In mt mode the main thread hammers a
@@ -1913,15 +1961,32 @@ else
   chk      "W16/attach: engine refuses detach"  ${TDIR}/gleam_W16_attach.txt "Detach refused: threads still suspended by us"
   chkcount "W16/attach: exactly one refusal"    ${TDIR}/gleam_W16_attach.txt "Detach refused: threads still suspended by us" 1
   chk      "W16/attach: command loop re-armed"  ${TDIR}/gleam_W16_attach.txt "detach refused: target left attached"
-  # Whitelist: no internal error outside the two expected shapes.
-  wlBad=$(grep 'event error msg=' ${TDIR}/gleam_W16_attach.txt |
-          grep -cvE 'ResumeThread failed for tid [0-9]+ \(error 5\)|Debugger::Detach refused: threads still suspended by us')
+  # The stub cleanup must never hit its timeout path: the deferred detach
+  # waits for the stub thread's EXIT_THREAD event, frees the page, and only
+  # then lets go.
+  chkcount "W16/attach: no stub cleanup timeout" ${TDIR}/gleam_W16_attach.txt "wait=0x102" 0
+  chk      "W16/attach: detach deferred for stub" ${TDIR}/gleam_W16_attach.txt "detach deferred: waiting for break-in stub thread to exit"
+  chkre    "W16/attach: stub page freed"        ${TDIR}/gleam_W16_attach.txt "^event breakin stub freed page=0x[0-9A-Fa-f]+"
+  # Whitelist: every internal error must FULL-LINE match one of the two
+  # expected shapes (anchored, CRLF-aware): an injected resume failure with
+  # error 5, or the single refusal with its tid list and fixed tail.
+  WL_RE='^event error msg="Debugger: ResumeThread failed for tid [0-9]+ \(error 5\)"\r?$|^event error msg="Debugger::Detach refused: threads still suspended by us \(tid [0-9 ]+\) - detach aborted, target left attached"\r?$'
+  wlBad=$(grep 'event error msg=' ${TDIR}/gleam_W16_attach.txt | grep -cvE "$WL_RE")
   if [ "$wlBad" -eq 0 ]; then
     ok "W16/attach: all errors within whitelist"
   else
     bad "W16/attach: $wlBad unexpected internal error(s) (see ${TDIR}/gleam_W16_attach.txt)"
   fi
-  chkcount "W16/attach: two detach attempts"    ${TDIR}/gleam_W16_attach.txt "detaching..." 2
+  # Whitelist meta-test: a legal prefix with junk appended must be REJECTED,
+  # a clean specimen must be ACCEPTED (proves the patterns really anchor).
+  printf 'event error msg="Debugger: ResumeThread failed for tid 123 (error 5); cleanup failed"\r\n' > ${TDIR}/wl_neg.txt
+  printf 'event error msg="Debugger::Detach refused: threads still suspended by us (tid 123 456) - detach aborted, target left attached"\r\n' > ${TDIR}/wl_pos.txt
+  if [ "$(grep -cvE "$WL_RE" ${TDIR}/wl_neg.txt)" -eq 1 ] && [ "$(grep -cvE "$WL_RE" ${TDIR}/wl_pos.txt)" -eq 0 ]; then
+    ok "W16/attach: whitelist anchors verified"
+  else
+    bad "W16/attach: whitelist anchoring broken"
+  fi
+  chkcount "W16/attach: two detach completions" ${TDIR}/gleam_W16_attach.txt "detaching..." 2
   chkcount "W16/attach: single session end"     ${TDIR}/gleam_W16_attach.txt "[gleam] session finished" 1
   # The refusal must precede the successful detach.
   rLine=$(grep -nF "Detach refused" ${TDIR}/gleam_W16_attach.txt | head -1 | cut -d: -f1)
@@ -1931,9 +1996,22 @@ else
   else
     bad "W16/attach: ordering wrong (refusal=$rLine, last detach=$dLine)"
   fi
+  # Independent proof the remote page is gone: VirtualQueryEx on the stub
+  # address (from the injection log line) must report MEM_FREE (0x10000),
+  # and the target must still be alive afterwards.
+  stubPage=$(sed -n 's/^event breakin injected page=0x\([0-9A-Fa-f]*\).*/\1/p' ${TDIR}/gleam_W16_attach.txt | head -1)
+  sleep 1
+  vqState=""
+  if [ -n "$stubPage" ]; then
+    vqState=$(powershell -NoProfile -ExecutionPolicy Bypass -File ${TDIR}/vq.ps1 "$ATT_PID" "$(printf '%d' 0x$stubPage)" 2>/dev/null | sed -n 's/^STATE=\([0-9]*\).*/\1/p')
+  fi
+  if [ "$vqState" = "65536" ]; then
+    ok "W16/attach: stub page MEM_FREE after detach"
+  else
+    bad "W16/attach: stub page state=$vqState (want 65536=MEM_FREE, page=0x$stubPage)"
+  fi
   # A properly detached target is still running; kill it ourselves. The
   # pid_state self-checks above prove "alive" is not a broken-query artifact.
-  sleep 1
   if [ "$(pid_state "$ATT_PID")" = "alive" ]; then
     ok "W16/attach: target alive after detach"
   else

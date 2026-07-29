@@ -86,9 +86,10 @@ void GleamDebugger::forceBreakIn()
     if(!ensureBreakInStub(process))
         return;
 
+    DWORD stubTid = 0;
     HANDLE hThread = CreateRemoteThread(process->hProcess, nullptr, 0,
                                         (LPTHREAD_START_ROUTINE)mBreakInStubPage.load(),
-                                        nullptr, CREATE_SUSPENDED, nullptr);
+                                        nullptr, CREATE_SUSPENDED, &stubTid);
     if(!hThread)
     {
         printf("event breakin fail=thread_create err=%lu\n", GetLastError());
@@ -96,6 +97,7 @@ void GleamDebugger::forceBreakIn()
         fallbackDebugBreak(process);
         return;
     }
+    mBreakInStubTid.store(stubTid);
     mBreakInStubThread.store(hThread);
     if(ResumeThread(hThread) == (DWORD)-1)
     {
@@ -105,6 +107,7 @@ void GleamDebugger::forceBreakIn()
         TerminateThread(hThread, 0);
         WaitForSingleObject(hThread, 1000);
         CloseHandle(mBreakInStubThread.exchange(nullptr));
+        mBreakInStubTid.store(0);
         fallbackDebugBreak(process);
         return;
     }
@@ -114,27 +117,56 @@ void GleamDebugger::forceBreakIn()
 
 void GleamDebugger::cleanupBreakInStub()
 {
+    // Request stub teardown WITHOUT ever losing track of it. The thread is
+    // hastened with TerminateThread; only a CONFIRMED death (or the thread's
+    // EXIT_THREAD event, see cbExitThreadEvent) releases the handle, and
+    // only a released handle lets the page go. If the thread cannot be
+    // confirmed dead right now (a held debug event freezes the whole
+    // process, so any wait inside a pause times out by construction), the
+    // handle and page stay registered: the detach path defers on them, and
+    // quit/restart paths reclaim them when the target dies.
     std::lock_guard<std::mutex> lock(mBreakInMutex);
-    auto hThread = mBreakInStubThread.load();
-    if(hThread)
+    if(auto hThread = mBreakInStubThread.load())
     {
         TerminateThread(hThread, 0);
-        // Only after the thread is CONFIRMED dead may the page go away;
-        // on timeout keep the handle and the page and say so visibly.
-        DWORD wr = WaitForSingleObject(hThread, 1000);
-        if(wr != WAIT_OBJECT_0)
+        if(WaitForSingleObject(hThread, 0) == WAIT_OBJECT_0)
         {
-            printf("event breakin cleanup wait=0x%lX (thread+page kept)\n", wr);
-            fflush(stdout);
             CloseHandle(hThread);
             mBreakInStubThread.store(nullptr);
-            return; // page intentionally kept
+            mBreakInStubTid.store(0);
         }
-        CloseHandle(hThread);
-        mBreakInStubThread.store(nullptr);
     }
+    if(!mBreakInStubThread.load())
+    {
+        if(auto page = mBreakInStubPage.exchange(nullptr))
+            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
+    }
+}
+
+void GleamDebugger::finishDeferredDetach()
+{
+    // The stub thread is confirmed dead (its EXIT_THREAD event arrived), so
+    // the page can never be executed again. Free it BEFORE letting go: a
+    // detach must not leave a remote RWX page in a surviving target. If the
+    // free fails, refuse the detach and stay attached instead.
+    std::lock_guard<std::mutex> lock(mBreakInMutex);
     if(auto page = mBreakInStubPage.exchange(nullptr))
-        VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
+    {
+        if(!VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE))
+        {
+            mQuitting = false; // detach is off; the session stays attached
+            mWantsPause = true; // hand control back at THIS event
+            printf("event error msg=\"Gleam: detach refused, break-in stub page free failed (error %lu)\"\n",
+                   GetLastError());
+            fflush(stdout);
+            return;
+        }
+        printf("event breakin stub freed page=0x%p\n", page);
+        fflush(stdout);
+    }
+    Detach(); // detach happens at the end of the debug loop iteration
+    printf("detaching...\n");
+    fflush(stdout);
 }
 
 void GleamDebugger::fallbackDebugBreak(GleeBug::Process* process)
@@ -323,6 +355,22 @@ void GleamDebugger::cbCreateThreadEvent(const CREATE_THREAD_DEBUG_INFO & createT
 void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread, const Thread & thread)
 {
     mRawDrThreads.erase(mDebugEvent.dwThreadId); // raw-DR ownership dies with the thread
+    // Break-in stub thread exited: the kernel reports the exit only after
+    // the thread's last user-mode instruction, so it can never touch the
+    // stub page again - this is the death confirmation the deferred detach
+    // cleanup waits for (a WaitForSingleObject inside a pause could never
+    // succeed: a held debug event freezes the whole process).
+    if(mBreakInStubTid.load() != 0 && mDebugEvent.dwThreadId == mBreakInStubTid.load())
+    {
+        if(auto hThread = mBreakInStubThread.exchange(nullptr))
+            CloseHandle(hThread);
+        mBreakInStubTid.store(0);
+        if(mDetachAfterStubCleanup)
+        {
+            mDetachAfterStubCleanup = false;
+            finishDeferredDetach();
+        }
+    }
     // The thread a stepout operation owns is gone: cancel it.
     if(mStepOutActive && mDebugEvent.dwThreadId == mStepOutTid)
         abortStepOut("thread exit");
@@ -568,6 +616,14 @@ void GleamDebugger::resetTransientState()
     mOepBreakpoint = 0;
     mBreakInExpected = false;
     mPauseAfterResume = false;
+    // Break-in stub records point into the OLD (now dead) process: the OS
+    // reclaimed the page and the thread, so just drop our records - no
+    // VirtualFreeEx (the address space is gone).
+    if(auto hThread = mBreakInStubThread.exchange(nullptr))
+        CloseHandle(hThread);
+    mBreakInStubTid = 0;
+    mBreakInStubPage = nullptr;
+    mDetachAfterStubCleanup = false;
     mExitThreadAddr = 0;
     mDbgBreakInAddr = 0;
     mExitThreadResolveAttempts = 0;
@@ -902,15 +958,16 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     if(isStubBreakIn || isFallbackBreakIn)
     {
         mContinueStatus = DBG_CONTINUE;
-        // The stub thread self-terminates via call ExitThread; kill it as a
-        // belt-and-braces. The page is session-scoped and reused, freed at
-        // cbExitProcessEvent - never while a stub thread may run on it.
-        if(auto hThread = mBreakInStubThread.exchange(nullptr))
-        {
+        // Terminate the stub thread right at its int3: it must NOT run the
+        // trailing "call ExitThread" - the resolved ExitThread address is
+        // best-effort (a wrong one would send the thread into a fault loop),
+        // and the thread is at a known-good point inside our own page now.
+        // Keep the HANDLE: the EXIT_THREAD event is the death confirmation
+        // the deferred detach cleanup waits for before the stub page may be
+        // freed. (Waiting here could never succeed - a held debug event
+        // freezes the whole process.)
+        if(auto hThread = mBreakInStubThread.load())
             TerminateThread(hThread, 0);
-            WaitForSingleObject(hThread, 1000);
-            CloseHandle(hThread);
-        }
         emitStop("pause", nullptr);
         abortStepOut("pause");
         mWantsPause = true;

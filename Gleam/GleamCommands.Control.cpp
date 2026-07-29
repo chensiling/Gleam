@@ -167,8 +167,20 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     {
         mQuitting = true;
         abortStepOut("detach");
+        // A live break-in stub thread must be CONFIRMED dead before we let
+        // go: this pause holds a debug event, so the whole target is frozen
+        // and any wait here times out by construction. Defer the real
+        // Detach() to the stub's EXIT_THREAD event (cbExitThreadEvent ->
+        // finishDeferredDetach) instead of leaking its RWX page on timeout.
+        if(mBreakInStubThread.load())
+        {
+            mDetachAfterStubCleanup = true;
+            printf("detach deferred: waiting for break-in stub thread to exit\n");
+            fflush(stdout);
+            return CmdResult::Resume;
+        }
         // Reclaim stub resources left in the target before letting it go
-        // (terminate -> wait -> close -> free, in that order).
+        // (terminate -> confirm -> close -> free, in that order).
         cleanupBreakInStub();
         Detach(); // detach happens at the end of the debug loop iteration
         printf("detaching...\n");
