@@ -637,8 +637,20 @@ bool GleamDebugger::handleStepOutBreakpoint(const BreakpointInfo & info)
     // so no path can leave a stale delete right behind.
     mStepOutBpOurs = false;
 
+    // Stale generation (hit by ANY thread): the physical bp is gone and the
+    // operation has nothing left to wait on. Converge to an error finish
+    // BEFORE the owner/non-owner split, so a stale hit can never register a
+    // deferred re-arm - that would write an int3 back for a dead generation
+    // and set mStepOutBpOurs for an operation that no longer owns it.
+    if(mStepOutBpGen != mStepOutGen)
+    {
+        mStepOutBpAddr = 0;
+        stepOutFinish("error");
+        return true; // consumed; stop record was emitted by stepOutFinish
+    }
+
     // Owner thread, owning generation: drive the next tick.
-    if(mDebugEvent.dwThreadId == mStepOutTid && mStepOutBpGen == mStepOutGen)
+    if(mDebugEvent.dwThreadId == mStepOutTid)
     {
         mStepOutBpAddr = 0;
         stepOutTick();
@@ -650,21 +662,11 @@ bool GleamDebugger::handleStepOutBreakpoint(const BreakpointInfo & info)
     // step AFTER this event, so arming a replacement now would make the
     // non-owner trip it again. Two-stage: register here, arm at the NEXT
     // event (cbPostDebugEvent). The hit surfaces as a normal stop.
-    if(mDebugEvent.dwThreadId != mStepOutTid)
-    {
-        mStepOutRearmPending = mStepOutBpAddr;
-        printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
-               mDebugEvent.dwThreadId);
-        fflush(stdout);
-        return false;
-    }
-
-    // Owner thread but a stale generation: the physical bp is gone and the
-    // operation has nothing left to wait on. Finish with an error instead
-    // of leaving mStepOutActive set with no breakpoint behind it.
-    mStepOutBpAddr = 0;
-    stepOutFinish("error");
-    return true; // consumed; stop record was emitted by stepOutFinish
+    mStepOutRearmPending = mStepOutBpAddr;
+    printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
+           mDebugEvent.dwThreadId);
+    fflush(stdout);
+    return false;
 }
 
 void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)

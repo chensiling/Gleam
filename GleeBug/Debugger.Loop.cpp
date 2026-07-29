@@ -152,7 +152,13 @@ namespace GleeBug
                         // the same thread's event is processed normally.
                         DeferredExceptionThreads.insert(eventThreadKey);
                         if(!ContinueDebugEvent(mDebugEvent.dwProcessId, mDebugEvent.dwThreadId, DBG_REPLY_LATER))
+                        {
+                            char contBuf[160];
+                            sprintf_s(contBuf, "Debugger::ContinueDebugEvent(DBG_REPLY_LATER) failed (error %lu, pid=%lu, tid=%lu)",
+                                      GetLastError(), mDebugEvent.dwProcessId, mDebugEvent.dwThreadId);
+                            cbInternalError(contBuf);
                             break;
+                        }
 
                         // Wait for the next event
                         continue;

@@ -17,8 +17,9 @@ PROBE=$(timeout 30 "$TARGET" | grep -E '^(MARKER|INNER|GDATA)=')
 MARKER=$(printf '%s\n' "$PROBE" | sed -n 's/^MARKER=0*\([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F')
 INNER=$(printf '%s\n' "$PROBE" | sed -n 's/^INNER=0*\([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F')
 GDATA=$(printf '%s\n' "$PROBE" | sed -n 's/^GDATA=0*\([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F')
-OUT=$(printf 'eval TestTarget!marker\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
+OUT=$(printf 'eval TestTarget!marker\neval TestTarget!looper\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
 MBODY=$(printf '%s\n' "$OUT" | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | head -1)
+LADDR=$(printf '%s\n' "$OUT" | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | sed -n '2p')
 OEP=$(printf '%s\n' "$OUT" | sed -n 's/^event process.*start=0x0*\([0-9A-F]*\).*/\1/p' | head -1)
 # The ret instruction and the instruction after "call inner" inside marker,
 # located by disassembly (never by fixed offsets).
@@ -30,7 +31,7 @@ GD2=$(printf '%X' $((0x$GDATA + 2)))
 GD4=$(printf '%X' $((0x$GDATA + 4)))
 GD6=$(printf '%X' $((0x$GDATA + 6)))
 GD8=$(printf '%X' $((0x$GDATA + 8)))
-for v in MARKER INNER GDATA MBODY OEP MRET MCALLNEXT GD2 GD4 GD6 GD8; do
+for v in MARKER INNER GDATA MBODY LADDR OEP MRET MCALLNEXT GD2 GD4 GD6 GD8; do
   eval "test -n \"\$$v\"" || { echo "FATAL: cannot resolve $v - suite cannot run"; exit 1; }
 done
 
@@ -1319,7 +1320,7 @@ w14b g        "stop reason=stepout return" g g g g g g g g g g g g g g g
 w14b step     "stop reason=step rip=" "step"
 w14b stepover "stop reason=step rip=" "stepover"
 w14b tgo      "stop reason=trace " "tgo rax!=0 100"
-w14b until    "stop reason=breakpoint" "until TestTarget!looper"
+w14b until    "stop reason=breakpoint type=software address=0x$LADDR" "until TestTarget!looper"
 w14b newret   "stop reason=stepout return" "ret"
 # Aborting the old stepout must not delete a USER breakpoint - not the normal
 # one that happens to sit at the internal one-shot's own address, and not an
@@ -1387,9 +1388,22 @@ EOF
 ec=$?
 echo "== W14c/sameaddr =="
 if [ $ec -ne 0 ]; then bad "W14c/sameaddr: abnormal exit (code $ec)"; fi
-# The user once must fire as a NORMAL user breakpoint (this line cannot come
-# from the internal one-shot, which reports through the stepout bookkeeping).
-chk "W14c/sameaddr: user once fires normally" ${TDIR}/gleam_W14c_sameaddr.txt "stop reason=breakpoint type=software address=0x$MCALLNEXT"
+# The user once must fire as a NORMAL user breakpoint. A non-owner stop at the
+# same address prints the identical line, so the whole-file match proves
+# nothing. The only window in which a stop at 0x$MCALLNEXT can ONLY be the
+# user once is between "one-shot breakpoint set" (the user once became the
+# physical bp) and the next "re-armed" (the internal int3 is written back and
+# later hits are claimed as internal again).
+if awk -v set="one-shot breakpoint set at 0x$MCALLNEXT" \
+       -v hit="stop reason=breakpoint type=software address=0x$MCALLNEXT" \
+       'index($0, set)      { f=1; next }
+        f && /re-armed/     { exit }
+        f && index($0, hit) { found=1; exit }
+        END                 { exit !found }' ${TDIR}/gleam_W14c_sameaddr.txt; then
+  ok "W14c/sameaddr: user once fires normally"
+else
+  bad "W14c/sameaddr: user once did not fire as a user breakpoint (see ${TDIR}/gleam_W14c_sameaddr.txt)"
+fi
 chk "W14c/sameaddr: stepout completes" ${TDIR}/gleam_W14c_sameaddr.txt "stop reason=stepout return"
 # After the operation completes the last bl must be clean: neither the user
 # once (consumed by its own hit) nor the internal one (consumed by owner).
@@ -1412,7 +1426,19 @@ echo "== W14c/abort =="
 if [ $ec -ne 0 ]; then bad "W14c/abort: abnormal exit (code $ec)"; fi
 chk "W14c/abort: user once listed"   ${TDIR}/gleam_W14c_abort.txt "0x$MCALLNEXT  software int3"
 chk "W14c/abort: unified abort"        ${TDIR}/gleam_W14c_abort.txt "stepout aborted (new ret)"
-chk "W14c/abort: user once fires"      ${TDIR}/gleam_W14c_abort.txt "stop reason=breakpoint type=software address=0x$MCALLNEXT"
+# The user once fires AFTER the abort - but the non-owner stop BEFORE the once
+# was set prints the identical line, so only matches after the
+# "one-shot breakpoint set" line count (after the abort there is no re-arm,
+# so any later hit at that address is the user once).
+if awk -v set="one-shot breakpoint set at 0x$MCALLNEXT" \
+       -v hit="stop reason=breakpoint type=software address=0x$MCALLNEXT" \
+       'index($0, set)      { f=1; next }
+        f && index($0, hit) { found=1; exit }
+        END                 { exit !found }' ${TDIR}/gleam_W14c_abort.txt; then
+  ok "W14c/abort: user once fires"
+else
+  bad "W14c/abort: user once did not fire (see ${TDIR}/gleam_W14c_abort.txt)"
+fi
 
 # --- W14d: teardown paths at a non-owner stop (quit / restart / owner exit) ---
 # quit and restart must go through the SAME abort entry point as pause and
