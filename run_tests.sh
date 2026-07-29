@@ -31,11 +31,24 @@ GD2=$(printf '%X' $((0x$GDATA + 2)))
 GD4=$(printf '%X' $((0x$GDATA + 4)))
 GD6=$(printf '%X' $((0x$GDATA + 6)))
 GD8=$(printf '%X' $((0x$GDATA + 8)))
-# inner's slow-loop body (main thread only in mt mode): the target of the
-# first backward jump inside inner, located by disassembly. Used by W16 to
-# make the main thread raise a constant stream of breakpoint exceptions.
-OUT3=$(printf 'disasm TestTarget!inner 60\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
-ILOOP=$(printf '%s\n' "$OUT3" | awk '$1 ~ /^0000000[0-9A-F]+$/ && $2 ~ /^j/ && $3 ~ /^0x0000000[0-9A-F]+$/ { a = strtonum("0x" $1); t = strtonum("0x" substr($3, 3)); if (t < a) { printf "%X", t; exit } }')
+# inner's slow-loop body (main thread only in mt/mtl mode): the target of
+# the first backward jump inside inner, located by disassembly. Used by W16
+# to make the main thread raise a constant stream of breakpoint exceptions.
+#
+# The probe must NOT use gleam's "!inner" symbol resolution: under
+# incremental linking the PDB can point at a ZOMBIE body (an outdated copy
+# the linker replaced), and a breakpoint computed from it lands
+# mid-instruction in the REAL body - it corrupted "sub rsp, imm" once and
+# sent main into an access violation. Instead follow the target's own
+# printed INNER (the ILT thunk) through its jmp to the real body, and
+# require the slow loop's cmp against 10000000 (0x989680) in the listing as
+# proof the right function was found.
+OUT3=$(printf 'disasm 0x%s 2\nquit\n' "$INNER" | timeout 30 "$GLEAM" $TARGET 2>&1)
+IBODY=$(printf '%s\n' "$OUT3" | sed -n 's/^0000000[0-9A-F]*  jmp 0x0000000\([0-9A-F]*\).*$/\1/p' | head -1)
+[ -z "$IBODY" ] && IBODY=$INNER
+OUT4=$(printf 'disasm 0x%s 60\nquit\n' "$IBODY" | timeout 30 "$GLEAM" $TARGET 2>&1)
+ILOOP=$(printf '%s\n' "$OUT4" | awk '$1 ~ /^0000000[0-9A-F]+$/ && $2 ~ /^j/ && $3 ~ /^0x0000000[0-9A-F]+$/ { a = strtonum("0x" $1); t = strtonum("0x" substr($3, 3)); if (t < a) { printf "%X", t; exit } }')
+printf '%s\n' "$OUT4" | grep -q '989680' || { echo "FATAL: ILOOP probe lost the slow loop (IBODY=$IBODY)"; exit 1; }
 for v in MARKER INNER GDATA MBODY LADDR OEP MRET MCALLNEXT GD2 GD4 GD6 GD8 ILOOP; do
   eval "test -n \"\$$v\"" || { echo "FATAL: cannot resolve $v - suite cannot run"; exit 1; }
 done
@@ -1884,22 +1897,22 @@ fi
 
 # reply-later: inject a DBG_REPLY_LATER continue failure. Both threads hammer
 # their own auto-continued breakpoint (ignore): main inside inner's slow loop
-# (ILOOP), the busy worker at inner's entry - tens of thousands of bp hits,
-# each one a potential deferral.
+# (ILOOP), the worker at inner's entry - using "mtl" mode, whose partner
+# thread hammers for 5000 marker calls. The partner's LIFETIME is what
+# matters: a deferral needs one thread's exception queued while the other's
+# bp-hit internal step runs, and a partner that exits after 12 calls (~1ms
+# with an ignored bp) leaves main hammering alone - no deferral can ever
+# happen afterwards (Release gate proved it: ~1M solo hits, zero deferrals).
 #
-# HONEST LIMITATION: the deferral itself is a kernel DELIVERY-ORDER artifact -
-# it fires only when the kernel processes one thread's exception while the
-# other thread's exception is still queued (measured: 968k hits can pass
-# without a single deferral, because the resumed thread is frozen during the
-# whole ThreadBeingProcessed window and can only fault outside it). The
-# ordering cannot be forced from user mode, so the scenario retries bounded
-# times: each attempt either injects (and the handling is asserted on that
-# log) or times out (~15s, a plain miss); all attempts missing = FAIL. What
-# the gate proves is the HANDLING of the failure, never the race itself.
+# HONEST LIMITATION: even with a long-lived partner the exact overlap is a
+# kernel scheduling artifact, so the scenario still retries bounded times.
+# Each attempt either injects (the handling is asserted on that log) or
+# times out (~10s, a plain miss); all attempts missing = FAIL. What the gate
+# proves is the HANDLING of the failure, never the scheduling itself.
 rlLog=""
-for rlTry in 1 2 3 4 5; do
+for rlTry in 1 2 3; do
   printf "selftest failapi replylater\nbp 0x$ILOOP\nignore 0x$ILOOP 200000000\nbp 0x$INNER\nignore 0x$INNER 200000000\ng\n" |
-    timeout 15 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W16_replylater.txt 2>&1
+    timeout 10 "$GLEAM" $TARGET mtl > ${TDIR}/gleam_W16_replylater.txt 2>&1
   if grep -qE 'ContinueDebugEvent\(DBG_REPLY_LATER\) failed' ${TDIR}/gleam_W16_replylater.txt; then
     rlLog="yes"
     break
@@ -1907,7 +1920,7 @@ for rlTry in 1 2 3 4 5; do
 done
 echo "== W16/replylater =="
 if [ -z "$rlLog" ]; then
-  bad "W16/replylater: no deferral in 5 attempts (see ${TDIR}/gleam_W16_replylater.txt)"
+  bad "W16/replylater: no deferral in 3 attempts (see ${TDIR}/gleam_W16_replylater.txt)"
 else
   ok "W16/replylater: injected (attempt $rlTry)"
 fi

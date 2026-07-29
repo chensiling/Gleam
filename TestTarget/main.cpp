@@ -95,6 +95,22 @@ static DWORD WINAPI busyWorker(LPVOID)
     return 0;
 }
 
+// "mtl" mode: same gate alignment, but hammers for a long time. The
+// reply-later fault injection needs a partner thread whose exceptions keep
+// overlapping main's internal-step windows; 12 calls are over in ~1ms with
+// an ignored breakpoint, after which main hammers alone and no deferral can
+// ever happen (Release gate proved this: ~1M solo hits, zero deferrals).
+static DWORD WINAPI busyWorkerLong(LPVOID)
+{
+    while(g_gate < 2)
+        Sleep(0);
+    for(int i = 0; i < 5000; i++)
+        marker(1);
+    printf("BUSYWORKER_DONE=1\n");
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if(argc > 1 && !strcmp(argv[1], "exc"))
@@ -219,6 +235,14 @@ int main(int argc, char** argv)
         g_slowInner = true;
         g_mainTid = GetCurrentThreadId();
         CreateThread(nullptr, 0, busyWorker, nullptr, 0, nullptr);
+    }
+    else if(argc > 1 && !strcmp(argv[1], "mtl"))
+    {
+        // Same alignment as mt, but a LONG-LIVED hammering partner for the
+        // reply-later fault injection (see busyWorkerLong).
+        g_slowInner = true;
+        g_mainTid = GetCurrentThreadId();
+        CreateThread(nullptr, 0, busyWorkerLong, nullptr, 0, nullptr);
     }
     else
         CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
