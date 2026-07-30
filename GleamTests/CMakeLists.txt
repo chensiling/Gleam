@@ -5,6 +5,9 @@ project(GleamTests)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Use dynamic runtime library (/MD) to match Google Test
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+
 # Google Test
 add_subdirectory(../googletest googletest EXCLUDE_FROM_ALL)
 
@@ -19,6 +22,8 @@ add_executable(GleamTests
     test_main.cpp
     test_caches.cpp
     test_constants.cpp
+    test_ilt_disambiguation.cpp
+    ../Gleam/GleamIltDisambiguation.cpp
 )
 
 # Link Google Test

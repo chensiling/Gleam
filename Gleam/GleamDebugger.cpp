@@ -1,4 +1,6 @@
 #include "GleamDebugger.h"
+#include "Log.h"
+#include "Constants.h"
 
 #include <cstdio>
 #include <psapi.h>
@@ -50,8 +52,7 @@ void GleamDebugger::forceBreakIn()
     std::lock_guard<std::mutex> lock(mBreakInMutex);
     if(mQuitting.load())
     {
-        printf("event breakin skip=quitting\n");
-        fflush(stdout);
+        Gleam::logEvent("breakin skip=quitting");
         return;
     }
 
@@ -69,8 +70,7 @@ void GleamDebugger::forceBreakIn()
     // pending event will arrive and clean itself up).
     if(mBreakInStubThread.load())
     {
-        printf("event breakin skip=in_flight\n");
-        fflush(stdout);
+        Gleam::logEvent("breakin skip=in_flight");
         return;
     }
 
@@ -92,8 +92,7 @@ void GleamDebugger::forceBreakIn()
                                         nullptr, CREATE_SUSPENDED, &stubTid);
     if(!hThread)
     {
-        printf("event breakin fail=thread_create err=%lu\n", GetLastError());
-        fflush(stdout);
+        Gleam::logEvent("breakin fail=thread_create err=%lu", GetLastError());
         fallbackDebugBreak(process);
         return;
     }
@@ -112,8 +111,7 @@ void GleamDebugger::forceBreakIn()
     }
     if(!resumed)
     {
-        printf("event breakin fail=resume err=%lu\n", GetLastError());
-        fflush(stdout);
+        Gleam::logEvent("breakin fail=resume err=%lu", GetLastError());
         // Don't leave a permanently suspended thread in the target - but
         // only close the handle when death is CONFIRMED; an unconfirmed
         // thread keeps handle + tid + page registered (the deferred detach
@@ -121,18 +119,16 @@ void GleamDebugger::forceBreakIn()
         bool terminated = TerminateThread(hThread, 0) != 0;
         if(!terminated)
         {
-            printf("event breakin fail=terminate err=%lu\n", GetLastError());
-            fflush(stdout);
+            Gleam::logEvent("breakin fail=terminate err=%lu", GetLastError());
         }
-        else if(WaitForSingleObject(hThread, 1000) == WAIT_OBJECT_0)
+        else if(WaitForSingleObject(hThread, Gleam::Limits::THREAD_WAIT_TIMEOUT_MS) == WAIT_OBJECT_0)
         {
             CloseHandle(mBreakInStubThread.exchange(nullptr));
             mBreakInStubTid.store(0);
         }
         else
         {
-            printf("event breakin fail=terminate_wait (thread+page kept)\n");
-            fflush(stdout);
+            Gleam::logEvent("breakin fail=terminate_wait (thread+page kept)");
         }
         // C3-R6 FIX: When hide is off, use DebugBreakProcess fallback.
         // When hide is on, DebugBreakProcess would fail (PEB.BeingDebugged cleared),
@@ -147,13 +143,11 @@ void GleamDebugger::forceBreakIn()
             // and fails. Re-arm the pause request; it will be consumed at the next
             // natural debug event (exception, DLL load, thread create, etc).
             mPauseAfterResume.store(true);
-            printf("event breakin deferred: waiting for next target event under hide on\n");
-            fflush(stdout);
+            Gleam::logEvent("breakin deferred: waiting for next target event under hide on");
         }
         return;
     }
-    printf("event breakin injected page=0x%p\n", mBreakInStubPage.load());
-    fflush(stdout);
+    Gleam::logEvent("breakin injected page=0x%p", mBreakInStubPage.load());
 }
 
 // Frees the stub page through the (injectable) VirtualFreeEx path. Only a
@@ -177,14 +171,12 @@ bool GleamDebugger::freeBreakInStubPage()
     }
     if(!freed)
     {
-        printf("event error msg=\"Gleam: break-in stub page free failed for 0x%p (error %lu)\"\n",
+        Gleam::logEvent("error msg=\"Gleam: break-in stub page free failed for 0x%p (error %lu)\"",
                page, GetLastError());
-        fflush(stdout);
         return false; // page address KEPT for the retry
     }
     mBreakInStubPage.store(nullptr);
-    printf("event breakin stub freed page=0x%p\n", page);
-    fflush(stdout);
+    Gleam::logEvent("breakin stub freed page=0x%p", page);
     return true;
 }
 
@@ -207,20 +199,19 @@ bool GleamDebugger::cleanupBreakInStub()
         // C3-R6 FIX: Keep trying to terminate until confirmed dead or we give up.
         // Don't limit to 16 INT3s - keep the thread tracked until death is confirmed.
         int retries = 0;
-        const int maxRetries = 100; // Generous retry limit for persistent failures
+        const int maxRetries = Gleam::Limits::MAX_TERMINATE_RETRIES;
         while(retries < maxRetries)
         {
             if(!TerminateThread(hThread, 0))
             {
-                printf("event error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu, retry %d)\"\n",
+                Gleam::logEvent("error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu, retry %d)\"",
                        mBreakInStubTid.load(), GetLastError(), retries);
-                fflush(stdout);
                 retries++;
-                Sleep(10); // Brief delay before retry
+                Sleep(Gleam::Limits::TERMINATE_RETRY_DELAY_MS);
                 continue;
             }
             // Termination call succeeded, check if thread is dead
-            if(WaitForSingleObject(hThread, 100) == WAIT_OBJECT_0)
+            if(WaitForSingleObject(hThread, Gleam::Limits::SHORT_THREAD_WAIT_MS) == WAIT_OBJECT_0)
             {
                 CloseHandle(hThread);
                 mBreakInStubThread.store(nullptr);
@@ -230,13 +221,12 @@ bool GleamDebugger::cleanupBreakInStub()
             // Thread not dead yet, retry termination
             retries++;
             if(retries < maxRetries)
-                Sleep(10);
+                Sleep(Gleam::Limits::TERMINATE_RETRY_DELAY_MS);
         }
         if(retries >= maxRetries)
         {
-            printf("event error msg=\"Gleam: break-in stub thread %u could not be terminated after %d retries (handle+page kept)\"\n",
+            Gleam::logEvent("error msg=\"Gleam: break-in stub thread %u could not be terminated after %d retries (handle+page kept)\"",
                    mBreakInStubTid.load(), maxRetries);
-            fflush(stdout);
         }
     }
     if(mBreakInStubThread.load())
@@ -254,8 +244,7 @@ void GleamDebugger::finishDeferredDetach()
         if(freeBreakInStubPage())
         {
             Detach(); // detach happens at the end of the debug loop iteration
-            printf("detaching...\n");
-            fflush(stdout);
+            Gleam::logInfo(Gleam::Strings::DETACHING);
             return;
         }
     }
@@ -269,8 +258,7 @@ void GleamDebugger::finishDeferredDetach()
     // cbDetachRefused).
     mQuitting = false;
     mWantsPause = true;
-    printf("detach refused: break-in stub page still held (free failed)\n");
-    fflush(stdout);
+    Gleam::logError(Gleam::Strings::DETACH_REFUSED_PAGE);
     forceBreakIn();
 }
 
@@ -283,8 +271,7 @@ void GleamDebugger::fallbackDebugBreak(GleeBug::Process* process)
     if(!DebugBreakProcess(process->hProcess))
     {
         mBreakInExpected.store(false);
-        printf("event breakin fail=debugbreakprocess err=%lu\n", GetLastError());
-        fflush(stdout);
+        Gleam::logEvent("breakin fail=debugbreakprocess err=%lu", GetLastError());
     }
 }
 
@@ -299,14 +286,13 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
     if(mBreakInStubPage.load())
         return true;
 
-    uint8_t stub[16];
+    uint8_t stub[Gleam::Memory::BREAK_IN_STUB_SIZE];
     memset(stub, 0xCC, sizeof(stub)); // int3 ...
-    auto page = VirtualAllocEx(process->hProcess, nullptr, 0x1000,
+    auto page = VirtualAllocEx(process->hProcess, nullptr, Gleam::Memory::BREAK_IN_PAGE_SIZE,
                                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if(!page)
     {
-        printf("event breakin fail=alloc err=%lu\n", GetLastError());
-        fflush(stdout);
+        Gleam::logEvent("breakin fail=alloc err=%lu", GetLastError());
         fallbackDebugBreak(process);
         return false;
     }
@@ -317,14 +303,12 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
 
     if(!WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
     {
-        printf("event breakin fail=write err=%lu\n", GetLastError());
-        fflush(stdout);
+        Gleam::logEvent("breakin fail=write err=%lu", GetLastError());
         // Try to free immediately; if that fails, the page is already registered
         // in mBreakInStubPage and freeBreakInStubPage can retry later.
         if(!VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE))
         {
-            printf("event breakin fail=free err=%lu (page retained for retry)\n", GetLastError());
-            fflush(stdout);
+            Gleam::logEvent("breakin fail=free err=%lu (page retained for retry)", GetLastError());
             // Page stays registered for cleanup retry
         }
         else
@@ -358,9 +342,8 @@ Thread* GleamDebugger::currentThread()
             return found->second.get();
         // A stale selection must never silently redirect commands at the
         // event thread (P0-6): report and let callers refuse to act.
-        printf("selected thread %u no longer exists (use 'thread' to reselect)\n",
+        Gleam::logWarn("selected thread %u no longer exists (use 'thread' to reselect)",
                mSelectedThreadId);
-        fflush(stdout);
         return nullptr;
     }
     return mThread;
@@ -377,13 +360,7 @@ void GleamDebugger::emitStop(const char* reason, const char* details) const
         Registers r(mThread->hThread);
         rip = r.Gip();
     }
-    printf("stop reason=%s%s%s rip=0x%llX tid=%u\n",
-           reason,
-           details ? " " : "",
-           details ? details : "",
-           (unsigned long long)rip,
-           mDebugEvent.dwThreadId);
-    fflush(stdout);
+    Gleam::logStop(reason, details, rip, mDebugEvent.dwThreadId);
 }
 
 void GleamDebugger::applyEntryBreakpoint()
@@ -397,18 +374,16 @@ void GleamDebugger::applyEntryBreakpoint()
         mOepBreakpoint = oep;
     else
     {
-        printf("event error msg=\"failed to set OEP breakpoint\"\n");
-        fflush(stdout);
+        Gleam::logEvent("error msg=\"failed to set OEP breakpoint\"");
     }
 }
 
 void GleamDebugger::cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const Process & process)
 {
-    printf("event process op=create pid=%u base=0x%p start=0x%p\n",
+    Gleam::logEvent("process op=create pid=%u base=0x%p start=0x%p",
            mDebugEvent.dwProcessId,
            createProcess.lpBaseOfImage,
            createProcess.lpStartAddress);
-    fflush(stdout);
 
     if(mBreakOnEntry)
         applyEntryBreakpoint();
@@ -431,7 +406,7 @@ void GleamDebugger::resolveBreakInSymbols()
 
 void GleamDebugger::cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const Process & process)
 {
-    char details[64];
+    char details[Gleam::Memory::SMALL_DETAIL_BUFFER];
     sprintf_s(details, "code=0x%08X", exitProcess.dwExitCode);
     emitStop("exit", details);
     cleanupBreakInStub();
@@ -589,7 +564,7 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
             // The refusal was already printed by resolve*Symbol.
             if(sr == SymbolResult::Ambiguous)
             {
-                printf("event bp rejected module=%s symbol=%s (ambiguous)\n",
+                Gleam::logEvent("bp rejected module=%s symbol=%s (ambiguous)",
                        lb.module.c_str(), lb.symbol.c_str());
                 mLogicalBps.erase(mLogicalBps.begin() + i);
                 continue;
@@ -614,7 +589,7 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
             }
             if(lb.rva >= imageSize || moduleBase + lb.rva < moduleBase)
             {
-                printf("event bp rejected module=%s rva=0x%llX (out of image)\n",
+                Gleam::logEvent("bp rejected module=%s rva=0x%llX (out of image)",
                        lb.module.c_str(), (unsigned long long)lb.rva);
                 mLogicalBps.erase(mLogicalBps.begin() + i);
                 continue;
@@ -630,9 +605,8 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
         lb.boundBase = moduleBase;
         if(lb.rule.condReg != RegId::Invalid || lb.rule.trace || !lb.rule.command.empty())
             mBpRules[addr] = lb.rule;
-        printf("event bp bound module=%s address=0x%llX\n",
+        Gleam::logEvent("bp bound module=%s address=0x%llX",
                lb.module.c_str(), (unsigned long long)addr);
-        fflush(stdout);
         i++;
     }
 }
@@ -657,11 +631,10 @@ void GleamDebugger::unbindModuleBreakpoints(uint64_t moduleBase)
             mProcess->softwareBreakpointReferences.erase(lb.boundAddr);
         }
         mBpRules.erase(lb.boundAddr);
-        printf("event bp unbound module=%s address=0x%llX\n",
+        Gleam::logEvent("bp unbound module=%s address=0x%llX",
                lb.module.c_str(), (unsigned long long)lb.boundAddr);
         lb.boundAddr = 0;
         lb.boundBase = 0;
-        fflush(stdout);
     }
 }
 
@@ -751,9 +724,7 @@ void GleamDebugger::resetTransientState()
     mTestHookResumeThread = nullptr;
     if(!mPatches.empty())
     {
-        // Patches never auto-reapply: the new process must be re-examined
-        // and patched deliberately (fingerprint + original-bytes policy).
-        printf("patches cleared on restart\n");
+        Gleam::logInfo(Gleam::Strings::PATCHES_CLEARED);
         mPatches.clear();
     }
     // Logical breakpoints survive but must re-bind in the new session.
@@ -762,7 +733,9 @@ void GleamDebugger::resetTransientState()
         lb.boundAddr = 0;
         lb.boundBase = 0;
     }
-    fflush(stdout);
+    // Clear caches on restart (new process)
+    clearIltCache();
+    clearSymbolCache();
 }
 
 void GleamDebugger::cbSystemBreakpoint()
@@ -840,9 +813,8 @@ bool GleamDebugger::handleStepOutBreakpoint(const BreakpointInfo & info)
     // non-owner trip it again. Two-stage: register here, arm at the NEXT
     // event (cbPostDebugEvent). The hit surfaces as a normal stop.
     mStepOutRearmPending = mStepOutBpAddr;
-    printf("event stepout internal bp hit by non-owner tid=%u (re-arm deferred)\n",
+    Gleam::logEvent("stepout internal bp hit by non-owner tid=%u (re-arm deferred)",
            mDebugEvent.dwThreadId);
-    fflush(stdout);
     return false;
 }
 
@@ -897,9 +869,8 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
     {
         if(!info.singleshoot)
             mIgnoreHits[info.address] = ignoreLeft - 1;
-        printf("event ignored address=0x%llX left=%u\n",
+        Gleam::logEvent("ignored address=0x%llX left=%u",
                (unsigned long long)info.address, ignoreLeft - 1);
-        fflush(stdout);
         return;
     }
 
@@ -908,7 +879,7 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
     if(!evalBpRule(info, rulePtr))
         return;
 
-    char details[96];
+    char details[Gleam::Memory::MEDIUM_DETAIL_BUFFER];
     if(mOepBreakpoint && info.address == mOepBreakpoint && info.singleshoot)
     {
         mOepBreakpoint = 0;
@@ -951,8 +922,7 @@ void GleamDebugger::cbStep()
         if(mTraceLog)
         {
             auto text = disasmOne(rip);
-            printf("trace rip=0x%llX %s\n", (unsigned long long)rip, text.c_str());
-            fflush(stdout);
+            Gleam::logInfo("trace rip=0x%llX %s", (unsigned long long)rip, text.c_str());
         }
         bool done = evalCondition(mTraceCondReg, mTraceCondOp, mTraceCondValue);
         bool capped = mTraceCount >= mTraceMax;
@@ -960,7 +930,7 @@ void GleamDebugger::cbStep()
         {
             mTraceActive = false;
             mStepArmed = false;
-            char details[96];
+            char details[Gleam::Memory::MEDIUM_DETAIL_BUFFER];
             sprintf_s(details, "%s steps=%llu", capped && !done ? "maxreached" : "condition",
                       (unsigned long long)mTraceCount);
             emitStop("trace", details);
@@ -1050,7 +1020,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
         const int slot = (dr6 & 1) ? 0 : (dr6 & 2) ? 1 : (dr6 & 4) ? 2 : (dr6 & 8) ? 3 : -1;
         if(slot >= 0)
         {
-            char details[96];
+            char details[Gleam::Memory::MEDIUM_DETAIL_BUFFER];
             sprintf_s(details, "raw-hardware slot=%d address=0x%p", slot, exceptionRecord.ExceptionAddress);
             mContinueStatus = DBG_CONTINUE; // single-step exceptions continue
             emitStop("hardware", details);
@@ -1099,9 +1069,8 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
             }
             if(!terminated)
             {
-                printf("event error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu)\"\n",
+                Gleam::logEvent("error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu)\"",
                        mBreakInStubTid.load(), GetLastError());
-                fflush(stdout);
             }
         }
         emitStop("pause", nullptr);
@@ -1126,10 +1095,9 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
         // debuggee's own handlers run); "swallow" is DBG_CONTINUE.
         if(policy.swallow)
             mContinueStatus = DBG_CONTINUE;
-        printf("event exception code=0x%08lX action=%s\n",
+        Gleam::logEvent("exception code=0x%08lX action=%s",
                exceptionRecord.ExceptionCode,
                policy.swallow ? "swallowed" : "passed-to-debuggee");
-        fflush(stdout);
         return;
     }
 
@@ -1137,7 +1105,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     // decideExPolicy); "exception pass" is the explicit escape.
     if(policy.swallow)
         mContinueStatus = DBG_CONTINUE;
-    char details[128];
+    char details[Gleam::Memory::LARGE_DETAIL_BUFFER];
     sprintf_s(details, "code=0x%08lX address=0x%p chance=%s",
               exceptionRecord.ExceptionCode,
               exceptionRecord.ExceptionAddress,
@@ -1150,8 +1118,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
 
 void GleamDebugger::cbInternalError(const std::string & error)
 {
-    printf("event error msg=\"%s\"\n", error.c_str());
-    fflush(stdout);
+    Gleam::logEvent("error msg=\"%s\"", error.c_str());
 }
 
 void GleamDebugger::cbDetachRefused(const std::string & info)
@@ -1164,8 +1131,7 @@ void GleamDebugger::cbDetachRefused(const std::string & info)
     // the target never produces another event on its own.
     mQuitting = false; // detach is off; the session is fully attached again
     mWantsPause = true;
-    printf("detach refused: target left attached (threads still suspended by us)\n");
-    fflush(stdout);
+    Gleam::logError(Gleam::Strings::DETACH_REFUSED_THREADS);
     forceBreakIn();
 }
 
@@ -1190,10 +1156,9 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
     // logging; the pending state is simply "address still zero").
     if(!mDbgBreakInAddr.load())
     {
-        if(mExitThreadResolveAttempts++ % 32 == 0)
+        if(mExitThreadResolveAttempts++ % Gleam::Limits::RESOLVE_RETRY_LOG_INTERVAL == 0)
         {
-            printf("event breakin resolve retry=%u\n", mExitThreadResolveAttempts);
-            fflush(stdout);
+            Gleam::logEvent("breakin resolve retry=%u", mExitThreadResolveAttempts);
         }
         resolveBreakInSymbols();
     }
@@ -1212,16 +1177,15 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         {
             if(!mProcess->SetBreakpoint(mStepOutRearm, true))
             {
-                printf("stepout error: failed to re-arm internal breakpoint at 0x%llX\n",
+                Gleam::logError("stepout error: failed to re-arm internal breakpoint at 0x%llX",
                        (unsigned long long)mStepOutRearm);
                 stepOutFinish("error");
             }
             else
             {
                 mStepOutBpOurs = true; // physically ours again
-                printf("event stepout internal bp re-armed at 0x%llX\n",
+                Gleam::logEvent("stepout internal bp re-armed at 0x%llX",
                        (unsigned long long)mStepOutRearm);
-                fflush(stdout);
             }
         }
         mStepOutRearm = 0;
@@ -1245,8 +1209,7 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         mPauseAfterResume.store(false);
     else if(mPauseAfterResume.exchange(false))
     {
-        printf("event breakin deferred-fire\n");
-        fflush(stdout);
+        Gleam::logEvent("breakin deferred-fire");
         forceBreakIn();
     }
 }

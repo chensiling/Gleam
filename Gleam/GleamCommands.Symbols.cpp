@@ -21,6 +21,9 @@ using namespace GleeBug;
 #define DBG_REPLY_LATER ((NTSTATUS)0x40010001L)
 #endif // DBG_REPLY_LATER
 
+// Forward declaration for ILT cache (implemented below in anonymous namespace)
+std::unordered_set<uint64_t> iltThunkTargets(GleeBug::Process* process, uint64_t base);
+
 namespace
 {
     // Fault-injection hooks for "selftest failapi" (engine side:
@@ -100,15 +103,18 @@ namespace
         }
         return live == 1 ? found : -1;
     }
+} // anonymous namespace
 
-    // Collect the ILT thunk targets of a module loaded in the debuggee.
-    // With incremental linking every call goes through an "E9 rel32" thunk,
-    // so the thunk targets are exactly the function bodies of the linker's
-    // current layout.
-    std::unordered_set<uint64_t> iltThunkTargets(GleeBug::Process* process, uint64_t base)
-    {
-        std::unordered_set<uint64_t> targets;
-        uint8_t hdr[0x1000];
+// Collect the ILT thunk targets of a module loaded in the debuggee.
+// With incremental linking every call goes through an "E9 rel32" thunk,
+// so the thunk targets are exactly the function bodies of the linker's
+// current layout.
+// NOTE: This function is now wrapped by GleamDebugger::getIltTargets() which
+// provides caching. Direct calls should be avoided in hot paths.
+std::unordered_set<uint64_t> iltThunkTargets(GleeBug::Process* process, uint64_t base)
+{
+    std::unordered_set<uint64_t> targets;
+    uint8_t hdr[0x1000];
         if(!process->MemReadSafe(base, hdr, sizeof(hdr)))
             return targets;
         auto dos = (const IMAGE_DOS_HEADER*)hdr;
@@ -148,7 +154,6 @@ namespace
         }
         return targets;
     }
-}
 
 namespace
 {
@@ -533,6 +538,15 @@ uint32_t GleamDebugger::moduleImageSize(uint64_t base)
 
 GleamDebugger::SymbolResult GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & out)
 {
+    // Check cache first for successful resolutions
+    uint64_t cached = getCachedSymbol(modSym);
+    if(cached != 0)
+    {
+        out = cached;
+        return SymbolResult::Found;
+    }
+
+    // Cache miss - perform actual resolution
     if(!mProcess || !ensureSymSession())
         return SymbolResult::NotFound;
     // Enumerate ALL records for the name: under incremental linking the PDB
@@ -584,6 +598,10 @@ GleamDebugger::SymbolResult GleamDebugger::resolveModuleSymbol(const std::string
         }
     }
     out = candidates[pick];
+
+    // Cache the successful resolution
+    cacheSymbol(modSym, out);
+
     return SymbolResult::Found;
 }
 
@@ -1148,6 +1166,12 @@ GleamDebugger::SymbolResult GleamDebugger::resolvePdbSymbol(uint64_t moduleBase,
         }
     }
     out = candidates[pick];
+
+    // Cache the successful resolution - need to reconstruct cacheKey here
+    char keyBuf[256];
+    snprintf(keyBuf, sizeof(keyBuf), "%llX:%s", (unsigned long long)moduleBase, symbol.c_str());
+    cacheSymbol(std::string(keyBuf), out);
+
     return SymbolResult::Found;
 }
 

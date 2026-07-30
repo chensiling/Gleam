@@ -313,6 +313,22 @@ private:
     // module name: later events for the same module may have hFile == NULL.
     std::map<std::string, std::wstring> mModulePaths;
 
+    // ILT (Incremental Link Table) cache: Maps module base -> set of ILT thunk targets
+    // Caches the results of expensive iltThunkTargets() scans
+    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mIltCache;
+    void clearIltCache() { mIltCache.clear(); }
+    // Get ILT targets for a module, using cache if available
+    const std::unordered_set<uint64_t>* getIltTargets(uint64_t moduleBase);
+
+    // Symbol resolution cache: Maps "module!symbol" -> resolved address
+    // Caches successful symbol resolutions to avoid repeated lookups
+    std::unordered_map<std::string, uint64_t> mSymbolCache;
+    void clearSymbolCache() { mSymbolCache.clear(); }
+    // Lookup symbol in cache, returns 0 if not found
+    uint64_t getCachedSymbol(const std::string& modSym);
+    // Store resolved symbol in cache
+    void cacheSymbol(const std::string& modSym, uint64_t addr);
+
     // Expr.cpp: address expression evaluation. See the grammar comment there.
     bool evalExpression(const std::string & s, uint64_t & out, std::string & err);
     bool exprParseSum(const std::string & s, size_t & pos, uint64_t & out, std::string & err);

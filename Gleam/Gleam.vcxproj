@@ -85,9 +85,17 @@
     <ClCompile Include="GleamCommands.Symbols.cpp" />
     <ClCompile Include="GleamCommands.Hide.cpp" />
     <ClCompile Include="GleamCommands.Scan.cpp" />
+    <ClCompile Include="Log.cpp" />
+    <ClCompile Include="GleamIltCache.cpp" />
+    <ClCompile Include="GleamSymbolCache.cpp" />
+    <ClCompile Include="GleamIltDisambiguation.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GleamDebugger.h" />
+    <ClInclude Include="Log.h" />
+    <ClInclude Include="Constants.h" />
+    <ClInclude Include="RaiiUtils.h" />
+    <ClInclude Include="ThreadSafety.h" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\GleeBug\GleeBug.vcxproj">
