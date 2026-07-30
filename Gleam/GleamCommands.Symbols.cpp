@@ -2,6 +2,7 @@
 // reverse resolution) and export enumeration (dbghelp SymEnumSymbols).
 
 #include "GleamDebugger.h"
+#include "RaiiUtils.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -1000,6 +1001,7 @@ namespace
     }
 
     // Read the RSDS CodeView record from a PE file on disk.
+    // RAII: Uses Gleam::UniqueHandle and Gleam::MappedView for automatic cleanup
     CodeViewId codeViewFromFile(const wchar_t* path)
     {
         CodeViewId id;
@@ -1007,62 +1009,65 @@ namespace
         // needs them gone (plain "C:\") or in extended form ("\\?\").
         if(path[0] == L'\\' && path[1] == L'?' && path[2] == L'?' && path[3] == L'\\')
             path += 4;
-        HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                   OPEN_EXISTING, 0, nullptr);
-        if(hFile == INVALID_HANDLE_VALUE)
+
+        Gleam::UniqueHandle hFile(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                               OPEN_EXISTING, 0, nullptr));
+        if(!hFile)
             return id;
-        HANDLE hMap = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        const uint8_t* view = hMap ? (const uint8_t*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0) : nullptr;
-        if(view)
+
+        Gleam::UniqueHandle hMap(CreateFileMappingW(hFile.get(), nullptr, PAGE_READONLY, 0, 0, nullptr));
+        if(!hMap)
+            return id;
+
+        Gleam::MappedView mappedView(MapViewOfFile(hMap.get(), FILE_MAP_READ, 0, 0, 0));
+        if(!mappedView)
+            return id;
+
+        const uint8_t* view = mappedView.as_bytes();
+        const uint64_t fileSize = GetFileSize(hFile.get(), nullptr);
+        auto dos = (const IMAGE_DOS_HEADER*)view;
+        if(fileSize >= sizeof(IMAGE_DOS_HEADER) && dos->e_magic == IMAGE_DOS_SIGNATURE &&
+           (uint64_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) <= fileSize)
         {
-            const uint64_t fileSize = GetFileSize(hFile, nullptr);
-            auto dos = (const IMAGE_DOS_HEADER*)view;
-            if(fileSize >= sizeof(IMAGE_DOS_HEADER) && dos->e_magic == IMAGE_DOS_SIGNATURE &&
-               (uint64_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) <= fileSize)
+            auto nt = (const IMAGE_NT_HEADERS64*)(view + dos->e_lfanew);
+            if(nt->Signature == IMAGE_NT_SIGNATURE &&
+               nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
             {
-                auto nt = (const IMAGE_NT_HEADERS64*)(view + dos->e_lfanew);
-                if(nt->Signature == IMAGE_NT_SIGNATURE &&
-                   nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+                // The debug directory's VirtualAddress is an RVA; map it
+                // to a file offset through the section table.
+                auto sec = (const IMAGE_SECTION_HEADER*)(
+                    (const uint8_t*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+                auto rvaToOffset = [&](uint32_t rva) -> uint32_t
                 {
-                    // The debug directory's VirtualAddress is an RVA; map it
-                    // to a file offset through the section table.
-                    auto sec = (const IMAGE_SECTION_HEADER*)(
-                        (const uint8_t*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
-                    auto rvaToOffset = [&](uint32_t rva) -> uint32_t
+                    for(int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+                        if(rva >= sec[i].VirtualAddress &&
+                           rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
+                            return sec[i].PointerToRawData + (rva - sec[i].VirtualAddress);
+                    return 0;
+                };
+                const auto & dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+                const uint32_t dirOff = rvaToOffset(dd.VirtualAddress);
+                const uint32_t count = dd.Size / (uint32_t)sizeof(IMAGE_DEBUG_DIRECTORY);
+                for(uint32_t i = 0; i < count && !id.valid; i++)
+                {
+                    if(!dirOff || (uint64_t)dirOff + (i + 1) * sizeof(IMAGE_DEBUG_DIRECTORY) > fileSize)
+                        break;
+                    auto dir = (const IMAGE_DEBUG_DIRECTORY*)(view + dirOff + i * sizeof(IMAGE_DEBUG_DIRECTORY));
+                    if(dir->Type != IMAGE_DEBUG_TYPE_CODEVIEW || dir->SizeOfData < 24 ||
+                       (uint64_t)dir->PointerToRawData + 24 > fileSize)
+                        continue;
+                    const uint8_t* rsds = view + dir->PointerToRawData;
+                    if(memcmp(rsds, "RSDS", 4) == 0)
                     {
-                        for(int i = 0; i < nt->FileHeader.NumberOfSections; i++)
-                            if(rva >= sec[i].VirtualAddress &&
-                               rva < sec[i].VirtualAddress + sec[i].Misc.VirtualSize)
-                                return sec[i].PointerToRawData + (rva - sec[i].VirtualAddress);
-                        return 0;
-                    };
-                    const auto & dd = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
-                    const uint32_t dirOff = rvaToOffset(dd.VirtualAddress);
-                    const uint32_t count = dd.Size / (uint32_t)sizeof(IMAGE_DEBUG_DIRECTORY);
-                    for(uint32_t i = 0; i < count && !id.valid; i++)
-                    {
-                        if(!dirOff || (uint64_t)dirOff + (i + 1) * sizeof(IMAGE_DEBUG_DIRECTORY) > fileSize)
-                            break;
-                        auto dir = (const IMAGE_DEBUG_DIRECTORY*)(view + dirOff + i * sizeof(IMAGE_DEBUG_DIRECTORY));
-                        if(dir->Type != IMAGE_DEBUG_TYPE_CODEVIEW || dir->SizeOfData < 24 ||
-                           (uint64_t)dir->PointerToRawData + 24 > fileSize)
-                            continue;
-                        const uint8_t* rsds = view + dir->PointerToRawData;
-                        if(memcmp(rsds, "RSDS", 4) == 0)
-                        {
-                            id.valid = true;
-                            memcpy(&id.guid, rsds + 4, sizeof(GUID));
-                            memcpy(&id.age, rsds + 20, sizeof(uint32_t));
-                            id.sizeOfImage = nt->OptionalHeader.SizeOfImage;
-                        }
+                        id.valid = true;
+                        memcpy(&id.guid, rsds + 4, sizeof(GUID));
+                        memcpy(&id.age, rsds + 20, sizeof(uint32_t));
+                        id.sizeOfImage = nt->OptionalHeader.SizeOfImage;
                     }
                 }
             }
-            UnmapViewOfFile(view);
         }
-        if(hMap)
-            CloseHandle(hMap);
-        CloseHandle(hFile);
+        // Resources automatically cleaned up by RAII destructors
         return id;
     }
 }
