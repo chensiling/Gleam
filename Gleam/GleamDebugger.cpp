@@ -99,15 +99,40 @@ void GleamDebugger::forceBreakIn()
     }
     mBreakInStubTid.store(stubTid);
     mBreakInStubThread.store(hThread);
-    if(ResumeThread(hThread) == (DWORD)-1)
+    bool resumed;
+    if(mFailNextStubResume)
+    {
+        mFailNextStubResume = false; // injected failure (selftest)
+        resumed = false;
+        SetLastError(ERROR_ACCESS_DENIED);
+    }
+    else
+    {
+        resumed = ResumeThread(hThread) != (DWORD)-1;
+    }
+    if(!resumed)
     {
         printf("event breakin fail=resume err=%lu\n", GetLastError());
         fflush(stdout);
-        // Don't leave a permanently suspended thread in the target.
-        TerminateThread(hThread, 0);
-        WaitForSingleObject(hThread, 1000);
-        CloseHandle(mBreakInStubThread.exchange(nullptr));
-        mBreakInStubTid.store(0);
+        // Don't leave a permanently suspended thread in the target - but
+        // only close the handle when death is CONFIRMED; an unconfirmed
+        // thread keeps handle + tid + page registered (the deferred detach
+        // cleanup and cbExitThreadEvent keep tracking it).
+        if(!TerminateThread(hThread, 0))
+        {
+            printf("event breakin fail=terminate err=%lu\n", GetLastError());
+            fflush(stdout);
+        }
+        else if(WaitForSingleObject(hThread, 1000) == WAIT_OBJECT_0)
+        {
+            CloseHandle(mBreakInStubThread.exchange(nullptr));
+            mBreakInStubTid.store(0);
+        }
+        else
+        {
+            printf("event breakin fail=terminate_wait (thread+page kept)\n");
+            fflush(stdout);
+        }
         fallbackDebugBreak(process);
         return;
     }
@@ -115,7 +140,39 @@ void GleamDebugger::forceBreakIn()
     fflush(stdout);
 }
 
-void GleamDebugger::cleanupBreakInStub()
+// Frees the stub page through the (injectable) VirtualFreeEx path. Only a
+// SUCCESSFUL free clears the tracked address - a failure keeps it so the
+// next cleanup round can retry. Returns true when no page remains tracked.
+bool GleamDebugger::freeBreakInStubPage()
+{
+    auto page = mBreakInStubPage.load();
+    if(!page)
+        return true;
+    bool freed;
+    if(mFailNextVfree)
+    {
+        mFailNextVfree = false; // injected failure (selftest)
+        freed = false;
+        SetLastError(ERROR_ACCESS_DENIED);
+    }
+    else
+    {
+        freed = VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE) != 0;
+    }
+    if(!freed)
+    {
+        printf("event error msg=\"Gleam: break-in stub page free failed for 0x%p (error %lu)\"\n",
+               page, GetLastError());
+        fflush(stdout);
+        return false; // page address KEPT for the retry
+    }
+    mBreakInStubPage.store(nullptr);
+    printf("event breakin stub freed page=0x%p\n", page);
+    fflush(stdout);
+    return true;
+}
+
+bool GleamDebugger::cleanupBreakInStub()
 {
     // Request stub teardown WITHOUT ever losing track of it. The thread is
     // hastened with TerminateThread; only a CONFIRMED death (or the thread's
@@ -125,48 +182,58 @@ void GleamDebugger::cleanupBreakInStub()
     // process, so any wait inside a pause times out by construction), the
     // handle and page stay registered: the detach path defers on them, and
     // quit/restart paths reclaim them when the target dies.
+    //
+    // Returns true only when NOTHING remains tracked in the target (no live
+    // thread, no held page) - the detach command refuses on false.
     std::lock_guard<std::mutex> lock(mBreakInMutex);
     if(auto hThread = mBreakInStubThread.load())
     {
-        TerminateThread(hThread, 0);
-        if(WaitForSingleObject(hThread, 0) == WAIT_OBJECT_0)
+        if(!TerminateThread(hThread, 0))
+        {
+            printf("event error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu)\"\n",
+                   mBreakInStubTid.load(), GetLastError());
+            fflush(stdout);
+        }
+        else if(WaitForSingleObject(hThread, 0) == WAIT_OBJECT_0)
         {
             CloseHandle(hThread);
             mBreakInStubThread.store(nullptr);
             mBreakInStubTid.store(0);
         }
     }
-    if(!mBreakInStubThread.load())
-    {
-        if(auto page = mBreakInStubPage.exchange(nullptr))
-            VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE);
-    }
+    if(mBreakInStubThread.load())
+        return false; // unconfirmed thread: handle + page stay registered
+    return freeBreakInStubPage();
 }
 
 void GleamDebugger::finishDeferredDetach()
 {
     // The stub thread is confirmed dead (its EXIT_THREAD event arrived), so
     // the page can never be executed again. Free it BEFORE letting go: a
-    // detach must not leave a remote RWX page in a surviving target. If the
-    // free fails, refuse the detach and stay attached instead.
-    std::lock_guard<std::mutex> lock(mBreakInMutex);
-    if(auto page = mBreakInStubPage.exchange(nullptr))
+    // detach must not leave a remote RWX page in a surviving target.
     {
-        if(!VirtualFreeEx(mProcess->hProcess, page, 0, MEM_RELEASE))
+        std::lock_guard<std::mutex> lock(mBreakInMutex);
+        if(freeBreakInStubPage())
         {
-            mQuitting = false; // detach is off; the session stays attached
-            mWantsPause = true; // hand control back at THIS event
-            printf("event error msg=\"Gleam: detach refused, break-in stub page free failed (error %lu)\"\n",
-                   GetLastError());
+            Detach(); // detach happens at the end of the debug loop iteration
+            printf("detaching...\n");
             fflush(stdout);
             return;
         }
-        printf("event breakin stub freed page=0x%p\n", page);
-        fflush(stdout);
     }
-    Detach(); // detach happens at the end of the debug loop iteration
-    printf("detaching...\n");
+    // The free failed: refuse the detach and stay attached - with the page
+    // address KEPT, so a later detach command can retry the free. The lock
+    // is released before forceBreakIn (it takes mBreakInMutex itself).
+    // mWantsPause cannot hand control back at THIS event: an EXIT_THREAD
+    // event always has mThread == nullptr (exitThreadEvent clears it), so
+    // the command loop gate would fail and the session would hang on a
+    // quiet target. Manufacture the re-entry event instead (same as
+    // cbDetachRefused).
+    mQuitting = false;
+    mWantsPause = true;
+    printf("detach refused: break-in stub page still held (free failed)\n");
     fflush(stdout);
+    forceBreakIn();
 }
 
 void GleamDebugger::fallbackDebugBreak(GleeBug::Process* process)
@@ -183,36 +250,19 @@ void GleamDebugger::fallbackDebugBreak(GleeBug::Process* process)
     }
 }
 
-// Allocate/write the session stub page (once) and resolve ExitThread.
+// Allocate/write the session stub page (once). The stub is pure int3s: the
+// stub thread is ALWAYS terminated by the debugger at its int3 stop (see
+// the break-in block in cbExceptionEvent), so it never executes past the
+// first byte and never needs a resolved ExitThread address. That dependency
+// used to make break-in unavailable when the resolution failed - and a
+// WRONG resolution turned the stub's "call ExitThread" into a target crash.
 bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
 {
     if(mBreakInStubPage.load())
         return true;
 
-    uint8_t stub[] = {
-        0xCC,                         // int3
-        0xB9, 0, 0, 0, 0,             // mov ecx, 0
-        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, ExitThread
-        0xFF, 0xD0                    // call rax
-    };
-    uint64_t exitThread = mExitThreadAddr.load();
-    if(!exitThread)
-    {
-        // Retry the resolution - safe only on the debugger thread (dbghelp).
-        if(mInDebugEvent.load() && parseAddress("kernel32!ExitThread", exitThread))
-            mExitThreadAddr.store(exitThread);
-    }
-    if(!exitThread)
-    {
-        printf("event breakin fail=no_exitthread (will retry later)\n");
-        fflush(stdout);
-        // NOTE: DebugBreakProcess is BeingDebugged-dependent; use only as a
-        // last resort and expect a later retry via the stub path.
-        fallbackDebugBreak(process);
-        return false;
-    }
-    memcpy(stub + 8, &exitThread, 8);
-
+    uint8_t stub[16];
+    memset(stub, 0xCC, sizeof(stub)); // int3 ...
     auto page = VirtualAllocEx(process->hProcess, nullptr, 0x1000,
                                MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if(!page)
@@ -313,15 +363,9 @@ void GleamDebugger::cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & creat
     resolveBreakInSymbols();
 }
 
-// Resolve (and retry) the addresses needed for stub/fallback break-ins.
+// Resolve (and retry) the address needed to identify the fallback break-in.
 void GleamDebugger::resolveBreakInSymbols()
 {
-    if(!mExitThreadAddr.load())
-    {
-        uint64_t addr = 0;
-        if(parseAddress("kernel32!ExitThread", addr))
-            mExitThreadAddr.store(addr);
-    }
     if(!mDbgBreakInAddr.load())
     {
         uint64_t addr = 0;
@@ -624,7 +668,11 @@ void GleamDebugger::resetTransientState()
     mBreakInStubTid = 0;
     mBreakInStubPage = nullptr;
     mDetachAfterStubCleanup = false;
-    mExitThreadAddr = 0;
+    // Fault-injection flags die with the old session (one-shot by design,
+    // but an armed-but-unfired flag must not leak into the restart).
+    mFailNextTerminate = false;
+    mFailNextStubResume = false;
+    mFailNextVfree = false;
     mDbgBreakInAddr = 0;
     mExitThreadResolveAttempts = 0;
     mQuitting = false; // was set to shut the old session down cleanly
@@ -946,11 +994,15 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     }
 
     // Our own break-in (triggered by "pause"). Identification, most precise
-    // first: the stub's exception address, then the fallback thread's
-    // DbgUiRemoteBreakin address, then the fallback flag as last resort.
+    // first: the stub's exception address (any of the stub's int3 bytes, so
+    // a thread that survived a failed TerminateThread is recognized again at
+    // the next one), then the fallback thread's DbgUiRemoteBreakin address,
+    // then the fallback flag as last resort.
+    const uint8_t* stubPage = (uint8_t*)mBreakInStubPage.load();
     const bool isStubBreakIn = exceptionRecord.ExceptionCode == STATUS_BREAKPOINT &&
-                               mBreakInStubPage.load() != nullptr &&
-                               exceptionRecord.ExceptionAddress == mBreakInStubPage.load();
+                               stubPage != nullptr &&
+                               (uint8_t*)exceptionRecord.ExceptionAddress >= stubPage &&
+                               (uint8_t*)exceptionRecord.ExceptionAddress < stubPage + 16;
     const bool isFallbackBreakIn = exceptionRecord.ExceptionCode == STATUS_BREAKPOINT &&
                                    ((mDbgBreakInAddr.load() != 0 &&
                                      (uint64_t)exceptionRecord.ExceptionAddress == mDbgBreakInAddr.load()) ||
@@ -958,16 +1010,34 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
     if(isStubBreakIn || isFallbackBreakIn)
     {
         mContinueStatus = DBG_CONTINUE;
-        // Terminate the stub thread right at its int3: it must NOT run the
-        // trailing "call ExitThread" - the resolved ExitThread address is
-        // best-effort (a wrong one would send the thread into a fault loop),
-        // and the thread is at a known-good point inside our own page now.
-        // Keep the HANDLE: the EXIT_THREAD event is the death confirmation
-        // the deferred detach cleanup waits for before the stub page may be
-        // freed. (Waiting here could never succeed - a held debug event
-        // freezes the whole process.)
+        // Terminate the stub thread right at its int3: the stub is pure
+        // int3s, the thread is at a known-good point inside our own page,
+        // and past the stub only zero bytes (an instant crash) await - so a
+        // failed TerminateThread is loudly reported but still fatal to the
+        // thread. Keep the HANDLE: the EXIT_THREAD event is the death
+        // confirmation the deferred detach cleanup waits for before the
+        // stub page may be freed. (Waiting here could never succeed - a
+        // held debug event freezes the whole process.)
         if(auto hThread = mBreakInStubThread.load())
-            TerminateThread(hThread, 0);
+        {
+            bool terminated;
+            if(mFailNextTerminate)
+            {
+                mFailNextTerminate = false; // injected failure (selftest)
+                terminated = false;
+                SetLastError(ERROR_ACCESS_DENIED);
+            }
+            else
+            {
+                terminated = TerminateThread(hThread, 0) != 0;
+            }
+            if(!terminated)
+            {
+                printf("event error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu)\"\n",
+                       mBreakInStubTid.load(), GetLastError());
+                fflush(stdout);
+            }
+        }
         emitStop("pause", nullptr);
         abortStepOut("pause");
         mWantsPause = true;
@@ -1052,7 +1122,7 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
     }
     // Event-opportunity retry for break-in symbol resolution (rate-limited
     // logging; the pending state is simply "address still zero").
-    if(!mExitThreadAddr.load() || !mDbgBreakInAddr.load())
+    if(!mDbgBreakInAddr.load())
     {
         if(mExitThreadResolveAttempts++ % 32 == 0)
         {

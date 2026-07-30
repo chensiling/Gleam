@@ -52,7 +52,12 @@ public:
 
     // Terminate the stub thread, wait for it to die, close the handle, and
     // only then free the page - never free memory a stub thread may run on.
-    void cleanupBreakInStub();
+    // Requests stub teardown; returns true only when nothing remains tracked
+    // in the target (detach refuses on false - a held page must not leak).
+    bool cleanupBreakInStub();
+    // Frees the tracked stub page via the (injectable) VirtualFreeEx path;
+    // the address is cleared only on success. Returns true when freed/none.
+    bool freeBreakInStubPage();
     // Completes a deferred detach once the break-in stub thread is confirmed
     // dead: frees the stub page, then Detach(); refuses (stays attached)
     // when the page cannot be freed.
@@ -274,6 +279,11 @@ private:
     bool parseAddress(const std::string & s, uint64_t & out, std::string & err);
     void printAddrError();           // GleamCommands.Symbols.cpp
     std::string mAddrError;          // reason of the last failed parseAddress
+    // Set by resolveModuleSymbol when a name has multiple records and no
+    // unique live body. Unlike "not found" (which may bind later and may
+    // become a pending breakpoint), an ambiguous symbol must NEVER bind -
+    // the bp command refuses instead of registering it as pending.
+    bool mSymbolAmbiguous = false;
     // Look up a loaded module's base by name (case-insensitive, .dll optional).
     bool moduleBaseByName(const std::string & name, uint64_t & base);
     // Same, with image size (for RVA bounds checks).
@@ -367,7 +377,12 @@ private:
     // detach deferred until the break-in stub thread is confirmed dead and
     // its page is freed (never detach leaving a remote RWX page behind).
     bool mDetachAfterStubCleanup = false;
-    std::atomic<uint64_t> mExitThreadAddr{ 0 };        // kernel32!ExitThread in the debuggee
+
+    // Gleam-side fault-injection flags ("selftest failapi ..."): each fails
+    // the matching API call ONCE in the break-in stub paths, then clears.
+    bool mFailNextTerminate = false;  // TerminateThread on the stub thread
+    bool mFailNextStubResume = false; // ResumeThread of a fresh stub thread
+    bool mFailNextVfree = false;      // VirtualFreeEx of the stub page
     std::atomic<uint64_t> mDbgBreakInAddr{ 0 };        // ntdll!DbgUiRemoteBreakin (fallback break-in identity)
     uint32_t mExitThreadResolveAttempts = 0;           // rate-limit retry logging
     bool mWantsPause = false;

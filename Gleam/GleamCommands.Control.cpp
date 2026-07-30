@@ -167,21 +167,31 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     {
         mQuitting = true;
         abortStepOut("detach");
-        // A live break-in stub thread must be CONFIRMED dead before we let
-        // go: this pause holds a debug event, so the whole target is frozen
-        // and any wait here times out by construction. Defer the real
-        // Detach() to the stub's EXIT_THREAD event (cbExitThreadEvent ->
-        // finishDeferredDetach) instead of leaking its RWX page on timeout.
+        // Hasten + confirm what can be confirmed right now (non-blocking;
+        // a held debug event freezes the whole process, so anything still
+        // unconfirmed afterwards CANNOT finish inside this pause).
+        cleanupBreakInStub();
         if(mBreakInStubThread.load())
         {
+            // The stub thread's death is not confirmed yet: its EXIT_THREAD
+            // event is the confirmation (cbExitThreadEvent ->
+            // finishDeferredDetach), so defer the real Detach() to it.
             mDetachAfterStubCleanup = true;
             printf("detach deferred: waiting for break-in stub thread to exit\n");
             fflush(stdout);
             return CmdResult::Resume;
         }
-        // Reclaim stub resources left in the target before letting it go
-        // (terminate -> confirm -> close -> free, in that order).
-        cleanupBreakInStub();
+        if(mBreakInStubPage.load())
+        {
+            // Thread gone but the page free FAILED: refuse the detach - a
+            // remote RWX page must not leak into a surviving target. We are
+            // inside the command loop already, so just stay paused and let
+            // the user fix the cause and retry.
+            mQuitting = false;
+            printf("detach refused: break-in stub page still held (free failed)\n");
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
         Detach(); // detach happens at the end of the debug loop iteration
         printf("detaching...\n");
         fflush(stdout);

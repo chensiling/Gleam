@@ -293,6 +293,14 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
             else
                 printf("failed to set breakpoint at 0x%llX\n", a);
         }
+        else if(mSymbolAmbiguous)
+        {
+            // Ambiguous symbols must NEVER bind: not now, not later. The
+            // refusal was already printed by resolveModuleSymbol; do NOT
+            // register a pending breakpoint (its rebind retries would spam
+            // the same error at every debug event).
+            printf("breakpoint refused (ambiguous symbol)\n");
+        }
         else // module not loaded yet: bind when it loads
         {
             lb.once = once;

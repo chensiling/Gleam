@@ -6,7 +6,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <psapi.h>
 #include <dbghelp.h>
@@ -68,6 +70,82 @@ namespace
     {
         SetLastError(ERROR_ACCESS_DENIED);
         return (DWORD)-1;
+    }
+}
+
+namespace
+{
+    // Decide which record for a symbol is the CURRENT function body. Under
+    // incremental linking the PDB can keep a stale (zombie) record: the old
+    // body is still mapped and still carries the name, but no ILT thunk
+    // references it anymore. A single record is all the information there
+    // is (accepted); with several, only a body an ILT thunk still points at
+    // can be used - and only when EXACTLY ONE such body exists. Returns the
+    // candidate index, or -1 when no reliable identification is possible
+    // (the caller must refuse rather than write a breakpoint to a guess).
+    int pickLiveSymbolCandidate(const std::vector<uint64_t> & candidates,
+                                const std::unordered_set<uint64_t> & iltTargets)
+    {
+        if(candidates.size() == 1)
+            return 0;
+        int found = -1, live = 0;
+        for(size_t i = 0; i < candidates.size(); i++)
+        {
+            if(iltTargets.count(candidates[i]) != 0)
+            {
+                found = (int)i;
+                live++;
+            }
+        }
+        return live == 1 ? found : -1;
+    }
+
+    // Collect the ILT thunk targets of a module loaded in the debuggee.
+    // With incremental linking every call goes through an "E9 rel32" thunk,
+    // so the thunk targets are exactly the function bodies of the linker's
+    // current layout.
+    std::unordered_set<uint64_t> iltThunkTargets(GleeBug::Process* process, uint64_t base)
+    {
+        std::unordered_set<uint64_t> targets;
+        uint8_t hdr[0x1000];
+        if(!process->MemReadSafe(base, hdr, sizeof(hdr)))
+            return targets;
+        auto dos = (const IMAGE_DOS_HEADER*)hdr;
+        if(dos->e_magic != IMAGE_DOS_SIGNATURE ||
+           (uint64_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > sizeof(hdr))
+            return targets;
+        auto nt = (const IMAGE_NT_HEADERS64*)(hdr + dos->e_lfanew);
+        if(nt->Signature != IMAGE_NT_SIGNATURE)
+            return targets;
+        auto sec = (const IMAGE_SECTION_HEADER*)((const uint8_t*)&nt->OptionalHeader +
+                                                 nt->FileHeader.SizeOfOptionalHeader);
+        if((const uint8_t*)(sec + nt->FileHeader.NumberOfSections) > hdr + sizeof(hdr))
+            return targets;
+        const uint64_t imageEnd = base + nt->OptionalHeader.SizeOfImage;
+        std::vector<uint8_t> buf;
+        for(int i = 0; i < nt->FileHeader.NumberOfSections; i++)
+        {
+            if(!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE))
+                continue;
+            const uint32_t size = sec[i].Misc.VirtualSize;
+            if(!size || size > 32 * 1024 * 1024)
+                continue;
+            buf.resize(size);
+            if(!process->MemReadSafe(base + sec[i].VirtualAddress, buf.data(), size))
+                continue;
+            const uint64_t secBase = base + sec[i].VirtualAddress;
+            for(uint32_t off = 0; off + 5 <= size; off++)
+            {
+                if(buf[off] != 0xE9)
+                    continue;
+                int32_t rel;
+                memcpy(&rel, buf.data() + off + 1, sizeof(rel));
+                const uint64_t target = secBase + off + 5 + (int64_t)rel;
+                if(target >= base && target < imageEnd)
+                    targets.insert(target);
+            }
+        }
+        return targets;
     }
 }
 
@@ -454,19 +532,60 @@ uint32_t GleamDebugger::moduleImageSize(uint64_t base)
 
 bool GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & out)
 {
+    mSymbolAmbiguous = false;
     if(!mProcess || !ensureSymSession())
         return false;
-    char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
-    memset(buf, 0, sizeof(buf));
-    auto si = (SYMBOL_INFO*)buf;
-    si->SizeOfStruct = sizeof(SYMBOL_INFO);
-    si->MaxNameLen = MAX_SYM_NAME;
-    if(SymFromName(mProcess->hProcess, modSym.c_str(), si))
+    // Enumerate ALL records for the name: under incremental linking the PDB
+    // can keep a stale (zombie) record whose address no live code uses, and
+    // SymFromName's pick between the records is not reliable. A breakpoint
+    // written to such an address may never fire - or land mid-instruction
+    // in a current function and corrupt the target (observed for real: a
+    // stale "inner" record redirected an int3 into "sub rsp,imm").
+    std::vector<uint64_t> candidates;
+    uint64_t modBase = 0;
     {
-        out = si->Address;
-        return true;
+        struct Ctx
+        {
+            std::vector<uint64_t>* addrs;
+            uint64_t* modBase;
+        } ctx{ &candidates, &modBase };
+        auto cb = [](PSYMBOL_INFO si, ULONG, PVOID userCtx) -> BOOL
+        {
+            auto c = (Ctx*)userCtx;
+            c->addrs->push_back(si->Address);
+            if(!*c->modBase)
+                *c->modBase = si->ModBase;
+            return TRUE;
+        };
+        if(!SymEnumSymbols(mProcess->hProcess, 0, modSym.c_str(), cb, &ctx))
+            return false;
     }
-    return false;
+    if(candidates.empty())
+        return false;
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+    int pick = 0;
+    if(candidates.size() > 1)
+    {
+        // Disambiguate through the module's ILT: only a body a thunk still
+        // points at can be the current function.
+        auto ilt = iltThunkTargets(mProcess, modBase);
+        pick = pickLiveSymbolCandidate(candidates, ilt);
+        if(pick < 0)
+        {
+            printf("error: ambiguous symbol '%s' (%zu records, no unique live body):",
+                   modSym.c_str(), candidates.size());
+            for(auto a : candidates)
+                printf(" 0x%llX", (unsigned long long)a);
+            printf(" - refusing to use it\n");
+            fflush(stdout);
+            mSymbolAmbiguous = true;
+            return false;
+        }
+    }
+    out = candidates[pick];
+    return true;
 }
 
 bool GleamDebugger::ensureSymSession()
@@ -1405,9 +1524,15 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
             mTestHookResumeThread = &failapiResume;
         else if(which == "resume" && args.size() == 4 && args[3] == "always")
             mTestHookResumeThread = &failapiResumeAlways;
+        else if(which == "terminate" && args.size() == 3)
+            mFailNextTerminate = true;    // TerminateThread on the stub thread
+        else if(which == "stubresume" && args.size() == 3)
+            mFailNextStubResume = true;   // ResumeThread of a fresh stub thread
+        else if(which == "vfree" && args.size() == 3)
+            mFailNextVfree = true;        // VirtualFreeEx of the stub page
         else
         {
-            printf("usage: selftest failapi wait|continue|replylater|resume [always]|off\n");
+            printf("usage: selftest failapi wait|continue|replylater|resume [always]|terminate|stubresume|vfree|off\n");
             fflush(stdout);
             return CmdResult::Handled;
         }
@@ -1470,6 +1595,22 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
         T(P(D(false, true, 1, 1, true), true, true), true);    // hit    -> pause/swallow
         T(P(D(true, true, 1, 1, true), false, true), true);    // miss   -> no-pause swallow
         printf("selftest excpolicy %d/%d ok\n", pass, total);
+        // Symbol disambiguation under incremental linking (zombie records):
+        // the pure decision over candidate address sets.
+        {
+            std::unordered_set<uint64_t> ilt{ 0x2000, 0x3000 };
+            int okc = 0;
+            if(pickLiveSymbolCandidate({ 0x1000 }, ilt) == 0)
+                okc++; // a single record is all the information there is
+            if(pickLiveSymbolCandidate({ 0x1000, 0x2000 }, ilt) == 1)
+                okc++; // zombie + live: pick the ILT-backed body
+            if(pickLiveSymbolCandidate({ 0x1000, 0x4000 }, ilt) < 0)
+                okc++; // no ILT-backed body: refuse
+            if(pickLiveSymbolCandidate({ 0x2000, 0x3000 }, ilt) < 0)
+                okc++; // two ILT-backed bodies: refuse (cannot disambiguate)
+            printf("selftest symdis %d/4 ok\n", okc);
+            fflush(stdout);
+        }
         // Module identity check (needs Late.dll + NoExp.dll loaded: dll4).
         {
             uint64_t lateBase = 0, noexpBase = 0;

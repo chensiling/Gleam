@@ -215,13 +215,14 @@ int main(int argc, char** argv)
     {
         // Long-lived, always-runnable target for attach scenarios: main spins
         // (steppable at any moment), a second thread sleeps (a thread that
-        // can be frozen by a failed resume). Runs ~30s unless killed earlier.
+        // can be frozen by a failed resume). Runs ~120s unless killed earlier
+        // (the scenarios kill it explicitly; 120s covers slow CI machines).
         CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
         printf("WAIT_READY=1\n");
         fflush(stdout);
         DWORD start = GetTickCount();
         volatile uint64_t k = 0;
-        while(GetTickCount() - start < 30000)
+        while(GetTickCount() - start < 120000)
             k += 0;
         printf("WAIT_DONE=%llu\n", (unsigned long long)k);
         fflush(stdout);

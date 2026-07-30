@@ -727,6 +727,11 @@ chkcount "T8: one trace line"    ${TDIR}/gleam_T8.txt "trace address=0x$INNER" 1
 chk "T8: results correct"        ${TDIR}/gleam_T8.txt "MARKER_RESULT_2=13"
 
 # --- R6: pause->detach must NOT re-inject after quitting ---
+# The pause MAY legitimately inject BEFORE quitting starts (it was issued
+# while not quitting - since the stub no longer depends on resolving
+# ExitThread, that early injection now succeeds). What must not happen is
+# an injection once detach is in flight: forceBreakIn refuses then, and the
+# deferred detach cleanup reuses the existing stub instead of injecting.
 run R6 "" <<EOF
 bp $MARKER
 g
@@ -734,7 +739,15 @@ pause
 detach
 EOF
 chk "R6: detaching"              ${TDIR}/gleam_R6.txt "detaching..."
-chkcount "R6: no injection after detach" ${TDIR}/gleam_R6.txt "event breakin injected" 0
+read -r r6Inj < <(awk '/detach deferred/ { f=1 } f && /event breakin injected/ { n++ } END { print n+0 }' ${TDIR}/gleam_R6.txt)
+if [ "$r6Inj" = "0" ]; then
+  ok "R6: no injection after detach"
+else
+  bad "R6: $r6Inj injection(s) after detach (see ${TDIR}/gleam_R6.txt)"
+fi
+# The detached target inherits gleam's stdout, so its completion output
+# lands in this log AFTER gleam has already exited - give it a moment.
+sleep 2
 chk "R6: target ran to completion" ${TDIR}/gleam_R6.txt "MARKER_RESULT_2=13"
 
 # --- R7: pause->quit must NOT re-inject ---
@@ -744,7 +757,12 @@ g
 pause
 quit
 EOF
-chkcount "R7: no injection after quit" ${TDIR}/gleam_R7.txt "event breakin injected" 0
+read -r r7Inj < <(awk '/stop reason=pause/ { f=1 } f && /event breakin injected/ { n++ } END { print n+0 }' ${TDIR}/gleam_R7.txt)
+if [ "$r7Inj" = "0" ]; then
+  ok "R7: no injection after quit"
+else
+  bad "R7: $r7Inj injection(s) after quit (see ${TDIR}/gleam_R7.txt)"
+fi
 
 # --- U1: address expressions (eval) ---
 run U1 "" <<EOF
@@ -1994,8 +2012,9 @@ else
   chkre    "W16/attach: stub page freed"        ${TDIR}/gleam_W16_attach.txt "^event breakin stub freed page=0x[0-9A-Fa-f]+"
   # Whitelist: every internal error must FULL-LINE match one of the two
   # expected shapes (anchored, CRLF-aware): an injected resume failure with
-  # error 5, or the single refusal with its tid list and fixed tail.
-  WL_RE='^event error msg="Debugger: ResumeThread failed for tid [0-9]+ \(error 5\)"\r?$|^event error msg="Debugger::Detach refused: threads still suspended by us \(tid [0-9 ]+\) - detach aborted, target left attached"\r?$'
+  # error 5, or the single refusal with a STRICT tid list (at least one
+  # number; multiple tids separated by exactly one space) and its fixed tail.
+  WL_RE='^event error msg="Debugger: ResumeThread failed for tid [0-9]+ \(error 5\)"\r?$|^event error msg="Debugger::Detach refused: threads still suspended by us \(tid [0-9]+( [0-9]+)*\) - detach aborted, target left attached"\r?$'
   wlBad=$(grep 'event error msg=' ${TDIR}/gleam_W16_attach.txt | grep -cvE "$WL_RE")
   if [ "$wlBad" -eq 0 ]; then
     ok "W16/attach: all errors within whitelist"
@@ -2003,13 +2022,25 @@ else
     bad "W16/attach: $wlBad unexpected internal error(s) (see ${TDIR}/gleam_W16_attach.txt)"
   fi
   # Whitelist meta-test: a legal prefix with junk appended must be REJECTED,
-  # a clean specimen must be ACCEPTED (proves the patterns really anchor).
+  # clean specimens must be ACCEPTED (proves the patterns really anchor).
   printf 'event error msg="Debugger: ResumeThread failed for tid 123 (error 5); cleanup failed"\r\n' > ${TDIR}/wl_neg.txt
   printf 'event error msg="Debugger::Detach refused: threads still suspended by us (tid 123 456) - detach aborted, target left attached"\r\n' > ${TDIR}/wl_pos.txt
   if [ "$(grep -cvE "$WL_RE" ${TDIR}/wl_neg.txt)" -eq 1 ] && [ "$(grep -cvE "$WL_RE" ${TDIR}/wl_pos.txt)" -eq 0 ]; then
     ok "W16/attach: whitelist anchors verified"
   else
     bad "W16/attach: whitelist anchoring broken"
+  fi
+  # Strict tid-list meta-test: empty, space-only, double-space and trailing-
+  # space lists must ALL be rejected by the whitelist pattern.
+  printf 'event error msg="Debugger::Detach refused: threads still suspended by us (tid ) - detach aborted, target left attached"\r\n' > ${TDIR}/wl_tid.txt
+  printf 'event error msg="Debugger::Detach refused: threads still suspended by us (tid  ) - detach aborted, target left attached"\r\n' >> ${TDIR}/wl_tid.txt
+  printf 'event error msg="Debugger::Detach refused: threads still suspended by us (tid 123  456) - detach aborted, target left attached"\r\n' >> ${TDIR}/wl_tid.txt
+  printf 'event error msg="Debugger::Detach refused: threads still suspended by us (tid 123 ) - detach aborted, target left attached"\r\n' >> ${TDIR}/wl_tid.txt
+  wlTidBad=$(grep -cvE "$WL_RE" ${TDIR}/wl_tid.txt)
+  if [ "$wlTidBad" -eq 4 ]; then
+    ok "W16/attach: strict tid list rejects malformed forms"
+  else
+    bad "W16/attach: strict tid list accepted $((4 - wlTidBad)) malformed form(s)"
   fi
   chkcount "W16/attach: two detach completions" ${TDIR}/gleam_W16_attach.txt "detaching..." 2
   chkcount "W16/attach: single session end"     ${TDIR}/gleam_W16_attach.txt "[gleam] session finished" 1
@@ -2046,6 +2077,157 @@ else
   kill $ATT_BG 2>/dev/null
 fi
 
+# --- W17: break-in stub fault paths (gleam-side failapi) ---
+# The pause break-in stub is pure int3s; the thread is terminated at its
+# int3 stop and the page is freed only after the thread's EXIT_THREAD event
+# confirms death. These scenarios inject the three gleam-side stub API
+# failures. Logs are named gleam_W16_* on purpose: like W16 they inject
+# failures intentionally, so the suite-wide internal-error sweep skips
+# them - and each log is held to an exact error count here instead.
+echo "== W17 =="
+
+w17_target() { # start a fresh "wait" target; sets ATT_PID / ATT_BG
+  "$TARGET" wait > ${TDIR}/gleam_W17_target.txt 2>&1 &
+  ATT_BG=$!
+  sleep 1
+  ATT_PID=$(cat /proc/$ATT_BG/winpid 2>/dev/null)
+}
+w17_cleanup() {
+  [ -n "$ATT_PID" ] && powershell -NoProfile -Command "Stop-Process -Id $ATT_PID -Force -ErrorAction SilentlyContinue" > /dev/null 2>&1
+  kill $ATT_BG 2>/dev/null
+}
+
+# stubresume: ResumeThread of the fresh stub thread fails once. The fallback
+# (DebugBreakProcess) must still deliver the pause, the never-ran thread
+# must be terminated and confirmed at cleanup, and the page freed.
+w17_target
+if [ -z "$ATT_PID" ]; then
+  bad "W17/stubresume: cannot resolve target pid"
+else
+  ( printf 'selftest failapi stubresume\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) |
+    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_stubresume.txt 2>&1
+  ec=$?
+  echo "== W17/stubresume =="
+  if [ $ec -ne 0 ]; then bad "W17/stubresume: abnormal exit (code $ec)"; fi
+  chk      "W17/stubresume: armed"              ${TDIR}/gleam_W16_stubresume.txt "selftest failapi armed stubresume"
+  chk      "W17/stubresume: resume failure"     ${TDIR}/gleam_W16_stubresume.txt "event breakin fail=resume err=5"
+  chk      "W17/stubresume: fallback pauses"    ${TDIR}/gleam_W16_stubresume.txt "stop reason=pause"
+  chkcount "W17/stubresume: zero internal errors" ${TDIR}/gleam_W16_stubresume.txt 'event error msg=' 0
+  chk      "W17/stubresume: detached"           ${TDIR}/gleam_W16_stubresume.txt "detaching..."
+  chk      "W17/stubresume: controlled exit"    ${TDIR}/gleam_W16_stubresume.txt "[gleam] session finished"
+  sleep 1
+  [ "$(pid_state "$ATT_PID")" = "alive" ] && ok "W17/stubresume: target alive after detach" ||
+    bad "W17/stubresume: target pid=$ATT_PID not alive"
+  w17_cleanup
+fi
+
+# terminate: TerminateThread on the stub thread fails once at its int3. The
+# failure must be reported; the thread survives to the NEXT stub int3 (the
+# page is pure int3s and the identification covers the range), where the
+# retry terminates it; the deferred detach then completes normally.
+w17_target
+if [ -z "$ATT_PID" ]; then
+  bad "W17/terminate: cannot resolve target pid"
+else
+  ( printf 'selftest failapi terminate\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'g\ndetach\n' ) |
+    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_terminate.txt 2>&1
+  ec=$?
+  echo "== W17/terminate =="
+  if [ $ec -ne 0 ]; then bad "W17/terminate: abnormal exit (code $ec)"; fi
+  chk      "W17/terminate: armed"               ${TDIR}/gleam_W16_terminate.txt "selftest failapi armed terminate"
+  chkre    "W17/terminate: precise error"       ${TDIR}/gleam_W16_terminate.txt '^event error msg="Gleam: TerminateThread failed for break-in stub tid [0-9]+ \(error 5\)"'
+  chkcount "W17/terminate: exactly 1 error"     ${TDIR}/gleam_W16_terminate.txt 'event error msg=' 1
+  chkcount "W17/terminate: retried at next int3" ${TDIR}/gleam_W16_terminate.txt "stop reason=pause" 2
+  chk      "W17/terminate: stub freed"          ${TDIR}/gleam_W16_terminate.txt "event breakin stub freed"
+  chk      "W17/terminate: detached"            ${TDIR}/gleam_W16_terminate.txt "detaching..."
+  chk      "W17/terminate: controlled exit"     ${TDIR}/gleam_W16_terminate.txt "[gleam] session finished"
+  sleep 1
+  [ "$(pid_state "$ATT_PID")" = "alive" ] && ok "W17/terminate: target alive after detach" ||
+    bad "W17/terminate: target pid=$ATT_PID not alive"
+  w17_cleanup
+fi
+
+# vfree: VirtualFreeEx of the stub page fails once at the deferred detach.
+# The detach must be REFUSED with the page address KEPT; the immediate retry
+# (the hook is one-shot) frees it and the second detach completes. External
+# VirtualQueryEx must confirm MEM_FREE in the surviving target.
+w17_target
+if [ -z "$ATT_PID" ]; then
+  bad "W17/vfree: cannot resolve target pid"
+else
+  ( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'selftest failapi vfree\ndetach\ndetach\n' ) |
+    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_vfree.txt 2>&1
+  ec=$?
+  echo "== W17/vfree =="
+  if [ $ec -ne 0 ]; then bad "W17/vfree: abnormal exit (code $ec)"; fi
+  chk      "W17/vfree: stub injected"           ${TDIR}/gleam_W16_vfree.txt "event breakin injected"
+  chkre    "W17/vfree: precise error"           ${TDIR}/gleam_W16_vfree.txt '^event error msg="Gleam: break-in stub page free failed for 0x[0-9A-Fa-f]+ \(error 5\)"'
+  chkcount "W17/vfree: exactly 1 error"         ${TDIR}/gleam_W16_vfree.txt 'event error msg=' 1
+  chk      "W17/vfree: detach refused"          ${TDIR}/gleam_W16_vfree.txt "detach refused: break-in stub page still held (free failed)"
+  chk      "W17/vfree: retry freed the page"    ${TDIR}/gleam_W16_vfree.txt "event breakin stub freed"
+  chkcount "W17/vfree: single successful detach" ${TDIR}/gleam_W16_vfree.txt "detaching..." 1
+  chk      "W17/vfree: controlled exit"         ${TDIR}/gleam_W16_vfree.txt "[gleam] session finished"
+  vPage=$(sed -n 's/^event breakin injected page=0x\([0-9A-Fa-f]*\).*/\1/p' ${TDIR}/gleam_W16_vfree.txt | head -1)
+  sleep 1
+  vState=""
+  if [ -n "$vPage" ]; then
+    vState=$(powershell -NoProfile -ExecutionPolicy Bypass -File ${TDIR}/vq.ps1 "$ATT_PID" "$(printf '%d' 0x$vPage)" 2>/dev/null | sed -n 's/^STATE=\([0-9]*\).*/\1/p')
+  fi
+  if [ "$vState" = "65536" ]; then
+    ok "W17/vfree: stub page MEM_FREE after retry"
+  else
+    bad "W17/vfree: stub page state=$vState (want 65536=MEM_FREE, page=0x$vPage)"
+  fi
+  [ "$(pid_state "$ATT_PID")" = "alive" ] && ok "W17/vfree: target alive after detach" ||
+    bad "W17/vfree: target pid=$ATT_PID not alive"
+  w17_cleanup
+fi
+
+# --- SYM: ambiguous symbol handling (incremental-link zombie shape) ---
+# ZombieTarget is a PINNED fixture (ZombieTarget/fixtures/): two translation
+# units each define a file-static "inner", so the PDB carries two records
+# for the plain name - the same shape an incremental-link zombie record
+# creates. The debugger must REFUSE the ambiguous name outright (a pending
+# breakpoint would bind to a guess later or spam the error at every event),
+# while unambiguous symbols keep working end to end.
+echo "== SYM =="
+ZTARGET=ZombieTarget/fixtures/ZombieTarget.exe
+ZAADDR=$(printf 'eval ZombieTarget!innerA\nquit\n' | timeout 30 "$GLEAM" $ZTARGET 2>&1 | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | head -1)
+if [ -z "$ZAADDR" ]; then
+  bad "SYM: cannot resolve innerA in the fixture"
+else
+  timeout 40 "$GLEAM" $ZTARGET > ${TDIR}/gleam_SYM.txt 2>&1 <<EOF
+eval ZombieTarget!inner
+bp ZombieTarget!inner
+bl
+bp ZombieTarget!innerA
+g
+bl
+rbp 0x$ZAADDR
+disasm 0x$ZAADDR 1
+g
+g
+quit
+EOF
+  ec=$?
+  if [ $ec -ne 0 ]; then bad "SYM: abnormal exit (code $ec; see ${TDIR}/gleam_SYM.txt)"; fi
+  chk      "SYM: ambiguity refused"        ${TDIR}/gleam_SYM.txt "ambiguous symbol 'ZombieTarget!inner' (2 records"
+  chk      "SYM: bp refused, not pending"  ${TDIR}/gleam_SYM.txt "breakpoint refused (ambiguous symbol)"
+  chk      "SYM: no pending registered"    ${TDIR}/gleam_SYM.txt "no breakpoints"
+  chkcount "SYM: refusal printed once per use" ${TDIR}/gleam_SYM.txt "ambiguous symbol 'ZombieTarget!inner'" 2
+  chk      "SYM: unambiguous bp hits"      ${TDIR}/gleam_SYM.txt "stop reason=breakpoint type=software address=0x$ZAADDR"
+  chk      "SYM: bp removed"               ${TDIR}/gleam_SYM.txt "breakpoint removed at 0x$ZAADDR"
+  # The byte under the removed breakpoint must be restored (no int3 left).
+  if grep -E "^0000000[0-9A-F]+ " ${TDIR}/gleam_SYM.txt | grep -q "int3"; then
+    bad "SYM: int3 left after breakpoint removal"
+  else
+    ok "SYM: original byte restored"
+  fi
+  chkcount "SYM: no exceptions in target"  ${TDIR}/gleam_SYM.txt "stop reason=exception" 0
+  chk      "SYM: target completes"         ${TDIR}/gleam_SYM.txt "R2=13"
+  chk      "SYM: clean exit"               ${TDIR}/gleam_SYM.txt "stop reason=exit code=0x00000000"
+fi
+
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF
 selftest
@@ -2053,6 +2235,7 @@ g
 EOF
 chk "selftest: rangeInImage"     ${TDIR}/gleam_ST.txt "selftest rangeInImage 12/12 ok"
 chk "selftest: excpolicy"        ${TDIR}/gleam_ST.txt "selftest excpolicy 16/16 ok"
+chk "selftest: symdis"           ${TDIR}/gleam_ST.txt "selftest symdis 4/4 ok"
 
 # --- suite-wide: no engine internal error in ANY scenario ---
 # cbInternalError is the engine's only channel for "a Windows API we depend on
