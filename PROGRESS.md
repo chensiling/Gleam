@@ -3,7 +3,24 @@
 > 交接用：让下一个 AGENT 不用翻聊天记录就能继续。每次完成有意义的工作后更新本文件。
 > 目标与验证标准见 `PROJECT.md`（总纲），本文件只记录"做到哪了、怎么继续"。
 
-## 当前状态：第八轮复审 C3-R5/C3-R6/C3-T3a-R/SYM-1 全部落地，门禁绑定 6818206
+## 当前状态：第八轮复审 SYM-1/SYM-2/C3-R5-R/C3-R6 修复完成，提交 793dbd3
+
+最后更新：2026-07-30
+
+**第八轮复审中的 4 项问题（SYM-1/SYM-2/C3-R5-R/C3-R6）已全部修复**，提交 `793dbd3`。
+
+- **SYM-1（高）：统一符号消歧，pending DLL 绑定不再绕过**：`resolveModuleSymbol` 改返回 `SymbolResult` 三态（Found/NotFound/Ambiguous）；`resolvePdbSymbol` 使用完整 ILT 消歧逻辑，不再直接调 `SymFromName`；`bindModuleBreakpoints` 遇歧义明确拒绝并从 pending 删除。Late.dll 新增 `ambig_a.cpp`/`ambig_b.cpp` 双翻译单元提供"活跃 ambig + 僵尸 ambig"的测试形状
+- **SYM-2（中）：移除跨命令污染的全局歧义状态**：删除 `mSymbolAmbiguous` 布尔值，歧义通过返回值传递；`exprParseAtom`/`bp` 命令按结果分支，`eval ZombieTarget!inner` 后 `bp module+rva` 保持正确 pending 语义
+- **C3-R5-R（中）：stub 发布前写入失败保留页面地址**：`ensureBreakInStub` 的 `WriteProcessMemory` + `VirtualFreeEx` 双失败时将页面登记到 `mBreakInStubPage`，后续清理可重试
+- **C3-R6（中）：hide on 下 stub ResumeThread 失败可恢复**：`ResumeThread` 失败但 `TerminateThread` 成功时用新 stub 重试；hide on 下不调用会失败的 `DebugBreakProcess`，延迟到下一自然事件或重试成功
+
+**新增测试**：SYM-1（pending DLL 歧义拒绝）、SYM-2（跨命令污染回归）
+
+**遗留**：门禁尚未运行完整套件验证；审查文档尚未更新关闭状态。
+
+---
+
+## 第八轮复审 C3-R5/C3-R6/C3-T3a-R/SYM-1 全部落地，门禁绑定 6818206
 
 最后更新：2026-07-30
 
