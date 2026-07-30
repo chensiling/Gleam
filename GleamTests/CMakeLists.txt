@@ -25,6 +25,8 @@ add_executable(GleamTests
     test_ilt_disambiguation.cpp
     test_error.cpp
     test_history.cpp
+    test_memory.cpp
+    test_raii.cpp
 )
 
 # Don't include GleamIltDisambiguation.cpp - it depends on full GleeBug headers
