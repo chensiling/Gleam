@@ -69,7 +69,7 @@ TEST(ErrorTest, ConstructWithMessage) {
 }
 
 TEST(ErrorTest, ConstructWithSystemCode) {
-    Gleam::Error err(Gleam::ErrorCategory::WindowsSystem, "API call failed", 5);
+    Gleam::Error err(Gleam::ErrorCategory::Process, "API call failed", 5);
     EXPECT_TRUE(err.hasError());
     EXPECT_EQ(err.systemCode, 5);
 }

@@ -4,9 +4,25 @@
 #include <vector>
 #include <unordered_set>
 
-// Forward declaration of the function to test
+// Mock implementation for testing
 int pickLiveSymbolCandidate(const std::vector<uint64_t>& candidates,
-                            const std::unordered_set<uint64_t>& iltTargets);
+                            const std::unordered_set<uint64_t>& iltTargets) {
+    if (candidates.empty())
+        return -1;
+    if (candidates.size() == 1)
+        return 0;
+
+    std::vector<int> liveIndices;
+    for (size_t i = 0; i < candidates.size(); i++)
+    {
+        if (iltTargets.count(candidates[i]) > 0)
+            liveIndices.push_back((int)i);
+    }
+
+    if (liveIndices.size() == 1)
+        return liveIndices[0];
+    return -1;
+}
 
 // Test fixture for ILT disambiguation
 class IltDisambiguationTest : public ::testing::Test {

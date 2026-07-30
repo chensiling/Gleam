@@ -33,6 +33,7 @@ public:
 class MockIltCache {
 public:
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> cache;
+    mutable int scanCount = 0;  // Track scan calls
 
     const std::unordered_set<uint64_t>* getTargets(uint64_t moduleBase) {
         auto it = cache.find(moduleBase);
@@ -40,6 +41,7 @@ public:
             return &it->second;
 
         // Simulate expensive scan - create dummy ILT targets
+        scanCount++;
         std::unordered_set<uint64_t> targets;
         targets.insert(moduleBase + 0x1000);
         targets.insert(moduleBase + 0x2000);
@@ -236,28 +238,19 @@ TEST(CachePerformanceTest, SymbolCacheSavesLookups) {
 
 TEST(CachePerformanceTest, IltCacheSavesScans) {
     MockIltCache cache;
-    int scanCount = 0;
-
-    auto expensiveScan = [&](uint64_t base) -> std::unordered_set<uint64_t> {
-        scanCount++;
-        // Simulate expensive PE scan
-        std::unordered_set<uint64_t> targets;
-        targets.insert(base + 0x1000);
-        return targets;
-    };
 
     uint64_t moduleBase = 0x140000000;
 
     // First access - triggers scan
     const auto* targets1 = cache.getTargets(moduleBase);
-    EXPECT_EQ(scanCount, 1);
+    EXPECT_EQ(cache.scanCount, 1);
 
     // Subsequent accesses - no scan
     for (int i = 0; i < 100; i++) {
         const auto* targets = cache.getTargets(moduleBase);
         EXPECT_EQ(targets, targets1);
     }
-    EXPECT_EQ(scanCount, 1);  // Still only 1 expensive scan
+    EXPECT_EQ(cache.scanCount, 1);  // Still only 1 expensive scan
 }
 
 // Cache invalidation tests

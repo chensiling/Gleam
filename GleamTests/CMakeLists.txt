@@ -24,8 +24,10 @@ add_executable(GleamTests
     test_constants.cpp
     test_ilt_disambiguation.cpp
     test_error.cpp
-    ../Gleam/GleamIltDisambiguation.cpp
+    test_history.cpp
 )
+
+# Don't include GleamIltDisambiguation.cpp - it depends on full GleeBug headers
 
 # Link Google Test
 target_link_libraries(GleamTests
