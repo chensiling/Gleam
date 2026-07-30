@@ -233,8 +233,8 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
         // a probe to see if it resolves immediately - if it fails but the logical
         // parse succeeded, suppress the error (it will become a pending bp).
         const bool resolved = parseAddress(args[1], a);
-        // Check for ambiguous symbol BEFORE proceeding - ambiguous symbols
-        // must NEVER bind (not now, not as pending).
+        // SYM-2 FIX: Capture ambiguous state from THIS parseAddress call only.
+        // Extract the result BEFORE clearing mAddrError to avoid cross-command pollution.
         const bool ambiguous = !mAddrError.empty() && mAddrError.find("ambiguous") != std::string::npos;
         if(logical && !resolved)
             mAddrError.clear(); // the logical spec succeeded; don't leak the probe's error

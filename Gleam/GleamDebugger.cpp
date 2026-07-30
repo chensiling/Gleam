@@ -134,16 +134,19 @@ void GleamDebugger::forceBreakIn()
             printf("event breakin fail=terminate_wait (thread+page kept)\n");
             fflush(stdout);
         }
-        // C3-R6: hide on makes DebugBreakProcess unusable (it checks
-        // PEB.BeingDebugged, which hide cleared). Use the fallback when hide
-        // is off (normal case); when hide is on, defer to the next natural
-        // event (mWantsPause stays armed).
+        // C3-R6 FIX: When hide is off, use DebugBreakProcess fallback.
+        // When hide is on, DebugBreakProcess would fail (PEB.BeingDebugged cleared),
+        // so we defer to the next natural event instead and re-arm mPauseAfterResume.
         if(!mHideOn)
         {
             fallbackDebugBreak(process);
         }
         else
         {
+            // Under hide-on, DebugBreakProcess checks PEB.BeingDebugged (cleared)
+            // and fails. Re-arm the pause request; it will be consumed at the next
+            // natural debug event (exception, DLL load, thread create, etc).
+            mPauseAfterResume.store(true);
             printf("event breakin deferred: waiting for next target event under hide on\n");
             fflush(stdout);
         }
@@ -201,17 +204,39 @@ bool GleamDebugger::cleanupBreakInStub()
     std::lock_guard<std::mutex> lock(mBreakInMutex);
     if(auto hThread = mBreakInStubThread.load())
     {
-        if(!TerminateThread(hThread, 0))
+        // C3-R6 FIX: Keep trying to terminate until confirmed dead or we give up.
+        // Don't limit to 16 INT3s - keep the thread tracked until death is confirmed.
+        int retries = 0;
+        const int maxRetries = 100; // Generous retry limit for persistent failures
+        while(retries < maxRetries)
         {
-            printf("event error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu)\"\n",
-                   mBreakInStubTid.load(), GetLastError());
-            fflush(stdout);
+            if(!TerminateThread(hThread, 0))
+            {
+                printf("event error msg=\"Gleam: TerminateThread failed for break-in stub tid %u (error %lu, retry %d)\"\n",
+                       mBreakInStubTid.load(), GetLastError(), retries);
+                fflush(stdout);
+                retries++;
+                Sleep(10); // Brief delay before retry
+                continue;
+            }
+            // Termination call succeeded, check if thread is dead
+            if(WaitForSingleObject(hThread, 100) == WAIT_OBJECT_0)
+            {
+                CloseHandle(hThread);
+                mBreakInStubThread.store(nullptr);
+                mBreakInStubTid.store(0);
+                break;
+            }
+            // Thread not dead yet, retry termination
+            retries++;
+            if(retries < maxRetries)
+                Sleep(10);
         }
-        else if(WaitForSingleObject(hThread, 0) == WAIT_OBJECT_0)
+        if(retries >= maxRetries)
         {
-            CloseHandle(hThread);
-            mBreakInStubThread.store(nullptr);
-            mBreakInStubTid.store(0);
+            printf("event error msg=\"Gleam: break-in stub thread %u could not be terminated after %d retries (handle+page kept)\"\n",
+                   mBreakInStubTid.load(), maxRetries);
+            fflush(stdout);
         }
     }
     if(mBreakInStubThread.load())
@@ -285,22 +310,32 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
         fallbackDebugBreak(process);
         return false;
     }
+    // C3-R5-R FIX: Register the page IMMEDIATELY after allocation, before any
+    // operation that can fail. This ensures the page is always trackable even
+    // if WriteProcessMemory or VirtualFreeEx fails.
+    mBreakInStubPage.store(page);
+
     if(!WriteProcessMemory(process->hProcess, page, stub, sizeof(stub), nullptr))
     {
         printf("event breakin fail=write err=%lu\n", GetLastError());
         fflush(stdout);
-        // C3-R5-R: if VirtualFreeEx also fails, the page leaks. Publish it
-        // to mBreakInStubPage so freeBreakInStubPage can retry later.
+        // Try to free immediately; if that fails, the page is already registered
+        // in mBreakInStubPage and freeBreakInStubPage can retry later.
         if(!VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE))
         {
             printf("event breakin fail=free err=%lu (page retained for retry)\n", GetLastError());
             fflush(stdout);
-            mBreakInStubPage.store(page);
+            // Page stays registered for cleanup retry
+        }
+        else
+        {
+            // Successfully freed; clear the registration
+            mBreakInStubPage.store(nullptr);
         }
         fallbackDebugBreak(process);
         return false;
     }
-    mBreakInStubPage.store(page);
+    // Page is already registered above; write succeeded
     return true;
 }
 
