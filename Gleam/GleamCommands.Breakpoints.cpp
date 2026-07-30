@@ -293,7 +293,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
             else
                 printf("failed to set breakpoint at 0x%llX\n", a);
         }
-        else if(mSymbolAmbiguous)
+        else if(!mAddrError.empty() && mAddrError.find("ambiguous") != std::string::npos)
         {
             // Ambiguous symbols must NEVER bind: not now, not later. The
             // refusal was already printed by resolveModuleSymbol; do NOT

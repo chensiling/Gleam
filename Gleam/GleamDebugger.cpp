@@ -118,7 +118,8 @@ void GleamDebugger::forceBreakIn()
         // only close the handle when death is CONFIRMED; an unconfirmed
         // thread keeps handle + tid + page registered (the deferred detach
         // cleanup and cbExitThreadEvent keep tracking it).
-        if(!TerminateThread(hThread, 0))
+        bool terminated = TerminateThread(hThread, 0) != 0;
+        if(!terminated)
         {
             printf("event breakin fail=terminate err=%lu\n", GetLastError());
             fflush(stdout);
@@ -133,7 +134,26 @@ void GleamDebugger::forceBreakIn()
             printf("event breakin fail=terminate_wait (thread+page kept)\n");
             fflush(stdout);
         }
-        fallbackDebugBreak(process);
+        // C3-R6: hide on makes DebugBreakProcess unusable (it checks
+        // PEB.BeingDebugged, which hide cleared). Retry with a fresh stub
+        // thread if the first one was cleanly terminated - this covers the
+        // common "ResumeThread failed but TerminateThread succeeded" case.
+        // If both failed, the pause waits for the next natural event.
+        if(terminated && !mBreakInStubThread.load())
+        {
+            printf("event breakin retrying with fresh stub thread\n");
+            fflush(stdout);
+            forceBreakIn();
+        }
+        else if(!mHideOn)
+        {
+            fallbackDebugBreak(process);
+        }
+        else
+        {
+            printf("event breakin deferred: waiting for next target event under hide on\n");
+            fflush(stdout);
+        }
         return;
     }
     printf("event breakin injected page=0x%p\n", mBreakInStubPage.load());
@@ -276,7 +296,14 @@ bool GleamDebugger::ensureBreakInStub(GleeBug::Process* process)
     {
         printf("event breakin fail=write err=%lu\n", GetLastError());
         fflush(stdout);
-        VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE);
+        // C3-R5-R: if VirtualFreeEx also fails, the page leaks. Publish it
+        // to mBreakInStubPage so freeBreakInStubPage can retry later.
+        if(!VirtualFreeEx(process->hProcess, page, 0, MEM_RELEASE))
+        {
+            printf("event breakin fail=free err=%lu (page retained for retry)\n", GetLastError());
+            fflush(stdout);
+            mBreakInStubPage.store(page);
+        }
         fallbackDebugBreak(process);
         return false;
     }
@@ -512,12 +539,14 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
             continue;
         }
         uint64_t addr = 0;
+        bool ambiguous = false;
         if(!lb.symbol.empty())
         {
             addr = findExportByName(moduleBase, lb.symbol);
+            SymbolResult sr = SymbolResult::NotFound;
             if(!addr) // invade-session fallback (needs the loader list)
-                resolveModuleSymbol(lb.module + "!" + lb.symbol, addr);
-            if(!addr) // PDB-only fallback: load symbols from the file itself
+                sr = resolveModuleSymbol(lb.module + "!" + lb.symbol, addr);
+            if(!addr && sr != SymbolResult::Ambiguous) // PDB-only fallback
             {
                 const wchar_t* path = imagePath && *imagePath ? imagePath : nullptr;
                 if(!path)
@@ -526,7 +555,16 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
                     if(found != mModulePaths.end())
                         path = found->second.c_str();
                 }
-                addr = resolvePdbSymbol(moduleBase, path, lb.symbol);
+                sr = resolvePdbSymbol(moduleBase, path, lb.symbol, addr);
+            }
+            // Ambiguous symbols must NEVER bind (not now, not as pending).
+            // The refusal was already printed by resolve*Symbol.
+            if(sr == SymbolResult::Ambiguous)
+            {
+                printf("event bp rejected module=%s symbol=%s (ambiguous)\n",
+                       lb.module.c_str(), lb.symbol.c_str());
+                mLogicalBps.erase(mLogicalBps.begin() + i);
+                continue;
             }
             if(!addr)
             {

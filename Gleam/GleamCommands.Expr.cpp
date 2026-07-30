@@ -39,9 +39,13 @@ bool GleamDebugger::exprParseAtom(const std::string & s, size_t & pos, uint64_t 
     // module!symbol (dbghelp)
     if(tok.find('!') != std::string::npos)
     {
-        if(resolveModuleSymbol(tok, out))
+        SymbolResult sr = resolveModuleSymbol(tok, out);
+        if(sr == SymbolResult::Found)
             return true;
-        err = "unknown symbol '" + tok + "'";
+        if(sr == SymbolResult::Ambiguous)
+            err = "ambiguous symbol '" + tok + "'";
+        else
+            err = "unknown symbol '" + tok + "'";
         return false;
     }
 

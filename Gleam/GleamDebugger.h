@@ -279,11 +279,11 @@ private:
     bool parseAddress(const std::string & s, uint64_t & out, std::string & err);
     void printAddrError();           // GleamCommands.Symbols.cpp
     std::string mAddrError;          // reason of the last failed parseAddress
-    // Set by resolveModuleSymbol when a name has multiple records and no
-    // unique live body. Unlike "not found" (which may bind later and may
-    // become a pending breakpoint), an ambiguous symbol must NEVER bind -
-    // the bp command refuses instead of registering it as pending.
-    bool mSymbolAmbiguous = false;
+    // Symbol resolution result: distinguishes "not found" (may bind later)
+    // from "ambiguous" (must never bind). Replaces the cross-command-polluting
+    // mSymbolAmbiguous boolean.
+    enum class SymbolResult { Found, NotFound, Ambiguous };
+    // Resolve module!symbol with full ILT-based disambiguation (all paths).
     // Look up a loaded module's base by name (case-insensitive, .dll optional).
     bool moduleBaseByName(const std::string & name, uint64_t & base);
     // Same, with image size (for RVA bounds checks).
@@ -291,13 +291,17 @@ private:
     // Image size read directly from the PE at base (no loader list needed;
     // works during the DLL load event). 0 = cannot confirm.
     uint32_t moduleImageSize(uint64_t base);
-    // Resolve "module!symbol" through the dbghelp session.
-    bool resolveModuleSymbol(const std::string & modSym, uint64_t & out);
+    // Resolve "module!symbol" through the dbghelp session with ILT disambiguation.
+    // Returns Found/NotFound/Ambiguous; only writes 'out' when Found.
+    SymbolResult resolveModuleSymbol(const std::string & modSym, uint64_t & out);
     // Loader-list-independent module identity + export resolution (they work
     // during the DLL load event, when EnumProcessModules/dbghelp are blind).
     std::string dllNameFromBase(uint64_t base);
     uint64_t findExportByName(uint64_t base, const std::string & name);
     // Resolve a PDB-only symbol by explicitly loading the module's symbols
+    // from disk. Now uses the same ILT-based disambiguation as resolveModuleSymbol.
+    SymbolResult resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath,
+                                   const std::string & symbol, uint64_t & out);
     // from its file on disk (works during the load event; the loader list
     // is not needed). imagePath may be null when unknown.
     uint64_t resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol);

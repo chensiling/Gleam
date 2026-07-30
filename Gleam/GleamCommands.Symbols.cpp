@@ -530,11 +530,10 @@ uint32_t GleamDebugger::moduleImageSize(uint64_t base)
     return pe.valid ? pe.sizeOfImage : 0;
 }
 
-bool GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & out)
+GleamDebugger::SymbolResult GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & out)
 {
-    mSymbolAmbiguous = false;
     if(!mProcess || !ensureSymSession())
-        return false;
+        return SymbolResult::NotFound;
     // Enumerate ALL records for the name: under incremental linking the PDB
     // can keep a stale (zombie) record whose address no live code uses, and
     // SymFromName's pick between the records is not reliable. A breakpoint
@@ -558,10 +557,10 @@ bool GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & o
             return TRUE;
         };
         if(!SymEnumSymbols(mProcess->hProcess, 0, modSym.c_str(), cb, &ctx))
-            return false;
+            return SymbolResult::NotFound;
     }
     if(candidates.empty())
-        return false;
+        return SymbolResult::NotFound;
     std::sort(candidates.begin(), candidates.end());
     candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
 
@@ -580,12 +579,11 @@ bool GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & o
                 printf(" 0x%llX", (unsigned long long)a);
             printf(" - refusing to use it\n");
             fflush(stdout);
-            mSymbolAmbiguous = true;
-            return false;
+            return SymbolResult::Ambiguous;
         }
     }
     out = candidates[pick];
-    return true;
+    return SymbolResult::Found;
 }
 
 bool GleamDebugger::ensureSymSession()
@@ -1086,30 +1084,66 @@ bool GleamDebugger::verifyModuleIdentity(uint64_t moduleBase, const wchar_t* ima
 // Resolve a PDB-only symbol by explicitly loading the module's symbols
 // from its file on disk. The invade-based dbghelp session depends on the
 // loader list, which is not yet linked during the DLL load event - this
-// path has no such dependency. Returns 0 when unresolvable.
-uint64_t GleamDebugger::resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol)
+// path has no such dependency. Now uses the same ILT-based disambiguation
+// as resolveModuleSymbol.
+GleamDebugger::SymbolResult GleamDebugger::resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath,
+                                                              const std::string & symbol, uint64_t & out)
 {
     if(!imagePath || !*imagePath || !ensureSymSession())
-        return 0;
+        return SymbolResult::NotFound;
     if(!mSymLoadedBases.count(moduleBase))
     {
         if(!SymLoadModuleExW(mProcess->hProcess, NULL, imagePath, NULL,
                              moduleBase, 0 /* size from image */, NULL, 0))
-            return 0;
+            return SymbolResult::NotFound;
         mSymLoadedBases.insert(moduleBase);
     }
-    char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME];
-    memset(buf, 0, sizeof(buf));
-    auto si = (SYMBOL_INFO*)buf;
-    si->SizeOfStruct = sizeof(SYMBOL_INFO);
-    si->MaxNameLen = MAX_SYM_NAME;
-    // Wide path -> UTF-8 for the module name in "module!symbol".
-    char narrow[MAX_PATH * 2] = "";
-    WideCharToMultiByte(CP_UTF8, 0, imagePath, -1, narrow, sizeof(narrow), nullptr, nullptr);
-    std::string modSym = normalizeModuleName(narrow) + "!" + symbol;
-    if(SymFromName(mProcess->hProcess, modSym.c_str(), si))
-        return si->Address;
-    return 0;
+
+    // Enumerate all records (same logic as resolveModuleSymbol).
+    std::vector<uint64_t> candidates;
+    {
+        struct Ctx { std::vector<uint64_t>* addrs; } ctx{ &candidates };
+        auto cb = [](PSYMBOL_INFO si, ULONG, PVOID userCtx) -> BOOL
+        {
+            auto c = (Ctx*)userCtx;
+            c->addrs->push_back(si->Address);
+            return TRUE;
+        };
+        // Wide path -> UTF-8 for the module name in "module!symbol".
+        char narrow[MAX_PATH * 2] = "";
+        WideCharToMultiByte(CP_UTF8, 0, imagePath, -1, narrow, sizeof(narrow), nullptr, nullptr);
+        std::string modSym = normalizeModuleName(narrow) + "!" + symbol;
+        if(!SymEnumSymbols(mProcess->hProcess, 0, modSym.c_str(), cb, &ctx))
+            return SymbolResult::NotFound;
+    }
+    if(candidates.empty())
+        return SymbolResult::NotFound;
+    std::sort(candidates.begin(), candidates.end());
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+    int pick = 0;
+    if(candidates.size() > 1)
+    {
+        // Same ILT-based disambiguation.
+        auto ilt = iltThunkTargets(mProcess, moduleBase);
+        pick = pickLiveSymbolCandidate(candidates, ilt);
+        if(pick < 0)
+        {
+            // Wide path -> UTF-8 for error message.
+            char narrow[MAX_PATH * 2] = "";
+            WideCharToMultiByte(CP_UTF8, 0, imagePath, -1, narrow, sizeof(narrow), nullptr, nullptr);
+            std::string modName = normalizeModuleName(narrow);
+            printf("error: ambiguous symbol '%s!%s' (%zu records, no unique live body):",
+                   modName.c_str(), symbol.c_str(), candidates.size());
+            for(auto a : candidates)
+                printf(" 0x%llX", (unsigned long long)a);
+            printf(" - refusing to use it\n");
+            fflush(stdout);
+            return SymbolResult::Ambiguous;
+        }
+    }
+    out = candidates[pick];
+    return SymbolResult::Found;
 }
 
 uint64_t GleamDebugger::findExportByName(uint64_t base, const std::string & name)

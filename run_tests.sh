@@ -2228,6 +2228,58 @@ EOF
   chk      "SYM: clean exit"               ${TDIR}/gleam_SYM.txt "stop reason=exit code=0x00000000"
 fi
 
+# --- SYM-2: cross-command pollution regression ---
+# An ambiguous symbol eval must not cause a subsequent unrelated breakpoint
+# to be refused. mAddrError is per-parse; ambiguity is per-symbol.
+echo "== SYM-2 (cross-command pollution) =="
+timeout 30 "$GLEAM" $ZTARGET > ${TDIR}/gleam_SYM2.txt 2>&1 <<EOF
+eval ZombieTarget!inner
+bp definitely_missing_module+123
+bp ZombieTarget!innerA
+bp 0x1000
+g
+quit
+EOF
+ec=$?
+if [ $ec -ne 0 ]; then bad "SYM-2: abnormal exit (code $ec)"; fi
+chk "SYM-2: ambiguous eval refused"     ${TDIR}/gleam_SYM2.txt "ambiguous symbol 'ZombieTarget!inner'"
+chk "SYM-2: module+rva stays pending"   ${TDIR}/gleam_SYM2.txt "breakpoint pending module=definitely_missing_module rva=0x123"
+chk "SYM-2: unambiguous symbol works"   ${TDIR}/gleam_SYM2.txt "stop reason=breakpoint type=software address=0x$ZAADDR"
+chk "SYM-2: numeric bp works"           ${TDIR}/gleam_SYM2.txt "breakpoint set at 0x1000"
+# The module+rva bp must NOT be refused as ambiguous.
+if grep -q "breakpoint refused (ambiguous symbol)" ${TDIR}/gleam_SYM2.txt; then
+  bad "SYM-2: cross-command ambiguous pollution"
+else
+  ok "SYM-2: no cross-command pollution"
+fi
+
+# --- SYM-1: pending DLL with ambiguous PDB-only symbol must refuse at bind time ---
+# Late.dll now has an ambiguous "ambig" (two static functions across TUs).
+# A pending "bp Late!ambig" registered BEFORE the DLL loads must be refused
+# when the DLL loads (in bindModuleBreakpoints), not silently pick a record.
+echo "== SYM-1 (pending DLL ambiguous PDB fallback) =="
+timeout 30 "$GLEAM" $TARGET dll2 > ${TDIR}/gleam_SYM1.txt 2>&1 <<EOF
+bp Late!ambig
+bp Late!LateInternal
+g
+bl
+quit
+EOF
+ec=$?
+if [ $ec -ne 0 ]; then bad "SYM-1: abnormal exit (code $ec)"; fi
+chk "SYM-1: pending registered"       ${TDIR}/gleam_SYM1.txt "breakpoint pending module=late symbol=ambig"
+chk "SYM-1: ambiguous bind refused"   ${TDIR}/gleam_SYM1.txt "event bp rejected module=late symbol=ambig (ambiguous)"
+chk "SYM-1: unambiguous bind success" ${TDIR}/gleam_SYM1.txt "event bp bound module=late address=0x"
+chk "SYM-1: unambiguous bp hits"      ${TDIR}/gleam_SYM1.txt "stop reason=breakpoint type=software"
+# The ambiguous pending must NOT remain in the list after rejection.
+if grep -q "module=late symbol=ambig" ${TDIR}/gleam_SYM1.txt | tail -1 | grep -q "pending"; then
+  bad "SYM-1: ambiguous pending not removed after rejection"
+else
+  ok "SYM-1: ambiguous pending removed after rejection"
+fi
+chk "SYM-1: target completes"         ${TDIR}/gleam_SYM1.txt "LATE_LOADED=1"
+
+
 # --- selftest: rangeInImage unit boundaries ---
 run ST "" <<EOF
 selftest
