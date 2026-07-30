@@ -1,6 +1,7 @@
 // Symbol cache implementation for GleamDebugger
 
 #include "GleamDebugger.h"
+#include "Performance.h"
 
 // Lookup symbol in cache, returns 0 if not found
 uint64_t GleamDebugger::getCachedSymbol(const std::string& modSym)

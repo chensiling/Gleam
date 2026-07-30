@@ -3,6 +3,7 @@
 
 #include "GleamDebugger.h"
 #include "RaiiUtils.h"
+#include "Performance.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -538,10 +539,13 @@ uint32_t GleamDebugger::moduleImageSize(uint64_t base)
 
 GleamDebugger::SymbolResult GleamDebugger::resolveModuleSymbol(const std::string & modSym, uint64_t & out)
 {
+    PERF_RECORD(Gleam::PerfEvent::SymbolResolve, modSym);
+
     // Check cache first for successful resolutions
     uint64_t cached = getCachedSymbol(modSym);
     if(cached != 0)
     {
+        PERF_CACHE_HIT();
         out = cached;
         return SymbolResult::Found;
     }
