@@ -90,12 +90,14 @@
     <ClCompile Include="GleamSymbolCache.cpp" />
     <ClCompile Include="GleamIltDisambiguation.cpp" />
     <ClCompile Include="Performance.cpp" />
+    <ClCompile Include="Error.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GleamDebugger.h" />
     <ClInclude Include="Log.h" />
     <ClInclude Include="Constants.h" />
     <ClInclude Include="Performance.h" />
+    <ClInclude Include="Error.h" />
     <ClInclude Include="RaiiUtils.h" />
     <ClInclude Include="ThreadSafety.h" />
   </ItemGroup>

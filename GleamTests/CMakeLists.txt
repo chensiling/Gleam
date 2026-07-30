@@ -23,6 +23,7 @@ add_executable(GleamTests
     test_caches.cpp
     test_constants.cpp
     test_ilt_disambiguation.cpp
+    test_error.cpp
     ../Gleam/GleamIltDisambiguation.cpp
 )
 
