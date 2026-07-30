@@ -14,6 +14,12 @@
 #include <GleeBug/Debugger.h>
 #include <GleeBug/Debugger.Thread.Registers.h>
 
+// Forward declarations
+namespace Gleam {
+    class Logger;
+    class PerfMonitor;
+}
+
 // Shared parsing helper (GleamCommands.cpp).
 bool parseHex(const std::string & s, uint64_t & out);
 
@@ -37,6 +43,15 @@ std::string normalizeModuleName(const std::string & name);
 class GleamDebugger : public GleeBug::Debugger
 {
 public:
+    // Constructor
+    GleamDebugger();
+    // Destructor
+    ~GleamDebugger();
+
+    // Access to logger and perf monitor (instance-based state)
+    Gleam::Logger& logger();
+    Gleam::PerfMonitor& perfMonitor();
+
     // Called from the REPL thread. Returns true if the queue was empty before
     // this push (i.e. the debugger is likely running free).
     bool pushCommand(const std::string & cmd);
@@ -383,6 +398,10 @@ private:
 
     // GleamCommands.cpp
     static void cmdHelp();
+
+    // Instance-based state (replaces global variables)
+    Gleam::Logger* mLogger;
+    Gleam::PerfMonitor* mPerfMonitor;
 
     std::queue<std::string> mCmdQueue;
     std::mutex mCmdMutex;

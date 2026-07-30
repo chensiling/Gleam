@@ -31,7 +31,11 @@ add_executable(GleamTests
     test_process_manager.cpp
     test_breakpoint_manager.cpp
     test_symbol_resolver.cpp
+    test_global_state.cpp
     ../Gleam/SymbolResolver.cpp
+    ../Gleam/Logger.cpp
+    ../Gleam/PerfMonitor.cpp
+    ../Gleam/Performance.cpp
 )
 
 # Don't include GleamIltDisambiguation.cpp - it depends on full GleeBug headers

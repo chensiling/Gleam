@@ -120,41 +120,16 @@ public:
     void printReport() const;
 };
 
-// Global performance stats instance
+// DEPRECATED: Use PerfMonitor class instead
+// Global performance stats instance (kept for backward compatibility)
 extern PerfStats g_perfStats;
 
 // Helper macros for easy profiling
 #define PERF_TIMER(name) Gleam::ScopedTimer _perf_timer_##__LINE__(name)
 #define PERF_TIMER_NO_LOG(name) Gleam::ScopedTimer _perf_timer_##__LINE__(name, false)
 
-// Helper to record events with automatic timing
-class PerfRecorder {
-private:
-    PerformanceTimer mTimer;
-    PerfEvent mEvent;
-    bool mCacheHit;
-    std::string mDetails;
-
-public:
-    PerfRecorder(PerfEvent event, const std::string& details = "")
-        : mEvent(event), mCacheHit(false), mDetails(details)
-    {
-        if (g_perfStats.isEnabled())
-            mTimer.start();
-    }
-
-    void setCacheHit(bool hit) { mCacheHit = hit; }
-
-    ~PerfRecorder() {
-        if (g_perfStats.isEnabled()) {
-            int64_t duration = mTimer.elapsedMicros();
-            g_perfStats.record(mEvent, duration, mCacheHit, mDetails);
-        }
-    }
-};
-
-#define PERF_RECORD(event, details) Gleam::PerfRecorder _perf_recorder_##__LINE__(event, details)
-#define PERF_CACHE_HIT() _perf_recorder_##__LINE__.setCacheHit(true)
+// DEPRECATED: PerfRecorder and related macros moved to PerfMonitor.h
+// These macros are redefined there using the new PerfMonitor class
 
 } // namespace Gleam
 

@@ -1,5 +1,7 @@
 #include "GleamDebugger.h"
 #include "Log.h"
+#include "Logger.h"
+#include "PerfMonitor.h"
 #include "Constants.h"
 
 #include <cstdio>
@@ -7,6 +9,41 @@
 #include <dbghelp.h>
 
 using namespace GleeBug;
+
+// GleamDebugger constructor: create Logger and PerfMonitor instances
+// and set them as the global defaults (for transition period)
+GleamDebugger::GleamDebugger() {
+    mLogger = new Gleam::Logger(Gleam::LogLevel::Info);
+    mPerfMonitor = new Gleam::PerfMonitor();
+
+    // Set as global defaults (transition period)
+    Gleam::g_defaultLogger = mLogger;
+    Gleam::g_defaultPerfMonitor = mPerfMonitor;
+}
+
+// GleamDebugger destructor: clean up Logger and PerfMonitor
+GleamDebugger::~GleamDebugger() {
+    // Clear global defaults before destruction
+    if (Gleam::g_defaultLogger == mLogger) {
+        Gleam::g_defaultLogger = nullptr;
+    }
+    if (Gleam::g_defaultPerfMonitor == mPerfMonitor) {
+        Gleam::g_defaultPerfMonitor = nullptr;
+    }
+
+    delete mLogger;
+    delete mPerfMonitor;
+}
+
+// Access to logger
+Gleam::Logger& GleamDebugger::logger() {
+    return *mLogger;
+}
+
+// Access to perf monitor
+Gleam::PerfMonitor& GleamDebugger::perfMonitor() {
+    return *mPerfMonitor;
+}
 
 namespace
 {

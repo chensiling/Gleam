@@ -85,7 +85,6 @@
     <ClCompile Include="GleamCommands.Symbols.cpp" />
     <ClCompile Include="GleamCommands.Hide.cpp" />
     <ClCompile Include="GleamCommands.Scan.cpp" />
-    <ClCompile Include="Log.cpp" />
     <ClCompile Include="GleamIltCache.cpp" />
     <ClCompile Include="GleamSymbolCache.cpp" />
     <ClCompile Include="GleamIltDisambiguation.cpp" />
@@ -96,12 +95,16 @@
     <ClCompile Include="ProcessManager.cpp" />
     <ClCompile Include="BreakpointManager.cpp" />
     <ClCompile Include="SymbolResolver.cpp" />
+    <ClCompile Include="Logger.cpp" />
+    <ClCompile Include="PerfMonitor.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GleamDebugger.h" />
     <ClInclude Include="Log.h" />
+    <ClInclude Include="Logger.h" />
     <ClInclude Include="Constants.h" />
     <ClInclude Include="Performance.h" />
+    <ClInclude Include="PerfMonitor.h" />
     <ClInclude Include="Error.h" />
     <ClInclude Include="History.h" />
     <ClInclude Include="Memory.h" />

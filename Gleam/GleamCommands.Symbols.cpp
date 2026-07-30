@@ -4,6 +4,7 @@
 #include "GleamDebugger.h"
 #include "RaiiUtils.h"
 #include "Performance.h"
+#include "PerfMonitor.h"
 
 #include <cstdio>
 #include <cstdlib>
