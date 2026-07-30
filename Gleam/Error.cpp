@@ -29,7 +29,7 @@ std::string Error::format() const {
         case ErrorCategory::Internal:
             oss << "[Internal Error] ";
             break;
-        case ErrorCategory::System:
+        case ErrorCategory::WindowsSystem:
             oss << "[System Error] ";
             break;
         default:
