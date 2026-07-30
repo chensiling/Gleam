@@ -3,53 +3,10 @@
 #include <gtest/gtest.h>
 #include <string>
 
-// Mock Error implementation for testing
-namespace Gleam {
-
-enum class ErrorCategory {
-    None,
-    Memory,
-    Symbol,
-    Process,
-    Breakpoint,
-};
-
-struct Error {
-    ErrorCategory category;
-    std::string message;
-    int systemCode;
-    std::string context;
-
-    Error() : category(ErrorCategory::None), systemCode(0) {}
-    Error(ErrorCategory cat, const std::string& msg, int code = 0, const std::string& ctx = "")
-        : category(cat), message(msg), systemCode(code), context(ctx) {}
-
-    bool hasError() const { return category != ErrorCategory::None; }
-};
-
-template<typename T>
-class Result {
-private:
-    bool mIsOk;
-    T mValue;
-    Error mError;
-
-public:
-    Result(const T& value) : mIsOk(true), mValue(value) {}
-    Result(const Error& error) : mIsOk(false), mError(error) {}
-
-    bool isOk() const { return mIsOk; }
-    bool isError() const { return !mIsOk; }
-
-    const T& value() const { return mValue; }
-    const Error& error() const { return mError; }
-
-    T valueOr(const T& defaultValue) const {
-        return isOk() ? mValue : defaultValue;
-    }
-};
-
-} // namespace Gleam
+// Use the real Error/Result types. Defining local mocks in namespace Gleam
+// would collide with the real definitions pulled in by SymbolResolver.cpp,
+// an ODR violation that corrupts the stack (/RTC1 Check Failure #2).
+#include "../Gleam/Error.h"
 
 // Error Tests
 

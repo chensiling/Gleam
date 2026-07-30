@@ -1,157 +1,35 @@
 // Unit tests for exception handling strategy
 
 #include <gtest/gtest.h>
+
+// Exercise the real exception utilities rather than local mocks. Redefining
+// Error/Result/GleamException/tryCatch in namespace Gleam collides with the
+// real definitions reachable through SymbolResolver.cpp, an ODR violation that
+// corrupts the stack (/RTC1 Check Failure #2).
+//
+// windows.h must come first: Exception.h's retryWithBackoff() calls Sleep().
+#include <windows.h>
 #include <string>
 #include <functional>
-
-namespace Gleam {
-
-// Mock Error and Result for testing
-enum class ErrorCategory {
-    None, Memory, Symbol, Process, Breakpoint, Internal
-};
-
-struct Error {
-    ErrorCategory category;
-    std::string message;
-    int systemCode;
-    std::string context;
-
-    Error() : category(ErrorCategory::None), systemCode(0) {}
-    Error(ErrorCategory cat, const std::string& msg, int code = 0, const std::string& ctx = "")
-        : category(cat), message(msg), systemCode(code), context(ctx) {}
-
-    bool hasError() const { return category != ErrorCategory::None; }
-
-    std::string format() const {
-        return message + (context.empty() ? "" : " [" + context + "]");
-    }
-};
-
-template<typename T>
-class Result {
-private:
-    bool mIsOk;
-    T mValue;
-    Error mError;
-
-public:
-    Result(const T& value) : mIsOk(true), mValue(value) {}
-    Result(const Error& error) : mIsOk(false), mError(error) {}
-
-    bool isOk() const { return mIsOk; }
-    bool isError() const { return !mIsOk; }
-
-    const T& value() const { return mValue; }
-    const Error& error() const { return mError; }
-};
-
-// Mock exception classes
-class GleamException : public std::exception {
-private:
-    Error mError;
-    std::string mWhat;
-
-public:
-    explicit GleamException(const Error& error)
-        : mError(error), mWhat(error.format()) {}
-
-    GleamException(ErrorCategory category, const std::string& message)
-        : mError(category, message), mWhat(message) {}
-
-    const char* what() const noexcept override {
-        return mWhat.c_str();
-    }
-
-    const Error& error() const noexcept {
-        return mError;
-    }
-};
-
-class MemoryException : public GleamException {
-public:
-    explicit MemoryException(const std::string& message)
-        : GleamException(ErrorCategory::Memory, message) {}
-};
-
-// Try-catch wrapper
-template<typename T, typename Func>
-Result<T> tryCatch(Func func, const char* operation = "operation") {
-    try {
-        return Result<T>(func());
-    }
-    catch (const GleamException& e) {
-        return Result<T>(e.error());
-    }
-    catch (const std::exception& e) {
-        return Result<T>(Error(ErrorCategory::Internal, e.what()));
-    }
-    catch (...) {
-        return Result<T>(Error(ErrorCategory::Internal, "Unknown exception"));
-    }
-}
-
-template<typename Func>
-Result<bool> tryCatchVoid(Func func, const char* operation = "operation") {
-    try {
-        func();
-        return Result<bool>(true);
-    }
-    catch (const GleamException& e) {
-        return Result<bool>(e.error());
-    }
-    catch (const std::exception& e) {
-        return Result<bool>(Error(ErrorCategory::Internal, e.what()));
-    }
-    catch (...) {
-        return Result<bool>(Error(ErrorCategory::Internal, "Unknown exception"));
-    }
-}
-
-// Retry with backoff (simplified for testing - no Sleep)
-template<typename T, typename Func>
-Result<T> retryWithBackoff(Func func, int maxRetries = 3) {
-    for (int attempt = 0; attempt <= maxRetries; attempt++) {
-        auto result = tryCatch<T>(func, "retry operation");
-        if (result.isOk()) {
-            return result;
-        }
-    }
-    return Result<T>(Error(ErrorCategory::Internal, "Max retries exceeded"));
-}
-
-// Fallback chain
-template<typename T>
-Result<T> tryFallbacks(std::initializer_list<std::function<Result<T>()>> alternatives) {
-    Error lastError(ErrorCategory::Internal, "No alternatives succeeded");
-
-    for (const auto& alt : alternatives) {
-        auto result = alt();
-        if (result.isOk()) {
-            return result;
-        }
-        lastError = result.error();
-    }
-
-    return Result<T>(lastError);
-}
-
-} // namespace Gleam
+#include "../Gleam/Exception.h"
 
 // Exception Tests
 
 TEST(ExceptionTest, GleamExceptionConstruction) {
     Gleam::GleamException ex(Gleam::ErrorCategory::Memory, "Test error");
 
-    EXPECT_STREQ(ex.what(), "Test error");
+    // what() is Error::format(), which prefixes the category.
+    EXPECT_NE(std::string(ex.what()).find("Test error"), std::string::npos);
     EXPECT_EQ(ex.error().category, Gleam::ErrorCategory::Memory);
+    EXPECT_EQ(ex.error().message, "Test error");
 }
 
 TEST(ExceptionTest, MemoryExceptionType) {
     Gleam::MemoryException ex("Out of memory");
 
-    EXPECT_STREQ(ex.what(), "Out of memory");
+    EXPECT_NE(std::string(ex.what()).find("Out of memory"), std::string::npos);
     EXPECT_EQ(ex.error().category, Gleam::ErrorCategory::Memory);
+    EXPECT_EQ(ex.error().message, "Out of memory");
 }
 
 TEST(TryCatchTest, SuccessfulOperation) {

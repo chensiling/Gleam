@@ -1,14 +1,30 @@
-// Gleam: command-driven headless debugger based on GleeBug.
-//
-// Usage:
-//   gleam <target.exe> [args...]   start and debug a process
-//   gleam -a <pid>                 attach to a running process
-//
-// Commands are read from stdin (try 'help'). The debug loop runs on the main
-// thread; the REPL thread below forwards stdin lines to the debugger.
-//
-// wmain is used so target paths with non-ASCII characters (e.g. Chinese)
-// arrive as proper UTF-16 instead of lossy ANSI (CP_ACP) argv.
+/// @file main.cpp
+/// @brief Entry point for the Gleam headless debugger.
+///
+/// @details
+/// Gleam is a command-driven debugger built on the GleeBug engine.
+///
+/// @section main_usage Usage
+/// @code
+///   gleam <target.exe> [args...]   start and debug a new process
+///   gleam -a <pid>                 attach to a running process
+/// @endcode
+///
+/// Commands are read from stdin (try @c help).  The debug event loop runs on
+/// the main thread; a companion REPL thread forwards stdin lines to the
+/// debugger via pushCommand() / requestPause().
+///
+/// @note wmain is used so target paths with non-ASCII characters
+///   (e.g. Chinese directory names) arrive as proper UTF-16 instead of the
+///   lossy ANSI (CP_ACP) encoding that a narrow @c main would produce.
+///
+/// @section main_restart Restart loop
+///   After each Start() call returns, wmain checks takeRestartRequest().
+///   A "restart" command re-initialises the same target with the same
+///   arguments; logical breakpoints, exception filters, and hide patches
+///   survive (they re-bind / re-apply on the new session), while per-session
+///   state (patches, ignore counts, thread selection) is cleared by
+///   resetTransientState().
 
 #include <cstdio>
 #include <cstdlib>
@@ -82,12 +98,18 @@ static void replThread(GleamDebugger* dbg)
             line.pop_back();
         if(!line.empty())
         {
-            // "pause" is the only command that acts while the debuggee is
-            // running. Everything else is queued and executed at the next
-            // suspended state - to detach/quit a running debuggee, issue
-            // "pause" first. This keeps scripted command order deterministic.
+            // Commands that act immediately in the REPL thread (no debugger
+            // state required): pause/quit/detach use request*() methods;
+            // help prints and returns. Everything else is queued for the
+            // debugger thread.
             if(line == "pause")
                 dbg->requestPause(); // deferral handled internally
+            else if(line == "quit")
+                dbg->requestQuit(); // processed at next debug event
+            else if(line == "detach")
+                dbg->requestDetach(); // processed at next debug event
+            else if(line == "help")
+                GleamDebugger::cmdHelp(); // static, prints immediately
             else
                 dbg->pushCommand(line);
         }

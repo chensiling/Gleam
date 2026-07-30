@@ -1,5 +1,44 @@
-// Symbol commands: import table enumeration (descriptor walk + dbghelp
-// reverse resolution) and export enumeration (dbghelp SymEnumSymbols).
+/// @file GleamCommands.Symbols.cpp
+/// @brief Symbol resolution, import/export table inspection, and x64 stack
+///        frame unwinding.
+///
+/// @details
+/// The file covers several logical areas:
+///
+/// @section sym_pe  PE header helpers
+///   readPeDirectories() reads the optional header and data-directory table
+///   from a live debuggee process.  rangeInImage() provides overflow-safe
+///   bounds checks against the loader-reported image size (never the PE
+///   header value, which the target can falsify).
+///
+/// @section sym_ilt  ILT thunk-target collection
+///   iltThunkTargets() walks all executable sections looking for E9 rel32
+///   thunks.  Under incremental linking every call goes through such a thunk,
+///   so the set of thunk targets is exactly the set of live function bodies.
+///   getIltTargets() (in GleamDebugger.cpp) adds a per-module cache on top.
+///
+/// @section sym_resolve  Symbol resolution with zombie-record elimination
+///   resolveModuleSymbol() enumerates ALL PDB records for a name, then uses
+///   pickLiveSymbolCandidate() to discard stale "zombie" records left by
+///   incremental linking.  resolvePdbSymbol() does the same via an explicit
+///   SymLoadModuleExW for modules not yet in the loader list (DLL load event).
+///   Both populate mSymbolCache on success.
+///
+/// @section sym_modid  Module identity verification
+///   verifyModuleIdentity() compares the CodeView GUID+Age+SizeOfImage of a
+///   loaded module against its disk image.  Prevents symbol spoofing: loading
+///   a symbol file proves nothing; a matching debug record does.
+///
+/// @section sym_frames  x64 stack frame unwinding
+///   cmdFrames() uses RtlVirtualUnwind (the same unwinder dbghelp wraps)
+///   run locally against a mirror of the remote stack + code/unwind data.
+///   findRuntimeFunction() binary-searches a cached copy of the remote .pdata
+///   and resolves indirect table entries (common in system DLLs).
+///
+/// @section sym_failapi  Fault-injection hooks
+///   failapi* functions implement the "selftest failapi" test surface: each
+///   replaces the matching mTestHook* slot, fires once (or persistently for
+///   the "always" variant), and then disarms itself.
 
 #include "GleamDebugger.h"
 #include "RaiiUtils.h"

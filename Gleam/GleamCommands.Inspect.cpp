@@ -1,5 +1,24 @@
-// Inspection commands: registers, memory, disassembly, maps, modules,
-// memory search, exception info, backtrace.
+/**
+ * @file GleamCommands.Inspect.cpp
+ * @brief Inspection commands: registers, memory, disassembly, maps, modules,
+ *        memory search, exception info, backtrace, patches.
+ *
+ * These commands only read (or deliberately patch) the frozen debuggee; none of
+ * them resume it. Two behaviours are worth knowing before changing anything
+ * here:
+ *
+ * - **EFLAGS writes are sanitized by the kernel.** `setreg eflags` cannot set
+ *   arbitrary bits: IF is forced on and the reserved bits are cleared. Tests
+ *   must assert against a fixed point (0x2D5), never against the value written.
+ * - **DR registers written raw are tracked per thread** (mRawDrThreads). A
+ *   thread whose DRs were written directly no longer participates in engine
+ *   hardware breakpoints, and its DR6 hits are reported as `raw-hardware`.
+ *   Writing DRs at the initial system breakpoint does not stick: the kernel
+ *   wipes them on continue, so it has to happen at a user-code stop.
+ *
+ * `bt` and `stackscan` are heuristic by design. Verified frame enumeration is
+ * `frames` in GleamCommands.Symbols.cpp.
+ */
 
 #include "GleamDebugger.h"
 

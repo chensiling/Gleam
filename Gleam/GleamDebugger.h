@@ -1,3 +1,54 @@
+/**
+ * @file GleamDebugger.h
+ * @brief Command-driven headless Windows debugger built on the GleeBug engine.
+ *
+ * Declares GleamDebugger, the single class that owns a debug session: engine
+ * event callbacks, the suspended-state command loop, and all per-session state.
+ * Command implementations live in the GleamCommands.*.cpp files (see the class
+ * documentation for the split).
+ *
+ * @section threading Thread model
+ *
+ * Two threads touch this object:
+ *
+ * - **Debugger thread** - the thread that called Init()/Attach() and Start().
+ *   The GleeBug event loop runs here, so every `cb*` callback, commandLoop(),
+ *   and every command implementation executes on it. The debuggee is suspended
+ *   whenever this thread is inside a callback, which is what makes it the only
+ *   thread allowed to touch `mProcess`/`mThread` and the engine's breakpoint
+ *   tables.
+ * - **REPL thread** - created by main.cpp, reads stdin. It may only call
+ *   pushCommand(), requestPause(), pauseAfterResume(), and isPaused().
+ *
+ * @subsection guarded Shared state and its guards
+ *
+ * | State                        | Guard                                    |
+ * |------------------------------|------------------------------------------|
+ * | mCmdQueue                    | mCmdMutex + mCmdCv                       |
+ * | mBreakInStub{Thread,Page,Tid}| std::atomic, plus mBreakInMutex for the  |
+ * |                              | inject-vs-cleanup critical sections      |
+ * | mIsPaused, mInDebugEvent     | std::atomic (published by the debugger    |
+ * | mQuitting, mBreakInExpected  | thread, read by the REPL thread)         |
+ * | mPauseAfterResume            | std::atomic, consumed by exchange()      |
+ * | everything else              | debugger thread only - no guard needed   |
+ *
+ * @subsection invariants Invariants
+ *
+ * - Commands execute only while the debuggee is suspended, i.e. only from
+ *   commandLoop(), i.e. only with `mIsPaused == true`.
+ * - `mProcess` and `mThread` (engine members) are read on the debugger thread
+ *   only. The REPL thread must never dereference them - that is the reason
+ *   `pause` is the only command not routed through the queue.
+ * - Stub injection (forceBreakIn) and stub teardown (cleanupBreakInStub) are
+ *   serialized by mBreakInMutex and both check `mQuitting`, so a stub can
+ *   never be injected into a session that is tearing down.
+ * - `mBreakInStubPage` stays registered until VirtualFreeEx actually succeeds:
+ *   a page a stub thread might still execute on is never freed, and a page
+ *   whose free failed is never forgotten (detach refuses instead).
+ *
+ * @see PROGRESS.md for the platform facts behind these rules.
+ */
+
 #ifndef GLEAM_DEBUGGER_H
 #define GLEAM_DEBUGGER_H
 
@@ -20,84 +71,186 @@ namespace Gleam {
     class PerfMonitor;
 }
 
-// Shared parsing helper (GleamCommands.cpp).
+/**
+ * @brief Parse a hexadecimal literal (GleamCommands.cpp).
+ * @param s    Text to parse; an optional "0x" prefix is accepted.
+ * @param out  Receives the value on success.
+ * @return true on success; @p out is untouched on failure.
+ */
 bool parseHex(const std::string & s, uint64_t & out);
 
-// Shared helper (GleamCommands.cpp): basename, lowercase, ".dll" stripped.
+/**
+ * @brief Canonical module-name form (GleamCommands.cpp).
+ *
+ * The single normalization point for module names: strips the directory,
+ * lowercases, and removes a trailing ".dll"/".exe". Every comparison of a
+ * user-supplied module name against a loaded module goes through this, so
+ * `bp KERNEL32.DLL!Sleep` and `bp c:\windows\system32\kernel32!Sleep` name
+ * the same module.
+ */
 std::string normalizeModuleName(const std::string & name);
 
-// Command-driven headless debugger based on GleeBug.
-//
-// The debug loop (Init/Attach + Start) runs on the caller's thread. A REPL
-// thread feeds commands via pushCommand(). Whenever the debuggee is suspended
-// by an interesting event (system breakpoint, breakpoint hit, single step,
-// unhandled exception), the debugger thread enters a command loop and executes
-// queued commands; "g"/"step"/"stepover"/"ret"/"detach"/"quit" leave the
-// command loop and resume the debuggee.
-//
-// Command implementations are split by functional area:
-//   GleamCommands.cpp             command dispatch, parsing helpers, help
-//   GleamCommands.Breakpoints.cpp software/hardware/memory breakpoints, ignore counts
-//   GleamCommands.Inspect.cpp     registers, memory, disassembly, maps, modules, find, bt
-//   GleamCommands.Control.cpp     execution control (g/step/over/ret/detach/quit), thread selection
+/**
+ * @brief Command-driven headless debugger based on GleeBug.
+ *
+ * The debug loop (Init/Attach + Start) runs on the caller's thread. A REPL
+ * thread feeds commands via pushCommand(). Whenever the debuggee is suspended
+ * by an interesting event (system breakpoint, breakpoint hit, single step,
+ * unhandled exception), the debugger thread enters a command loop and executes
+ * queued commands; `g`/`step`/`stepover`/`ret`/`detach`/`quit` leave the
+ * command loop and resume the debuggee.
+ *
+ * Command implementations are split by functional area:
+ *
+ * | File                          | Commands                                   |
+ * |-------------------------------|--------------------------------------------|
+ * | GleamCommands.cpp             | dispatch, parsing helpers, `help`          |
+ * | GleamCommands.Control.cpp     | `g` `step` `stepover` `tgo` `ret` `until` `detach` `quit` `thread` `alloc` `free` `protect` `breakon` `hide` |
+ * | GleamCommands.Breakpoints.cpp | `bp` `rbp` `hbp` `mbp` `bl` `ignore` `trace` |
+ * | GleamCommands.Inspect.cpp     | `regs` `setreg` `read` `write` `disasm` `maps` `modules` `find` `bt` `stackscan` `patch` `threads` |
+ * | GleamCommands.Symbols.cpp     | `imports` `exports` `sym` `frames`, address parsing |
+ * | GleamCommands.Expr.cpp        | `eval`, the address expression grammar     |
+ * | GleamCommands.Scan.cpp        | `xref` `findasm`                           |
+ * | GleamCommands.Hide.cpp        | anti-anti-debug applied by `hide`          |
+ *
+ * @warning Every method is debugger-thread-only unless its documentation says
+ *          otherwise. See the @ref threading section in this file's header.
+ */
 class GleamDebugger : public GleeBug::Debugger
 {
 public:
-    // Constructor
     GleamDebugger();
-    // Destructor
     ~GleamDebugger();
 
-    // Access to logger and perf monitor (instance-based state)
+    /// Per-instance logger (replaces the former global log level).
     Gleam::Logger& logger();
+    /// Per-instance performance counters (replaces the former global stats).
     Gleam::PerfMonitor& perfMonitor();
 
-    // Called from the REPL thread. Returns true if the queue was empty before
-    // this push (i.e. the debugger is likely running free).
+    /**
+     * @brief Queue a command line for execution. **REPL thread.**
+     * @return true if the queue was empty before this push, i.e. the debuggee
+     *         is likely running free and the caller should consider a pause.
+     */
     bool pushCommand(const std::string & cmd);
 
-    // Called from the REPL thread: interrupt a running debuggee.
+    /**
+     * @brief Interrupt a running debuggee. **REPL thread.**
+     *
+     * Publishes the request first, then races both ends to consume it
+     * (set-then-check), so a request issued exactly at a resume boundary is
+     * not lost. When `mProcess` is not ready yet the request is re-queued
+     * rather than dropped.
+     */
     void requestPause();
 
-    // True while the debugger thread sits in the command loop.
+    /// Request quit from REPL thread. Processed at next debug event. **REPL thread.**
+    void requestQuit();
+
+    /// Request detach from REPL thread. Processed at next debug event. **REPL thread.**
+    void requestDetach();
+
+    /// True while the debugger thread sits in the command loop. **Any thread.**
     bool isPaused() const;
 
-    // Called from the REPL thread: break in right after the next resume.
+    /// Break in right after the next resume. **REPL thread.**
     void pauseAfterResume();
 
-    // Terminate the stub thread, wait for it to die, close the handle, and
-    // only then free the page - never free memory a stub thread may run on.
-    // Requests stub teardown; returns true only when nothing remains tracked
-    // in the target (detach refuses on false - a held page must not leak).
-    bool cleanupBreakInStub();
-    // Frees the tracked stub page via the (injectable) VirtualFreeEx path;
-    // the address is cleared only on success. Returns true when freed/none.
-    bool freeBreakInStubPage();
-    // Completes a deferred detach once the break-in stub thread is confirmed
-    // dead: frees the stub page, then Detach(); refuses (stays attached)
-    // when the page cannot be freed.
-    void finishDeferredDetach();
+    /// Print help text (static, callable from REPL thread). **Any thread.**
+    static void cmdHelp();
 
-    // "restart" support (main.cpp drives the re-Init + Start loop).
+    /**
+     * @name Break-in stub teardown
+     *
+     * The `pause` break-in works by injecting a thread that executes a page of
+     * `int3`s. Tearing that down has a strict order - terminate the thread,
+     * confirm it died, close the handle, and only then free the page - because
+     * freeing memory a stub thread may still execute on crashes the debuggee.
+     * @{
+     */
+
+    /**
+     * @brief Request stub teardown.
+     * @return true only when nothing remains tracked in the target.
+     * @note `detach` refuses when this returns false: a held page must not leak.
+     */
+    bool cleanupBreakInStub();
+
+    /**
+     * @brief Free the tracked stub page through the (injectable) VirtualFreeEx path.
+     * @return true when the page was freed or there was none.
+     * @note The address is cleared **only** on success, so a failed free can be
+     *       retried instead of leaking an unowned RWX page.
+     */
+    bool freeBreakInStubPage();
+
+    /**
+     * @brief Complete a detach that was deferred until the stub thread died.
+     *
+     * Frees the stub page, then calls Detach(). Refuses - staying attached -
+     * when the page cannot be freed.
+     */
+    void finishDeferredDetach();
+    /// @}
+
+    /**
+     * @name Session restart (`restart`)
+     * main.cpp drives the re-Init + Start loop; this object is not destroyed,
+     * which is how state survives across sessions.
+     * @{
+     */
+    /// Mark the session as launched (not attached); `restart` requires it.
     void setLaunched(bool launched) { mHasLaunchInfo = launched; }
+    /// Consume a pending restart request (main.cpp polls this).
     bool takeRestartRequest() { const bool r = mRestartPending; mRestartPending = false; return r; }
-    // Clear per-session state before a restart. Survives: logical
-    // breakpoints (re-bind on module load), exception filters, breakon
-    // switches, hide. Cleared: patches, ignore counts, thread selection,
-    // last-exception state, all transient stepping/trace state.
+
+    /**
+     * @brief Clear per-session state before a restart.
+     *
+     * Survives: logical breakpoints (they re-bind on module load), exception
+     * filters, `breakon` switches, `hide`.
+     * Cleared: patches, ignore counts, thread selection, last-exception state,
+     * all transient stepping/trace state, and the symbol/ILT caches (the new
+     * process may map the same modules at different bases).
+     */
     void resetTransientState();
+    /// @}
 
 private:
-    // Unguarded break-in, only valid at the just-before-continue point.
+    /**
+     * @name Break-in injection
+     * @{
+     */
+    /// Unguarded break-in; only valid at the just-before-continue point.
     void forceBreakIn();
-    // Lazily allocate/write the session stub page and resolve ExitThread.
+    /// Lazily allocate and write the session stub page.
     bool ensureBreakInStub(GleeBug::Process* process);
-    // Last-resort break-in; sets the expectation flag only on success.
+    /**
+     * @brief Last-resort break-in via DebugBreakProcess.
+     * @warning Reads `PEB.BeingDebugged`, which `hide` zeroes - unusable while
+     *          hiding is on. Sets the expectation flag only on success.
+     */
     void fallbackDebugBreak(GleeBug::Process* process);
-    // Resolve/retry break-in symbols (debugger thread only, dbghelp).
+    /// Resolve/retry break-in symbols (debugger thread only, dbghelp).
     void resolveBreakInSymbols();
+    /// @}
 
 protected:
+    /**
+     * @name GleeBug engine callbacks
+     *
+     * All of these run on the debugger thread with the debuggee suspended.
+     * Two ordering rules are load-bearing:
+     *
+     * - cbBreakpoint() must call handleStepOutBreakpoint() **first**. The engine
+     *   deletes a one-shot breakpoint after the callback returns regardless of
+     *   the path taken, so any early return before that bookkeeping strands the
+     *   stepout operation waiting on an int3 that no longer exists.
+     * - cbPostDebugEvent() enters the command loop **after** stepout re-arming,
+     *   so a stop produced by a failed re-arm surfaces in the same event with a
+     *   consistent RIP and context.
+     * @{
+     */
     void cbCreateProcessEvent(const CREATE_PROCESS_DEBUG_INFO & createProcess, const GleeBug::Process & process) override;
     void cbExitProcessEvent(const EXIT_PROCESS_DEBUG_INFO & exitProcess, const GleeBug::Process & process) override;
     void cbCreateThreadEvent(const CREATE_THREAD_DEBUG_INFO & createThread, const GleeBug::Thread & thread) override;
@@ -113,35 +266,50 @@ protected:
     void cbDetachRefused(const std::string & info) override;
     void cbPreDebugEvent(const DEBUG_EVENT & debugEvent) override;
     void cbPostDebugEvent(const DEBUG_EVENT & debugEvent) override;
+    /// @}
 
 private:
-    // Note: R is a member enum of GleeBug::Registers (declared inside the class).
+    /// @note R is a member enum of GleeBug::Registers (declared inside the class).
     using RegId = GleeBug::Registers::R;
 
-    // Result of a try*Command handler.
+    /// Outcome of a `try*Command` handler.
     enum class CmdResult
     {
-        NotMine,    // command not handled by this handler
-        Handled,    // handled, debuggee stays suspended
-        Resume      // handled, resume the debuggee
+        NotMine,    ///< Command not handled by this handler; try the next one.
+        Handled,    ///< Handled; the debuggee stays suspended.
+        Resume      ///< Handled; resume the debuggee and leave the command loop.
     };
 
-    // Command handlers by functional area. Called in order from executeCommand.
-    CmdResult tryControlCommand(const std::vector<std::string> & args);      // Control.cpp
-    CmdResult tryBreakpointCommand(const std::vector<std::string> & args);   // Breakpoints.cpp
-    CmdResult tryInspectCommand(const std::vector<std::string> & args);      // Inspect.cpp
-    CmdResult trySymbolCommand(const std::vector<std::string> & args);       // Symbols.cpp
-    CmdResult tryScanCommand(const std::vector<std::string> & args);         // Scan.cpp
+    /**
+     * @name Command dispatch
+     * Handlers are tried in this order from executeCommand(); the first one
+     * that does not return CmdResult::NotMine owns the command.
+     * @{
+     */
+    CmdResult tryControlCommand(const std::vector<std::string> & args);      ///< Control.cpp
+    CmdResult tryBreakpointCommand(const std::vector<std::string> & args);   ///< Breakpoints.cpp
+    CmdResult tryInspectCommand(const std::vector<std::string> & args);      ///< Inspect.cpp
+    CmdResult trySymbolCommand(const std::vector<std::string> & args);       ///< Symbols.cpp
+    CmdResult tryScanCommand(const std::vector<std::string> & args);         ///< Scan.cpp
 
-    // Returns true when the debuggee should resume.
+    /// @return true when the debuggee should resume.
     bool executeCommand(const std::string & cmdLine);
 
-    // Runs on the debugger thread while the debuggee is suspended.
+    /**
+     * @brief Execute queued commands while the debuggee is suspended.
+     *
+     * Runs on the debugger thread from a `cb*` callback and returns once a
+     * command asks to resume (or the session is ending).
+     */
     void commandLoop();
 
-    // The thread register/memory-inspection commands operate on: the thread
-    // selected with "thread <tid>", or the thread of the current debug event.
+    /**
+     * @brief Thread that register/memory inspection commands operate on.
+     * @return The thread selected with `thread <tid>`, or the thread of the
+     *         current debug event when no explicit selection is active.
+     */
     GleeBug::Thread* currentThread();
+    /// @}
 
     // Breakpoints.cpp
     void cmdBreakpointList();
@@ -313,14 +481,29 @@ private:
     // during the DLL load event, when EnumProcessModules/dbghelp are blind).
     std::string dllNameFromBase(uint64_t base);
     uint64_t findExportByName(uint64_t base, const std::string & name);
-    // Resolve a PDB-only symbol by explicitly loading the module's symbols
-    // from disk. Now uses the same ILT-based disambiguation as resolveModuleSymbol.
+    /**
+     * @brief Resolve a PDB-only symbol by loading the module's symbols from disk.
+     *
+     * Works during the DLL load event, where the invade-based dbghelp session
+     * is blind because the loader list is not linked yet. Applies the same
+     * ILT-based disambiguation as resolveModuleSymbol().
+     *
+     * @param moduleBase Base the module is loaded at in the debuggee.
+     * @param imagePath  Path to the image on disk; may be null when unknown.
+     * @param symbol     Bare symbol name (no `module!` prefix).
+     * @param out        Receives the address, written only on SymbolResult::Found.
+     */
     SymbolResult resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath,
                                    const std::string & symbol, uint64_t & out);
-    // from its file on disk (works during the load event; the loader list
-    // is not needed). imagePath may be null when unknown.
-    uint64_t resolvePdbSymbol(uint64_t moduleBase, const wchar_t* imagePath, const std::string & symbol);
-    // Prove "loaded module == file on disk" via CodeView GUID+Age+SizeOfImage.
+
+    /**
+     * @brief Prove "this loaded module IS that file on disk".
+     *
+     * Compares CodeView GUID + Age + SizeOfImage.
+     * @warning Never use symbol resolution as proof of identity: symbols from
+     *          any file can be loaded against any base, which makes that test
+     *          self-fulfilling.
+     */
     bool verifyModuleIdentity(uint64_t moduleBase, const wchar_t* imagePath);
     // Bases we SymLoadModuleEx'd explicitly (for SymUnloadModule64 pairing).
     std::set<uint64_t> mSymLoadedBases;
@@ -328,21 +511,46 @@ private:
     // module name: later events for the same module may have hFile == NULL.
     std::map<std::string, std::wstring> mModulePaths;
 
-    // ILT (Incremental Link Table) cache: Maps module base -> set of ILT thunk targets
-    // Caches the results of expensive iltThunkTargets() scans
+    /**
+     * @name Symbol and ILT caches
+     *
+     * Both caches key on data that a module reload invalidates, so their
+     * lifetime is tied to module identity:
+     *
+     * - mIltCache keys on the module **base**. A different module loaded at a
+     *   recycled base would otherwise be disambiguated against the previous
+     *   module's thunk targets.
+     * - mSymbolCache keys on `"module!symbol"`, which does **not** encode the
+     *   base. A module that unloads and reloads at a different base would
+     *   otherwise resolve to its previous address - and a breakpoint written
+     *   there lands in unrelated memory.
+     *
+     * @warning Every entry must therefore be dropped when the module it
+     *          describes goes away: cbUnloadDllEvent() for a single module,
+     *          resetTransientState() for a whole session.
+     * @{
+     */
+
+    /// Module base -> ILT thunk targets, caching expensive iltThunkTargets() scans.
     std::unordered_map<uint64_t, std::unordered_set<uint64_t>> mIltCache;
+    /// Drop every ILT entry (whole-session invalidation).
     void clearIltCache() { mIltCache.clear(); }
-    // Get ILT targets for a module, using cache if available
+    /**
+     * @brief ILT thunk targets of a module, scanning only on a cache miss.
+     * @return Pointer to the cached set, or nullptr when the scan failed.
+     *         Valid until the next invalidation of this module.
+     */
     const std::unordered_set<uint64_t>* getIltTargets(uint64_t moduleBase);
 
-    // Symbol resolution cache: Maps "module!symbol" -> resolved address
-    // Caches successful symbol resolutions to avoid repeated lookups
+    /// `"module!symbol"` -> resolved address (successful resolutions only).
     std::unordered_map<std::string, uint64_t> mSymbolCache;
+    /// Drop every symbol entry (whole-session invalidation).
     void clearSymbolCache() { mSymbolCache.clear(); }
-    // Lookup symbol in cache, returns 0 if not found
+    /// @return The cached address, or 0 when the symbol is not cached.
     uint64_t getCachedSymbol(const std::string& modSym);
-    // Store resolved symbol in cache
+    /// Record a successful resolution. Never called for ambiguous symbols.
     void cacheSymbol(const std::string& modSym, uint64_t addr);
+    /// @}
 
     // Expr.cpp: address expression evaluation. See the grammar comment there.
     bool evalExpression(const std::string & s, uint64_t & out, std::string & err);
@@ -396,69 +604,140 @@ private:
     // Arm the one-shot OEP breakpoint (no-op if already armed or unavailable).
     void applyEntryBreakpoint();
 
-    // GleamCommands.cpp
-    static void cmdHelp();
+    /**
+     * @name Instance-based services
+     * These replaced process-wide globals so several debugger instances can
+     * coexist (see GLOBAL_STATE_AUDIT.md).
+     * @{
+     */
+    Gleam::Logger* mLogger;            ///< Owns the log level (was a global).
+    Gleam::PerfMonitor* mPerfMonitor;  ///< Owns the perf counters (was a global).
+    /// @}
 
-    // Instance-based state (replaces global variables)
-    Gleam::Logger* mLogger;
-    Gleam::PerfMonitor* mPerfMonitor;
+    /**
+     * @name Command queue (cross-thread)
+     * The only channel from the REPL thread into the debugger thread.
+     * @{
+     */
+    std::queue<std::string> mCmdQueue;      ///< Guarded by mCmdMutex.
+    std::mutex mCmdMutex;                   ///< Guards mCmdQueue.
+    std::condition_variable mCmdCv;         ///< Signals a newly queued command.
+    std::atomic<bool> mIsPaused{ false };   ///< Debugger thread is in commandLoop().
+    std::atomic<bool> mInDebugEvent{ false }; ///< Between event delivery and ContinueDebugEvent.
+    /// @}
 
-    std::queue<std::string> mCmdQueue;
-    std::mutex mCmdMutex;
-    std::condition_variable mCmdCv;
-    std::atomic<bool> mIsPaused{ false };
-    std::atomic<bool> mInDebugEvent{ false };     // between event delivery and ContinueDebugEvent
-    std::atomic<bool> mBreakInExpected{ false };  // "pause" break-in is on its way
-    std::atomic<bool> mPauseAfterResume{ false }; // "pause" arrived while paused
-    std::atomic<HANDLE> mBreakInStubThread{ nullptr }; // injected int3-stub thread
-    std::atomic<void*> mBreakInStubPage{ nullptr };    // page backing the stub
-    std::atomic<uint32_t> mBreakInStubTid{ 0 };        // tid of the stub thread (death confirmation)
-    // detach deferred until the break-in stub thread is confirmed dead and
-    // its page is freed (never detach leaving a remote RWX page behind).
+    /**
+     * @name Break-in state (cross-thread)
+     *
+     * `pause` cannot stop the debuggee directly: it injects a thread that runs
+     * into an `int3` on a page we own. Recognition is by **exception address**
+     * (the stub page, then ntdll!DbgUiRemoteBreakin, then a fallback flag),
+     * which decouples it from any bookkeeping order.
+     * @{
+     */
+    std::atomic<bool> mBreakInExpected{ false };  ///< A `pause` break-in is on its way.
+    std::atomic<bool> mPauseAfterResume{ false }; ///< `pause` arrived while already paused.
+    std::atomic<bool> mQuitRequested{ false };    ///< `quit` requested from REPL thread.
+    std::atomic<bool> mDetachRequested{ false };  ///< `detach` requested from REPL thread.
+    std::atomic<HANDLE> mBreakInStubThread{ nullptr }; ///< Injected int3-stub thread.
+    std::atomic<void*> mBreakInStubPage{ nullptr };    ///< Page backing the stub; cleared only after a successful free.
+    std::atomic<uint32_t> mBreakInStubTid{ 0 };        ///< Stub tid, used to confirm its death.
+    /**
+     * @brief Detach is waiting for the stub thread to be confirmed dead.
+     *
+     * The session never detaches while a remote RWX page of ours is still
+     * mapped; finishDeferredDetach() completes the operation from the
+     * EXIT_THREAD event.
+     */
     bool mDetachAfterStubCleanup = false;
+    /// @}
 
-    // Gleam-side fault-injection flags ("selftest failapi ..."): each fails
-    // the matching API call ONCE in the break-in stub paths, then clears.
-    bool mFailNextTerminate = false;  // TerminateThread on the stub thread
-    bool mFailNextStubResume = false; // ResumeThread of a fresh stub thread
-    bool mFailNextVfree = false;      // VirtualFreeEx of the stub page
-    std::atomic<uint64_t> mDbgBreakInAddr{ 0 };        // ntdll!DbgUiRemoteBreakin (fallback break-in identity)
-    uint32_t mExitThreadResolveAttempts = 0;           // rate-limit retry logging
-    bool mWantsPause = false;
-    bool mStepArmed = false;      // a user-requested step is in flight
-    bool mStepOverArmed = false;  // a user-requested step-over is in flight
-    std::atomic<bool> mQuitting{ false }; // detach/quit in flight: no injections
+    /**
+     * @name Fault injection (`selftest failapi ...`)
+     * Each flag fails the matching API call **once** in the break-in stub
+     * paths and then clears itself, so an armed-but-untriggered flag cannot
+     * leak into the next session.
+     * @{
+     */
+    bool mFailNextTerminate = false;  ///< Fail TerminateThread on the stub thread.
+    bool mFailNextStubResume = false; ///< Fail ResumeThread of a fresh stub thread.
+    bool mFailNextVfree = false;      ///< Fail VirtualFreeEx of the stub page.
+    /// @}
 
-    // Serializes stub injection (forceBreakIn) against stub cleanup and the
-    // quitting transition: an injection and a cleanup can never interleave.
+    std::atomic<uint64_t> mDbgBreakInAddr{ 0 }; ///< ntdll!DbgUiRemoteBreakin, a fallback break-in identity.
+    uint32_t mExitThreadResolveAttempts = 0;    ///< Rate-limits symbol-retry logging.
+
+    /**
+     * @name Execution control state
+     * @{
+     */
+    bool mWantsPause = false;     ///< This event should surface as a user stop.
+    bool mStepArmed = false;      ///< A user-requested step is in flight.
+    bool mStepOverArmed = false;  ///< A user-requested step-over is in flight.
+    /**
+     * @brief detach/quit is in flight; no new stub injections.
+     * @note Atomic because the REPL thread reads it to decide whether a pause
+     *       request is still meaningful.
+     */
+    std::atomic<bool> mQuitting{ false };
+    /// @}
+
+    /**
+     * @brief Serializes stub injection against stub cleanup and the quitting
+     *        transition, so an injection and a teardown can never interleave.
+     */
     std::mutex mBreakInMutex;
 
-    // "breakon" switches: which event kinds may trigger a pause.
+    /**
+     * @name `breakon` switches
+     * Which event kinds may surface as a user stop. Survives a restart.
+     * @{
+     */
     bool mBreakOnEntry = false;
     bool mBreakOnDll = false;
     bool mBreakOnThread = false;
-    bool mBreakOnException = true;   // matches the historic default
-    GleeBug::ptr mOepBreakpoint = 0; // one-shot OEP breakpoint address (0 = none)
+    bool mBreakOnException = true;   ///< Matches the historic default.
+    /**
+     * @brief One-shot OEP breakpoint address (0 = none).
+     * @note Armed lazily by applyEntryBreakpoint(): `breakon entry on` usually
+     *       runs at the system breakpoint, long after the process-creation
+     *       event, so enabling it has to arm the breakpoint retroactively.
+     */
+    GleeBug::ptr mOepBreakpoint = 0;
+    /// @}
 
-    std::map<GleeBug::ptr, uint32_t> mIgnoreHits;  // breakpoint address -> remaining ignores
+    std::map<GleeBug::ptr, uint32_t> mIgnoreHits;  ///< Breakpoint address -> remaining ignores.
     // Exception filters ("excfilter"): per-code break chance + disposition.
     struct ExFilter
     {
         int breakOn = 2;    // 0=first chance, 1=second chance, 2=never
         int handledBy = 0;  // 0=pass to debuggee (NOT_HANDLED), 1=swallow (DBG_CONTINUE)
     };
-    std::map<uint32_t, ExFilter> mExFilters;
+    std::map<uint32_t, ExFilter> mExFilters;  ///< Exception code -> filter. Survives a restart.
+
+    /**
+     * @name Last exception
+     * Feeds `exinfo` and the `exception pass|handle` disposition commands.
+     * @{
+     */
     EXCEPTION_RECORD mLastException{};
     bool mLastExceptionValid = false;
     bool mLastExceptionFirstChance = false;
-    bool mPausedOnException = false; // the current pause is an exception stop
-    uint32_t mSelectedThreadId = 0;                // 0 = follow the event thread
-    bool mSymInitialized = false;                  // dbghelp session is up
-    bool mHideOn = false;                          // anti-anti-debug enabled
-    std::map<uint64_t, std::vector<uint8_t>> mPatches; // patch addr -> original bytes
-    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> mHideOriginals; // hide writes, for restore
-    bool mHasLaunchInfo = false;    // launched (not attached): "restart" allowed
-    bool mRestartPending = false;   // "restart" command consumed by main.cpp
+    /// The current pause is an exception stop; any resume-class command clears it.
+    bool mPausedOnException = false;
+    /// @}
+
+    uint32_t mSelectedThreadId = 0;  ///< `thread <tid>` selection; 0 = follow the event thread.
+    bool mSymInitialized = false;    ///< dbghelp session is up (created lazily).
+    bool mHideOn = false;            ///< Anti-anti-debug enabled; re-applied at each session start.
+
+    /// Patch address -> original bytes. First write wins, so `restore` is exact.
+    std::map<uint64_t, std::vector<uint8_t>> mPatches;
+    /// Writes made by `hide`, replayed in reverse by `hide off`.
+    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> mHideOriginals;
+
+    bool mHasLaunchInfo = false;    ///< Launched rather than attached: `restart` is allowed.
+    bool mRestartPending = false;   ///< `restart` was requested; main.cpp consumes it.
 };
 
 #endif //GLEAM_DEBUGGER_H

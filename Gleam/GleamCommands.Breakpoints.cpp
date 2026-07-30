@@ -1,4 +1,28 @@
-// Breakpoint commands: software, hardware, memory breakpoints and ignore counts.
+/**
+ * @file GleamCommands.Breakpoints.cpp
+ * @brief Breakpoint commands: software, hardware, memory, ignore counts,
+ *        conditions and tracepoints.
+ *
+ * `bp` accepts three address forms, and the third one changes the lifecycle:
+ * a literal expression binds immediately, while `module!symbol` and
+ * `module+rva` create a *logical* breakpoint that may stay pending until its
+ * module loads (see GleamDebugger::bindModuleBreakpoints).
+ *
+ * Hit-time behaviour (`if` conditions, `do` commands, `trace`, ignore counts)
+ * is evaluated by evalBpRule() **inside the debugger thread's callback**, not
+ * from the command loop. That keeps auto-continuing hits off the pause path,
+ * which is what makes high-frequency tracepoints usable - so this logic must
+ * stay in the core rather than moving behind a future MCP boundary.
+ *
+ * @note Two engine behaviours constrain the code here:
+ *       - Re-setting a breakpoint at the current address inside the same pause
+ *         hits again immediately: the restored original instruction has not
+ *         executed yet, so the new breakpoint catches it. Not a bug - tests
+ *         must expect it.
+ *       - SetBreakpoint() refuses a second breakpoint at an address that
+ *         already has one, so "user breakpoint at an address an internal
+ *         breakpoint holds" is unreachable from the command model.
+ */
 
 #include "GleamDebugger.h"
 

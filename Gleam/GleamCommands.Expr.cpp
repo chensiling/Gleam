@@ -1,13 +1,19 @@
-// Address expression evaluation. Shared by every address-taking command
-// through parseAddress. Supported grammar (no spaces needed):
-//
-//   expr  := unary (('+'|'-') unary)*
-//   unary := '-' unary | '[' expr ']' | '(' expr ')' | atom
-//   atom  := hex literal | register | module | module!symbol
-//
-// '[expr]' dereferences a pointer (8 bytes) in the debuggee. A bare module
-// name evaluates to its base address, so "kernel32+1234" is module+RVA.
-// Arithmetic wraps (unsigned), matching debugger convention.
+/// @file GleamCommands.Expr.cpp
+/// @brief Address expression evaluator shared by every address-taking command
+///        via parseAddress().
+///
+/// @section grammar Supported grammar (spaces not required)
+/// @code
+///   expr  := unary (('+'|'-') unary)*
+///   unary := '-' unary | '[' expr ']' | '(' expr ')' | atom
+///   atom  := hex literal | register | module | module!symbol
+/// @endcode
+///
+/// @note
+///   - <tt>[expr]</tt> dereferences a pointer (8 bytes) from the debuggee.
+///   - A bare module name evaluates to its load base, so
+///     <tt>kernel32+1234</tt> means module_base + RVA.
+///   - All arithmetic is unsigned and wraps, matching debugger convention.
 
 #include "GleamDebugger.h"
 

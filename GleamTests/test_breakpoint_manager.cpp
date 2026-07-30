@@ -7,6 +7,10 @@
 #include <unordered_map>
 #include <functional>
 
+// Use the real Error/Result types (see note in test_error.cpp): local mocks in
+// namespace Gleam would be an ODR violation against the real definitions.
+#include "../Gleam/Error.h"
+
 namespace Gleam {
 
 // Mock enums and structures
@@ -14,30 +18,6 @@ enum class BreakpointType { Software, Hardware, Memory };
 enum class BreakpointState { Enabled, Disabled, OneShot, Pending };
 enum class HardwareCondition { Execute, Write, ReadWrite, IO };
 enum class HardwareSize { Byte = 1, Word = 2, Dword = 4, Qword = 8 };
-
-enum class ErrorCategory { None, Breakpoint, Memory };
-
-struct Error {
-    ErrorCategory category;
-    std::string message;
-    Error() : category(ErrorCategory::None) {}
-    Error(ErrorCategory cat, const std::string& msg) : category(cat), message(msg) {}
-};
-
-template<typename T>
-class Result {
-private:
-    bool mIsOk;
-    T mValue;
-    Error mError;
-public:
-    Result(const T& value) : mIsOk(true), mValue(value) {}
-    Result(const Error& error) : mIsOk(false), mError(error) {}
-    bool isOk() const { return mIsOk; }
-    bool isError() const { return !mIsOk; }
-    const T& value() const { return mValue; }
-    const Error& error() const { return mError; }
-};
 
 struct BreakpointInfo {
     uint32_t id;

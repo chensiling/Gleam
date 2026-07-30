@@ -1,10 +1,18 @@
-// Code scanning commands: xref (find references to an address) and findasm
-// (search instructions by text). Shared linear-disassembly sweep over the
-// debuggee's committed executable regions.
-//
-// NOTE: instruction targets are computed from raw bytes (E8/E9 rel32,
-// FF /2 & /4 rip-relative) because the vendored Zydis mnemonic enum is not
-// trustworthy (see Debugger.Process.cpp MnemonicIs comment).
+/**
+ * @file GleamCommands.Scan.cpp
+ * @brief Code scanning: `xref` (references to an address) and `findasm`
+ *        (instructions matching text).
+ *
+ * Both share one linear-disassembly sweep over the debuggee's committed
+ * executable regions. Each block is read with 15 extra bytes so an instruction
+ * straddling a block boundary still decodes completely.
+ *
+ * @note Instruction targets are computed from **raw bytes** (E8/E9 rel32,
+ *       FF /2 and /4 rip-relative) rather than from decoder mnemonics. The
+ *       discipline dates from a vendored-Zydis enum mismatch; it is kept even
+ *       though the amalgamated v4.1.1 build fixed that, because it makes the
+ *       scanners independent of decoder-internal state.
+ */
 
 #include "GleamDebugger.h"
 

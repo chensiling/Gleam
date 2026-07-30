@@ -1,5 +1,35 @@
-// Execution control commands: continue, stepping, run-to-return, detach,
-// quit, thread selection, exception filters.
+/**
+ * @file GleamCommands.Control.cpp
+ * @brief Execution control: continue, stepping, run-to-return, conditional
+ *        tracing, detach, quit, restart, thread selection, memory regions,
+ *        exception disposition, `breakon`, `hide`.
+ *
+ * @section stepout Run-to-return (`ret`)
+ *
+ * Implemented as a stepping loop in the debugger core with three special cases
+ * and **no stack analysis at all**: a `ret` finishes the operation, a `call` is
+ * skipped with a one-shot breakpoint, and a backward jump is recognised as a
+ * loop edge so the loop exit gets a one-shot breakpoint and runs at native
+ * speed. Because it never reads the stack, unwind data, or frame pointers, it
+ * works identically on FPO code, packers and shellcode (100k iterations
+ * complete in ~22 debug events).
+ *
+ * The contract is deliberately different from x64dbg's `rtr`: Gleam stops
+ * **after** the `ret` executes, in the caller. x64dbg stops before it.
+ *
+ * Ownership of the internal one-shot breakpoint is tracked by address, thread
+ * **and** generation. Any hit at that address - by any thread - forfeits the
+ * right to delete it, because from that moment it may be carrying a user
+ * breakpoint instead.
+ *
+ * @section exceptions Exception disposition
+ *
+ * Follows x64dbg semantics via GleamDebugger::decideExPolicy(). The rule that
+ * matters: on a second-chance exception, only an explicit `{never, pass}`
+ * filter passes NOT_HANDLED without stopping. Blindly passing a second-chance
+ * exception kills the process, so every other combination pauses and defaults
+ * to swallowing, leaving the choice to the user.
+ */
 
 #include "GleamDebugger.h"
 

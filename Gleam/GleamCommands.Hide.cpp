@@ -1,16 +1,25 @@
-// Anti-anti-debug ("hide"): patch the common debugger-detection vectors in
-// the debuggee. Best applied at the system breakpoint, before any target
-// code has run.
-//
-// Coverage (v1):
-//   - PEB.BeingDebugged
-//   - PEB.NtGlobalFlag
-//   - ProcessHeap Flags / ForceFlags debug bits
-//   - kernelbase!IsDebuggerPresent         -> return FALSE
-//   - kernelbase!CheckRemoteDebuggerPresent -> *pbDebuggerPresent = FALSE
-// NOT covered (documented limitation): NtQueryInformationProcess-based checks
-// (ProcessDebugPort/ProcessDebugObjectHandle/ProcessDebugFlags), which need
-// an ntdll hook.
+/// @file GleamCommands.Hide.cpp
+/// @brief Anti-anti-debug ("hide"): patches common debugger-detection vectors
+///        inside the debuggee process.
+///
+/// @details
+/// Best applied at the system breakpoint, before any target code has run.
+/// cmdHide() acts as a toggle: "hide on" patches the targets and saves the
+/// original bytes in mHideOriginals; "hide off" restores them in reverse
+/// order.  Re-applying while already hidden is idempotent -- the first set
+/// of original bytes is kept.
+///
+/// @section hide_coverage Coverage (v1)
+///   - PEB.BeingDebugged
+///   - PEB.NtGlobalFlag
+///   - ProcessHeap Flags / ForceFlags debug bits
+///   - kernelbase!IsDebuggerPresent  ->  returns FALSE
+///   - kernelbase!CheckRemoteDebuggerPresent  ->  *pbDebuggerPresent = FALSE
+///
+/// @note <b>Not covered (documented limitation):</b>
+///   NtQueryInformationProcess-based checks (ProcessDebugPort,
+///   ProcessDebugObjectHandle, ProcessDebugFlags) require an ntdll hook and
+///   are outside v1 scope.
 
 #include "GleamDebugger.h"
 

@@ -36,6 +36,7 @@ add_executable(GleamTests
     ../Gleam/Logger.cpp
     ../Gleam/PerfMonitor.cpp
     ../Gleam/Performance.cpp
+    ../Gleam/Error.cpp
 )
 
 # Don't include GleamIltDisambiguation.cpp - it depends on full GleeBug headers

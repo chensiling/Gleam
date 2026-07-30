@@ -1,3 +1,18 @@
+/**
+ * @file GleamCommands.cpp
+ * @brief Command dispatch, shared parsing helpers, and `help`.
+ *
+ * executeCommand() splits the line into arguments and offers it to each
+ * `try*Command` handler in turn (control, breakpoints, inspect, symbols, scan);
+ * the first handler that claims it wins. Unclaimed lines report an error rather
+ * than being silently ignored.
+ *
+ * Also home to the two helpers every area shares: parseHex() and
+ * normalizeModuleName().
+ *
+ * @see GleamDebugger for the file-by-file command split.
+ */
+
 #include "GleamDebugger.h"
 
 #include <cstdio>

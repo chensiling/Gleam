@@ -1,3 +1,37 @@
+/**
+ * @file GleamDebugger.cpp
+ * @brief Debug session core: engine callbacks, command loop, and break-in.
+ *
+ * Four groups of code live here.
+ *
+ * **Engine callbacks** (`cb*`) translate GleeBug events into Gleam's stop
+ * model. Every stop is reported by emitStop() as one machine-readable line,
+ * `stop reason=<r> [details] rip=0x... tid=<id>`, which is what the test suite
+ * and the future MCP layer parse.
+ *
+ * **The command loop** runs while the debuggee is suspended. It is entered from
+ * a callback and returns when a command asks to resume, which is why every
+ * command implementation can assume a frozen debuggee.
+ *
+ * **Break-in** (`pause`) injects a thread that runs into an `int3` on a page we
+ * allocated. Two platform facts shape this design:
+ * - DebugBreakProcess() reads `PEB.BeingDebugged`, which `hide` zeroes, so it
+ *   cannot be the primary mechanism - only a fallback when hiding is off.
+ * - The stub is 16 bytes of pure `int3` and deliberately does **not** call
+ *   ExitThread: resolving that address is unreliable in an attach session, and
+ *   a wrong target once produced a 1.37-million-line exception loop. The stub
+ *   thread therefore dies by TerminateThread, confirmed through the EXIT_THREAD
+ *   event, and its page is freed only after that confirmation.
+ *
+ * **Logical breakpoint binding** resolves `bp module!symbol` / `bp module+rva`
+ * against modules as they load. During a DLL load event the loader list is not
+ * linked yet, so EnumProcessModules and dbghelp are both blind - binding reads
+ * the PE headers at the module base directly, and falls back to loading the
+ * PDB from disk.
+ *
+ * @see GleamDebugger.h for the thread model and state invariants.
+ */
+
 #include "GleamDebugger.h"
 #include "Log.h"
 #include "Logger.h"
@@ -59,6 +93,17 @@ namespace
 
 bool GleamDebugger::pushCommand(const std::string & cmd)
 {
+    // Defense #1: Discard commands typed while the debuggee is running or
+    // the session is shutting down. pause/quit/detach use request*() methods,
+    // and help is handled in the REPL thread -- all bypass pushCommand entirely.
+    // Everything else is stale and should not silently execute at the next stop.
+    if(!mIsPaused.load() || mQuitting.load())
+    {
+        printf("(command ignored: %s)\n",
+               mQuitting.load() ? "session ending" : "process running");
+        fflush(stdout);
+        return false;
+    }
     bool wasEmpty;
     {
         std::lock_guard<std::mutex> lock(mCmdMutex);
@@ -80,6 +125,20 @@ void GleamDebugger::requestPause()
         if(mPauseAfterResume.exchange(false))
             forceBreakIn();
     }
+}
+
+void GleamDebugger::requestQuit()
+{
+    // Publish the quit request; the debugger thread will consume it at the
+    // next debug event and execute the quit logic (Stop() + cleanup).
+    mQuitRequested.store(true);
+}
+
+void GleamDebugger::requestDetach()
+{
+    // Publish the detach request; the debugger thread will consume it at the
+    // next debug event and execute the detach logic (Detach() + cleanup).
+    mDetachRequested.store(true);
 }
 
 void GleamDebugger::forceBreakIn()
@@ -792,11 +851,15 @@ void GleamDebugger::cbSystemBreakpoint()
 
 void GleamDebugger::cbAttachBreakpoint()
 {
-    // Fired (instead of the system breakpoint) when attached to a process.
-    emitStop("attach", nullptr);
+    // Fired when attached to a process. Unlike cbSystemBreakpoint (launch),
+    // we do NOT pause here: the process keeps running automatically after
+    // attach. The caller (main.cpp) already printed "[gleam] attached to
+    // process N". Use "pause" to stop the process manually.
     resolveBreakInSymbols();
     rebindPendingBreakpoints();
-    mWantsPause = true;
+    if(mHideOn)
+        applyHides();
+    Gleam::logEvent("attach ready");
 }
 
 // Internal (stepout) breakpoint bookkeeping for a breakpoint hit.
@@ -1110,6 +1173,17 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
                        mBreakInStubTid.load(), GetLastError());
             }
         }
+        // Ensure mThread points to the stub thread so commandLoop()'s gate
+        // at the end of cbExceptionEvent passes (mThread != nullptr check).
+        // The stub thread may not be in mProcess->threads yet if its
+        // CREATE_THREAD event hasn't been processed, but the EXCEPTION event
+        // has dwThreadId set correctly.
+        if(!mThread && mProcess)
+        {
+            auto it = mProcess->threads.find(mDebugEvent.dwThreadId);
+            if(it != mProcess->threads.end())
+                mThread = it->second.get();
+        }
         emitStop("pause", nullptr);
         abortStepOut("pause");
         mWantsPause = true;
@@ -1249,6 +1323,42 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
         Gleam::logEvent("breakin deferred-fire");
         forceBreakIn();
     }
+
+    // Process quit/detach requests from REPL thread. These are checked after
+    // mInDebugEvent is cleared so the state is consistent for the next event.
+    if(mQuitRequested.exchange(false))
+    {
+        mQuitting = true;
+        abortStepOut("quit");
+        cleanupBreakInStub();
+        Stop();
+        printf("quitting...\n");
+        fflush(stdout);
+    }
+    else if(mDetachRequested.exchange(false))
+    {
+        mQuitting = true;
+        abortStepOut("detach");
+        cleanupBreakInStub();
+        if(mBreakInStubThread.load())
+        {
+            mDetachAfterStubCleanup = true;
+            printf("detach deferred: waiting for break-in stub thread to exit\n");
+            fflush(stdout);
+        }
+        else if(mBreakInStubPage.load())
+        {
+            mQuitting = false;
+            printf("detach refused: break-in stub page still held (free failed)\n");
+            fflush(stdout);
+        }
+        else
+        {
+            Detach();
+            printf("detaching...\n");
+            fflush(stdout);
+        }
+    }
 }
 
 void GleamDebugger::commandLoop()
@@ -1270,6 +1380,14 @@ void GleamDebugger::commandLoop()
         }
         if(executeCommand(cmd))
             break;
+    }
+    // Defense #2: A resume command just executed. Discard any commands
+    // that were queued for the previous pause state -- they are now stale
+    // and should not execute at the next stop.
+    {
+        std::lock_guard<std::mutex> lock(mCmdMutex);
+        while(!mCmdQueue.empty())
+            mCmdQueue.pop();
     }
     mIsPaused.store(false);
 }
