@@ -93,6 +93,7 @@
     <ClCompile Include="Error.cpp" />
     <ClCompile Include="History.cpp" />
     <ClCompile Include="Memory.cpp" />
+    <ClCompile Include="ProcessManager.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GleamDebugger.h" />
@@ -102,6 +103,8 @@
     <ClInclude Include="Error.h" />
     <ClInclude Include="History.h" />
     <ClInclude Include="Memory.h" />
+    <ClInclude Include="ProcessManager.h" />
+    <ClInclude Include="Exception.h" />
     <ClInclude Include="RaiiUtils.h" />
     <ClInclude Include="ThreadSafety.h" />
   </ItemGroup>
