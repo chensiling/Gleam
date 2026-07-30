@@ -3,20 +3,25 @@
 > 交接用：让下一个 AGENT 不用翻聊天记录就能继续。每次完成有意义的工作后更新本文件。
 > 目标与验证标准见 `PROJECT.md`（总纲），本文件只记录"做到哪了、怎么继续"。
 
-## 当前状态：第八轮复审 SYM-1/SYM-2/C3-R5-R/C3-R6 修复完成，提交 793dbd3
+## 当前状态：第八轮复审 SYM-1/SYM-2/C3-R5-R/C3-R6 修复完成并通过全部测试
 
 最后更新：2026-07-30
 
-**第八轮复审中的 4 项问题（SYM-1/SYM-2/C3-R5-R/C3-R6）已全部修复**，提交 `793dbd3`。
+**第八轮复审中的 4 项问题（SYM-1/SYM-2/C3-R5-R/C3-R6）已全部修复并通过测试**，提交 `793dbd3` + `cbba0e1` + `3b7dd5a`。
 
 - **SYM-1（高）：统一符号消歧，pending DLL 绑定不再绕过**：`resolveModuleSymbol` 改返回 `SymbolResult` 三态（Found/NotFound/Ambiguous）；`resolvePdbSymbol` 使用完整 ILT 消歧逻辑，不再直接调 `SymFromName`；`bindModuleBreakpoints` 遇歧义明确拒绝并从 pending 删除。Late.dll 新增 `ambig_a.cpp`/`ambig_b.cpp` 双翻译单元提供"活跃 ambig + 僵尸 ambig"的测试形状
-- **SYM-2（中）：移除跨命令污染的全局歧义状态**：删除 `mSymbolAmbiguous` 布尔值，歧义通过返回值传递；`exprParseAtom`/`bp` 命令按结果分支，`eval ZombieTarget!inner` 后 `bp module+rva` 保持正确 pending 语义
+- **SYM-2（中）：移除跨命令污染的全局歧义状态**：删除 `mSymbolAmbiguous` 布尔值，歧义通过返回值传递；`exprParseAtom`/`bp` 命令按结果分支，`eval ZombieTarget!inner` 后 `bp module+rva` 保持正确 pending 语义。修复歧义错误重复打印（`eval` 不再重复打印 `resolveModuleSymbol` 已打印的详细错误）
 - **C3-R5-R（中）：stub 发布前写入失败保留页面地址**：`ensureBreakInStub` 的 `WriteProcessMemory` + `VirtualFreeEx` 双失败时将页面登记到 `mBreakInStubPage`，后续清理可重试
-- **C3-R6（中）：hide on 下 stub ResumeThread 失败可恢复**：`ResumeThread` 失败但 `TerminateThread` 成功时用新 stub 重试；hide on 下不调用会失败的 `DebugBreakProcess`，延迟到下一自然事件或重试成功
+- **C3-R6（中）：hide on 下 stub ResumeThread 失败可恢复**：`ResumeThread` 失败后，非 hide on 时使用 `DebugBreakProcess` fallback（保持原始行为）；hide on 下明确告知不可用并延迟到下一自然事件
 
 **新增测试**：SYM-1（pending DLL 歧义拒绝）、SYM-2（跨命令污染回归）
 
-**遗留**：门禁尚未运行完整套件验证；审查文档尚未更新关闭状态。
+**测试结果**：**PASS=399 FAIL=0**（116 场景，Debug 模式全绿）
+
+**累计提交**：
+- `793dbd3`: 主要修复（符号消歧统一化、歧义状态移除、stub 页面/恢复修复）
+- `cbba0e1`: 测试修复（歧义错误去重、测试调整）
+- `3b7dd5a`: 修复总结文档
 
 ---
 
