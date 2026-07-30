@@ -124,7 +124,7 @@ public:
     explicit ExceptionGuard(const char* operation, bool rethrow = false)
         : mOperation(operation), mThrow(rethrow) {}
 
-    ~ExceptionGuard() noexcept(!mThrow) {
+    ~ExceptionGuard() noexcept {
         // Check if we're unwinding due to an exception
         if (std::uncaught_exception()) {
             try {
@@ -136,15 +136,13 @@ public:
             }
             catch (const GleamException& e) {
                 logError("Exception in %s: %s", mOperation, e.what());
-                if (mThrow) throw;
+                // Don't rethrow from destructor even if mThrow is true
             }
             catch (const std::exception& e) {
                 logError("Unexpected exception in %s: %s", mOperation, e.what());
-                if (mThrow) throw;
             }
             catch (...) {
                 logError("Unknown exception in %s", mOperation);
-                if (mThrow) throw;
             }
         }
     }

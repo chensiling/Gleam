@@ -95,6 +95,7 @@
     <ClCompile Include="Memory.cpp" />
     <ClCompile Include="ProcessManager.cpp" />
     <ClCompile Include="BreakpointManager.cpp" />
+    <ClCompile Include="SymbolResolver.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GleamDebugger.h" />
@@ -106,6 +107,7 @@
     <ClInclude Include="Memory.h" />
     <ClInclude Include="ProcessManager.h" />
     <ClInclude Include="BreakpointManager.h" />
+    <ClInclude Include="SymbolResolver.h" />
     <ClInclude Include="Exception.h" />
     <ClInclude Include="RaiiUtils.h" />
     <ClInclude Include="ThreadSafety.h" />

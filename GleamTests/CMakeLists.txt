@@ -30,6 +30,8 @@ add_executable(GleamTests
     test_exception.cpp
     test_process_manager.cpp
     test_breakpoint_manager.cpp
+    test_symbol_resolver.cpp
+    ../Gleam/SymbolResolver.cpp
 )
 
 # Don't include GleamIltDisambiguation.cpp - it depends on full GleeBug headers
