@@ -1,0 +1,508 @@
+== A ==
+  PASS: A: bp hit at marker
+  PASS: A: disasm at rip
+  PASS: A: maps regions
+  PASS: A: modules has TestTarget
+  PASS: A: bl lists bp
+  PASS: A: two threads
+  PASS: A: bt frame0 rip
+  PASS: A: find pattern
+  PASS: A: rcx=arg at entry
+  PASS: A: write ok
+  PASS: A: result1 modified by rcx
+  PASS: A: result2 normal
+  PASS: A: gdata self-write wins b0
+  PASS: A: exit code 0
+== B ==
+  PASS: B: hit exactly once
+  PASS: B: bp auto-deleted
+  PASS: B: both calls ran
+== C ==
+  PASS: C: first hit ignored
+  PASS: C: bp stop once
+  PASS: C: exit 0
+== D ==
+  PASS: D: hbp set
+  PASS: D: hbp hit once
+  PASS: D: self write done
+== E ==
+  PASS: E: mbp set
+  PASS: E: mbp hit once
+== F ==
+  PASS: F: unhandled exception
+  PASS: F: exinfo code
+== G ==
+  PASS: G: exception passed
+  PASS: G: survived
+  PASS: G: exit 0
+== H ==
+  PASS: H: bp inner hit
+  PASS: H: stepout stop
+  PASS: H: result1 normal
+== I ==
+  PASS: I: stepped over the call
+  PASS: I: result1 normal
+== J ==
+  PASS: J: detaching
+  PASS: J: target ran free
+  PASS: J: session finished
+== K ==
+  PASS: K: imports kernel32 group
+  PASS: K: import names resolved
+  PASS: K: exports wildcard filter
+  PASS: K: exports summary
+== L ==
+  PASS: L: default exception on
+  PASS: L: OEP entry stop
+  PASS: L: thread create stop
+  PASS: L: thread start named
+  PASS: L: dll load stop
+  PASS: L: symbol bp hit (real body)
+== M ==
+  PASS: M: no exception stop
+  PASS: M: exit 0
+  PASS: M: only 2 stops
+== N1 ==
+  PASS: N1: hidden from IsDebuggerPresent
+== N2 ==
+  PASS: N2: two trace lines
+  PASS: N2: no bp pause
+== N3 ==
+  PASS: N3: only rcx==7 pauses
+== N4 ==
+  PASS: N4: sym resolves marker
+  PASS: N4: stackscan finds main
+  PASS: N4: find ascii
+  PASS: N4: patched
+  PASS: N4: restored
+  PASS: N4: list empty after restore
+  PASS: N4: until hits
+  PASS: N4: restore kept data
+== O1 ==
+  PASS: O1: allocated
+  PASS: O1: protected
+== O2 ==
+  PASS: O2: xref finds call site
+  PASS: O2: xref count
+  PASS: O2: findasm indirect call
+== O3 ==
+  PASS: O3: suspend ok
+  PASS: O3: resume ok
+== P1 ==
+  PASS: P1: trace stops on condition
+  PASS: P1: rip in marker code
+== P2 ==
+  PASS: P2: regs dumped twice
+== P3 ==
+  PASS: P3: no bp pause
+  PASS: P3: results correct
+== Q1 ==
+  PASS: Q1: 1 one-shot + 1 refire + 1 call-2
+  PASS: Q1: results correct
+== Q2 ==
+  PASS: Q2: no entry stop
+== Q3 ==
+  PASS: Q3: restored to original
+== Q4 ==
+  PASS: Q4: stepout stop
+== R1 ==
+  PASS: R1: 2 marker + 1 inner stops
+  PASS: R1: results correct
+== R2 ==
+  PASS: R2: both bytes restored
+== R3 ==
+  PASS: R3: detection restored
+  PASS: R3: skip re-apply
+== R4 ==
+  PASS: R4: stepout stop (FPO)
+  PASS: R4: caller resume
+== R5 ==
+  PASS: R5: bridged originals kept
+== S1 ==
+  PASS: S1: 25/25 pause injections
+== T1 ==
+  PASS: T1: argc
+  PASS: T1: empty arg kept
+  PASS: T1: space arg
+  PASS: T1: tab arg
+  PASS: T1: embedded quote
+  PASS: T1: trailing backslash
+== T1c ==
+  PASS: T1c: trailing double backslash
+  PASS: T1c: 2x backslash + quote
+== T1b ==
+  PASS: T1b: unicode arg (gbk bytes)
+  PASS: T1b: backslash before quote
+== T2 ==
+  PASS: T2: straddler found
+  PASS: T2: direct+indirect calls
+  PASS: T2: rel8 jmp form
+  PASS: T2: second-boundary straddler
+== T3 ==
+  PASS: T3: containment restored
+  PASS: T3: gdata restored 2x
+  PASS: T3: tail restored 2x
+== T4a ==
+  PASS: T4a: one-shot ignored once
+  PASS: T4a: no bp pause
+  PASS: T4a: results correct
+== T4b ==
+  PASS: T4b: no bp pause
+  PASS: T4b: results correct
+== T5 ==
+  PASS: T5: stepout at entry
+== T5b ==
+  PASS: T5b: stepout at ret insn
+== T5c ==
+  PASS: T5c: maxreached at limit
+  PASS: T5c: loop result correct
+== S2 ==
+  PASS: S2: 100/100 pause injections
+== S3 ==
+  PASS: S3: 100/100 sessions exited
+== S3b ==
+  PASS: S3b: natural exit with stdin open
+  PASS: S3b: detach with stdin open
+  PASS: S3b: quit with stdin open
+== S4 ==
+  PASS: S4: 100/100 runtime pauses
+== S5 ==
+  PASS: S5: 100/100 hidden runtime pauses
+== T7 ==
+  PASS: T7: cond never met, no pause
+  PASS: T7: results correct
+== T8 ==
+  PASS: T8: one trace line
+  PASS: T8: results correct
+== R6 ==
+  PASS: R6: detaching
+  PASS: R6: no injection after detach
+  PASS: R6: target ran to completion
+== R7 ==
+  PASS: R7: no injection after quit
+== U1 ==
+  PASS: U1: hex add
+  PASS: U1: parens and sub
+  PASS: U1: bare hex names
+  PASS: U1: deref g_data
+  PASS: U1: module!symbol
+  PASS: U1: register
+  PASS: U1: module base
+  PASS: U1: syntax error reported
+  PASS: U1: unknown name reported
+  PASS: U1: expression in read
+== U2 ==
+  PASS: U2: pending at set
+  PASS: U2: bl shows pending
+  PASS: U2: bound on dll load
+  PASS: U2: breakpoint hit
+  PASS: U2: dll call ran
+== U3 ==
+  PASS: U3: marker frame
+  PASS: U3: main frame
+  PASS: U3: frame format
+  PASS: U3: unwind provenance
+  PASS: U3: bad tid reported
+== U4 ==
+  PASS: U4: initially empty
+  PASS: U4: filter listed
+  PASS: U4: passed to debuggee
+  PASS: U4: survived
+== U4b ==
+  PASS: U4b: exception stop
+  PASS: U4b: pass line
+  PASS: U4b: survived
+== U4c ==
+  PASS: U4c: filter removed
+  PASS: U4c: empty again
+  PASS: U4c: pauses again
+== U4d ==
+  PASS: U4d: filter overrides breakon
+  PASS: U4d: survived
+== U5 ==
+  PASS: U5: ansi string
+  PASS: U5: u8
+  PASS: U5: u16
+  PASS: U5: u32
+  PASS: U5: u64
+  PASS: U5: bad address reported
+  PASS: U5: savemem line
+  PASS: U5: savemem bytes
+== U6 ==
+  PASS: U6: xmm0 roundtrip
+  PASS: U6: eflags roundtrip
+  PASS: U6: dr line present
+  PASS: U6: mxcsr present
+== U7 ==
+  PASS: U7: restart requested
+  PASS: U7: patches cleared
+  PASS: U7: two sessions
+  PASS: U7: logical bp rebound
+  PASS: U7: bp hits after restart
+== V1 ==
+  PASS: V1: deref failure reported
+  PASS: V1: literal out of range
+  PASS: V1: wrap arithmetic
+  PASS: V1: wrap negative
+  PASS: V1: unknown name in disasm
+== V2 ==
+  PASS: V2: eax rmw keeps high
+  PASS: V2: single read eax
+  PASS: V2: ax rmw keeps high
+  PASS: V2: al read
+  PASS: V2: ah read
+  PASS: V2: xmm1 read
+== V3 ==
+  PASS: V3: dr write rejected
+  PASS: V3: raw dr written
+  PASS: V3: hbp rejected after raw
+  PASS: V3: raw hw hit
+  PASS: V3: slot decoded
+  PASS: V4: handles stable across restarts (99 -> 98)
+  PASS: V4c: 5/5 attach-detach cycles
+  PASS: V4d: Init failure exits 1
+== V5 ==
+  PASS: V5: once logical gone
+  PASS: V5: rva out of image
+== V6 ==
+  PASS: V6: stepout aborted
+  PASS: V6: pause stop
+== W1 ==
+  PASS: W1: noexp pending
+  PASS: W1: noexp bound via path
+  PASS: W1: noexp in-image rva kept
+  PASS: W1: late bound via pdb retry
+  PASS: W1: noexp loaded
+  PASS: W1: late loaded
+== W2 ==
+  PASS: W2: first chance
+  PASS: W2: second chance pauses
+  PASS: W2: dies after pass
+== W3 ==
+  PASS: W3: pending clears probe err
+  PASS: W3: two distinct errors
+== W4 ==
+  PASS: W4: extra arg rejected
+  PASS: W4: conflict reported
+  PASS: W4: stepout works after rbp
+== W5 ==
+  PASS: W5: ansi at 0 is error
+== W6 ==
+  PASS: W6: r8d rmw
+  PASS: W6: r8w rmw
+  PASS: W6: r8b read
+  PASS: W6: r8w read
+  PASS: W6: sil rmw
+  PASS: W6: r9b rmw
+== W7 ==
+  PASS: W7: bound at load event
+  PASS: W7: first call hit
+== W9 ==
+  PASS: W9: untrusted label
+  PASS: W9: non-module marked
+== W8 ==
+  PASS: W8: u16 cross-page
+  PASS: W8: utf16 reads cross-page
+  PASS: W8: no false error
+== W7b ==
+  PASS: W7b: bound in both sessions
+  PASS: W7b: hit in both sessions
+  PASS: W7b: session2 binds before dllmain (14 < 17)
+== V4e ==
+  PASS: V4e: 30/30 runtime pause->detach, target completes
+== W10 ==
+  PASS: W10: aborted on pause
+  PASS: W10: no stale once bp
+  PASS: W10: new ret completes
+== W11 ==
+  PASS: W11: bound twice
+  PASS: W11: unbound on unload
+  PASS: W11: hit both instances
+== W11b ==
+  PASS: W11b: bogus never binds
+  PASS: W11b: session still clean
+== W13 ==
+  PASS: W13: unreadable next page -> error
+  PASS: W13: prefix then partial
+  PASS: W13: odd address reads
+  PASS: W13: surrogate pair
+  PASS: W13: surrogate across chunk
+  PASS: W13: noaccess -> error
+  PASS: W13: restored -> readable
+== W14 ==
+  PASS: W14: 10/10 runs ec=0 + non-owner>=1 + exactly 1 return + clean exit
+  PASS: W14: no spurious step stops
+== W14b ==
+  PASS: W14b/g: reached a non-owner stop
+  PASS: W14b/g: follow-up output 'stop reason=stepout return'
+  PASS: W14b/g: no leftover internal bp
+  PASS: W14b/step: reached a non-owner stop
+  PASS: W14b/step: follow-up output 'stop reason=step rip='
+  PASS: W14b/step: no leftover internal bp
+  PASS: W14b/stepover: reached a non-owner stop
+  PASS: W14b/stepover: follow-up output 'stop reason=step rip='
+  PASS: W14b/stepover: no leftover internal bp
+  PASS: W14b/tgo: reached a non-owner stop
+  PASS: W14b/tgo: follow-up output 'stop reason=trace '
+  PASS: W14b/tgo: no leftover internal bp
+  PASS: W14b/until: reached a non-owner stop
+  PASS: W14b/until: follow-up output 'stop reason=breakpoint type=software address=0x140077E90'
+  PASS: W14b/until: no leftover internal bp
+  PASS: W14b/newret: reached a non-owner stop
+  PASS: W14b/newret: follow-up output 'stop reason=stepout return'
+  PASS: W14b/newret: no leftover internal bp
+== W14c ==
+  PASS: W14c/shared: user bp survives the stepout abort
+  PASS: W14c/once: user bp survives the stepout abort
+== W14c/sameaddr ==
+  PASS: W14c/sameaddr: user once fires once, no internal claim
+  PASS: W14c/sameaddr: stepout completes
+  PASS: W14c/sameaddr: no leftover once
+== W14c/abort ==
+  PASS: W14c/abort: user once listed
+  PASS: W14c/abort: unified abort
+  PASS: W14c/abort: owner hits the user once exactly once, no internal claim
+  PASS: W14c/abort: fired once gone from bl
+== W14d ==
+  PASS: W14d/quit: non-owner stop reached
+  PASS: W14d/quit: single unified abort
+  PASS: W14d/quit: no re-arm after abort
+  PASS: W14d/restart: non-owner stop reached
+  PASS: W14d/restart: single unified abort
+  PASS: W14d/restart: new session clean bl
+  PASS: W14d/restart: no stale stepout stop
+  PASS: W14d/restart: target completes
+  PASS: W14d/ownerexit: aborted on thread exit
+  PASS: W14d/ownerexit: no phantom step stop
+  PASS: W14d/ownerexit: target completes
+  PASS: W14d/ownerexit: clean exit
+== W14e ==
+  PASS: W14e/owner: stepout still returns
+  PASS: W14e/owner: internal hit not ignored
+  PASS: W14e/owner: no leftover internal bp
+  PASS: W14e/owner: target completes
+  PASS: W14e/owner: clean exit
+  PASS: W14e: 5/5 runs ec=0 + exactly 1 return + bookkeeping before ignore + exit
+== W15 ==
+  PASS: W15: decoy image identified in the loader snapshots
+  PASS: W15: two distinct Late image bases observed
+  PASS: W15: exactly 2 binds
+  PASS: W15: both binds paired with a Late load event
+  PASS: W15: zero binds at the NoExp load event
+  PASS: W15: zero binds inside the live NoExp range
+  PASS: W15: zero hits inside the live NoExp range
+  PASS: W15: 2 hits, one per bound address
+  PASS: W15: decoy actually loaded
+  PASS: W15: late reloaded
+  PASS: W15: identity selftest (aux)
+== W16 ==
+  PASS: pid_state: query failure distinguished
+  PASS: pid_state: dead pid reads gone
+== W16_wait ==
+  PASS: W16/wait: precise error
+  PASS: W16/wait: exactly 1 error
+  PASS: W16/wait: controlled exit
+  PASS: W16/wait: no target residue
+== W16_continue ==
+  PASS: W16/continue: precise error
+  PASS: W16/continue: exactly 1 error
+  PASS: W16/continue: controlled exit
+  PASS: W16/continue: no target residue
+== W16_resume ==
+  PASS: W16/resume: precise error
+  PASS: W16/resume: exactly 1 error
+  PASS: W16/resume: loop continues
+  PASS: W16/resume: detached
+  PASS: W16/resume: frozen thread resumed and completed
+  PASS: W16/resume: target process exited on its own
+  PASS: W16/resume: pid query failure would fail the gate
+== W16/replylater ==
+  PASS: W16/replylater: injected (attempt 1)
+  PASS: W16/replylater: main hammered
+  PASS: W16/replylater: worker hammered
+  PASS: W16/replylater: precise error
+  PASS: W16/replylater: exactly 1 error
+  PASS: W16/replylater: controlled exit
+  PASS: W16/replylater: no target residue
+== W16_restart ==
+  PASS: W16/restart: hooked session armed
+  PASS: W16/restart: zero injected errors
+  PASS: W16/restart: step works in new session
+  PASS: W16/restart: new session completes
+== W16/attach ==
+  PASS: W16/attach: persistent hook armed
+  PASS: W16/attach: resume failure (error 5)
+  PASS: W16/attach: engine refuses detach
+  PASS: W16/attach: exactly one refusal
+  PASS: W16/attach: command loop re-armed
+  PASS: W16/attach: no stub cleanup timeout
+  PASS: W16/attach: detach deferred for stub
+  PASS: W16/attach: stub page freed
+  PASS: W16/attach: all errors within whitelist
+  PASS: W16/attach: whitelist anchors verified
+  PASS: W16/attach: strict tid list rejects malformed forms
+  PASS: W16/attach: two detach completions
+  PASS: W16/attach: single session end
+  PASS: W16/attach: refusal before successful detach
+  PASS: W16/attach: stub page MEM_FREE after detach
+  PASS: W16/attach: target alive after detach
+== W17 ==
+== W17/stubresume ==
+  FAIL: W17/stubresume: abnormal exit (code 124)
+  PASS: W17/stubresume: armed
+  PASS: W17/stubresume: resume failure
+  FAIL: W17/stubresume: fallback pauses
+  PASS: W17/stubresume: zero internal errors
+  FAIL: W17/stubresume: detached
+  FAIL: W17/stubresume: controlled exit
+  PASS: W17/stubresume: target alive after detach
+== W17/terminate ==
+  PASS: W17/terminate: armed
+  PASS: W17/terminate: precise error
+  PASS: W17/terminate: exactly 1 error
+  PASS: W17/terminate: retried at next int3
+  PASS: W17/terminate: stub freed
+  PASS: W17/terminate: detached
+  PASS: W17/terminate: controlled exit
+  PASS: W17/terminate: target alive after detach
+== W17/vfree ==
+  PASS: W17/vfree: stub injected
+  PASS: W17/vfree: precise error
+  PASS: W17/vfree: exactly 1 error
+  PASS: W17/vfree: detach refused
+  PASS: W17/vfree: retry freed the page
+  PASS: W17/vfree: single successful detach
+  PASS: W17/vfree: controlled exit
+  PASS: W17/vfree: stub page MEM_FREE after retry
+  PASS: W17/vfree: target alive after detach
+== SYM ==
+  PASS: SYM: ambiguity refused
+  FAIL: SYM: bp refused, not pending
+  FAIL: SYM: no pending registered
+  FAIL: SYM: refusal printed once per use (count=3, want 2)
+  PASS: SYM: unambiguous bp hits
+  PASS: SYM: bp removed
+  PASS: SYM: original byte restored
+  PASS: SYM: no exceptions in target
+  PASS: SYM: target completes
+  PASS: SYM: clean exit
+== SYM-2 (cross-command pollution) ==
+  PASS: SYM-2: ambiguous eval refused
+  PASS: SYM-2: module+rva stays pending
+  PASS: SYM-2: unambiguous symbol works
+  FAIL: SYM-2: numeric bp works
+  PASS: SYM-2: no cross-command pollution
+== SYM-1 (pending DLL ambiguous PDB fallback) ==
+  PASS: SYM-1: pending registered
+  PASS: SYM-1: ambiguous bind refused
+  PASS: SYM-1: unambiguous bind success
+  PASS: SYM-1: unambiguous bp hits
+  PASS: SYM-1: ambiguous pending removed after rejection
+  FAIL: SYM-1: target completes
+== ST ==
+  PASS: selftest: rangeInImage
+  PASS: selftest: excpolicy
+  PASS: selftest: symdis
+  PASS: suite: no engine internal error in any scenario
+
+PASS=392 FAIL=9

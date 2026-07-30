@@ -135,17 +135,10 @@ void GleamDebugger::forceBreakIn()
             fflush(stdout);
         }
         // C3-R6: hide on makes DebugBreakProcess unusable (it checks
-        // PEB.BeingDebugged, which hide cleared). Retry with a fresh stub
-        // thread if the first one was cleanly terminated - this covers the
-        // common "ResumeThread failed but TerminateThread succeeded" case.
-        // If both failed, the pause waits for the next natural event.
-        if(terminated && !mBreakInStubThread.load())
-        {
-            printf("event breakin retrying with fresh stub thread\n");
-            fflush(stdout);
-            forceBreakIn();
-        }
-        else if(!mHideOn)
+        // PEB.BeingDebugged, which hide cleared). Use the fallback when hide
+        // is off (normal case); when hide is on, defer to the next natural
+        // event (mWantsPause stays armed).
+        if(!mHideOn)
         {
             fallbackDebugBreak(process);
         }

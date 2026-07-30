@@ -228,8 +228,14 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
     if(cmd == "bp" && args.size() >= 2)
     {
         LogicalBp lb;
-        const bool resolved = parseAddress(args[1], a);
         const bool logical = parseLogicalSpec(args[1], lb);
+        // For logical specs (module!symbol or module+rva), parseAddress is just
+        // a probe to see if it resolves immediately - if it fails but the logical
+        // parse succeeded, suppress the error (it will become a pending bp).
+        const bool resolved = parseAddress(args[1], a);
+        // Check for ambiguous symbol BEFORE proceeding - ambiguous symbols
+        // must NEVER bind (not now, not as pending).
+        const bool ambiguous = !mAddrError.empty() && mAddrError.find("ambiguous") != std::string::npos;
         if(logical && !resolved)
             mAddrError.clear(); // the logical spec succeeded; don't leak the probe's error
         if(!resolved && !logical)
@@ -293,7 +299,7 @@ GleamDebugger::CmdResult GleamDebugger::tryBreakpointCommand(const std::vector<s
             else
                 printf("failed to set breakpoint at 0x%llX\n", a);
         }
-        else if(!mAddrError.empty() && mAddrError.find("ambiguous") != std::string::npos)
+        else if(ambiguous)
         {
             // Ambiguous symbols must NEVER bind: not now, not later. The
             // refusal was already printed by resolveModuleSymbol; do NOT

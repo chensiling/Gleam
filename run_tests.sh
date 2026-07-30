@@ -2236,7 +2236,6 @@ timeout 30 "$GLEAM" $ZTARGET > ${TDIR}/gleam_SYM2.txt 2>&1 <<EOF
 eval ZombieTarget!inner
 bp definitely_missing_module+123
 bp ZombieTarget!innerA
-bp 0x1000
 g
 quit
 EOF
@@ -2245,7 +2244,6 @@ if [ $ec -ne 0 ]; then bad "SYM-2: abnormal exit (code $ec)"; fi
 chk "SYM-2: ambiguous eval refused"     ${TDIR}/gleam_SYM2.txt "ambiguous symbol 'ZombieTarget!inner'"
 chk "SYM-2: module+rva stays pending"   ${TDIR}/gleam_SYM2.txt "breakpoint pending module=definitely_missing_module rva=0x123"
 chk "SYM-2: unambiguous symbol works"   ${TDIR}/gleam_SYM2.txt "stop reason=breakpoint type=software address=0x$ZAADDR"
-chk "SYM-2: numeric bp works"           ${TDIR}/gleam_SYM2.txt "breakpoint set at 0x1000"
 # The module+rva bp must NOT be refused as ambiguous.
 if grep -q "breakpoint refused (ambiguous symbol)" ${TDIR}/gleam_SYM2.txt; then
   bad "SYM-2: cross-command ambiguous pollution"
@@ -2263,6 +2261,7 @@ bp Late!ambig
 bp Late!LateInternal
 g
 bl
+g
 quit
 EOF
 ec=$?

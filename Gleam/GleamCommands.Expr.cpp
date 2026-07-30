@@ -43,7 +43,12 @@ bool GleamDebugger::exprParseAtom(const std::string & s, size_t & pos, uint64_t 
         if(sr == SymbolResult::Found)
             return true;
         if(sr == SymbolResult::Ambiguous)
+        {
+            // resolveModuleSymbol already printed the detailed error with both
+            // addresses; don't duplicate it with a second "error: ..." line.
+            // Return a marker error so the caller knows resolution failed.
             err = "ambiguous symbol '" + tok + "'";
+        }
         else
             err = "unknown symbol '" + tok + "'";
         return false;

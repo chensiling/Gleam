@@ -1057,7 +1057,9 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
         std::string err;
         if(evalExpression(expr, value, err))
             printf("= 0x%llX\n", (unsigned long long)value);
-        else
+        else if(err.find("ambiguous symbol") == std::string::npos)
+            // For ambiguous symbols, resolveModuleSymbol already printed the
+            // detailed error with both addresses - don't print a second line.
             printf("error: %s\n", err.c_str());
         fflush(stdout);
         return CmdResult::Handled;
