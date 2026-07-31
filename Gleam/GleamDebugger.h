@@ -259,6 +259,17 @@ protected:
     void cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread, const GleeBug::Thread & thread) override;
     void cbLoadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll) override;
     void cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll) override;
+    /**
+     * @brief OutputDebugString from the debuggee.
+     *
+     * @warning The text is entirely attacker-controlled. It is emitted escaped
+     *          and quoted (see escapeForLog) so it cannot forge an `event` or
+     *          `stop` line in output that tools parse.
+     * @note The engine has already set DBG_EXCEPTION_NOT_HANDLED before this
+     *       runs (a debug string event IS an exception, and swallowing it is an
+     *       observable anti-debug tell); this callback must not change that.
+     */
+    void cbDebugStringEvent(const OUTPUT_DEBUG_STRING_INFO & debugString) override;
     void cbSystemBreakpoint() override;
     void cbAttachBreakpoint() override;
     void cbBreakpoint(const GleeBug::BreakpointInfo & info) override;
@@ -341,6 +352,19 @@ private:
     /// protection, type and owning module (see GLEAM_ATOMIC_FEATURE_GAPS P1).
     void cmdMemInfo(uint64_t addr);
     void cmdModules();
+
+    /// Print the debuggee's PEB: anti-debug flags, image base, heap, and the
+    /// command line / environment behind ProcessParameters.
+    /// @param showEnvValues Print environment VALUES, not just names. Default
+    ///   off because the environment routinely holds tokens and passwords and
+    ///   this output reaches transcripts and logs; "peb env" opts in.
+    void cmdPeb(bool showEnvValues);
+    /// Print a thread's TEB: stack bounds, ClientId, LastErrorValue, TLS
+    /// pointer. @p tid 0 means the current thread.
+    void cmdTeb(uint32_t tid);
+    /// Print a thread's TLS: the implicit-TLS module array plus the non-zero
+    /// fixed TlsSlots. @p tid 0 means the current thread.
+    void cmdTls(uint32_t tid);
     void cmdFind(uint64_t addr, uint64_t size, const std::string & pattern);
     void cmdFindString(uint64_t addr, uint64_t size, const std::string & text, bool utf16);
     void cmdExceptionInfo();
@@ -361,6 +385,60 @@ private:
         std::string command;             // bp do <command>: run on hit
     };
     std::map<GleeBug::ptr, BpRule> mBpRules;
+
+    /**
+     * @name Breakpoint enable/disable/edit
+     *
+     * A disabled breakpoint is **physically removed**, not merely ignored at
+     * hit time: the int3 byte is restored, a DR slot is handed back, and the
+     * page protection of a memory breakpoint is undone. The alternative
+     * (leave it armed, auto-continue on hit) was rejected - a "disabled"
+     * software breakpoint whose int3 is still in memory still perturbs a
+     * target that checksums its own code, and still pays an exception per hit.
+     *
+     * The cost of that choice is that re-enabling can fail (no free DR slot,
+     * memory since unmapped). That is reported and the entry stays disabled,
+     * which is honest; the entry is never silently dropped.
+     * @{
+     */
+    struct DisabledBp
+    {
+        GleeBug::BreakpointType type = GleeBug::BreakpointType::Software;
+        bool singleshoot = false;
+        BpRule rule;                 ///< Conditions/actions survive the cycle.
+        bool hasRule = false;
+        // Hardware
+        GleeBug::HardwareType hwType = GleeBug::HardwareType::Execute;
+        GleeBug::HardwareSize hwSize = GleeBug::HardwareSize::SizeByte;
+        // Memory
+        GleeBug::MemoryType memType = GleeBug::MemoryType::Access;
+        uint64_t memSize = 0;
+    };
+    /// Address -> how to re-create it. Cleared on restart (the process is new).
+    std::map<GleeBug::ptr, DisabledBp> mDisabledBps;
+    /// Address -> hits observed this session, for `bl`. Counts every hit,
+    /// including those suppressed by a condition, an ignore count or a trace.
+    std::map<GleeBug::ptr, uint64_t> mBpHits;
+
+    void cmdBpDisable(const std::string & spec);
+    void cmdBpEnable(const std::string & spec);
+    void cmdBpEdit(const std::vector<std::string> & args);
+    /// Remove the physical breakpoint at @p addr and record how to restore it.
+    /// @return false when there is no enabled breakpoint there.
+    bool disableBreakpointAt(GleeBug::ptr addr);
+    /// Re-create a previously disabled breakpoint. @return false on failure
+    /// (reported by the callee); the entry stays disabled.
+    bool enableBreakpointAt(GleeBug::ptr addr);
+    /// Drop every per-address side table for @p addr. Must be called by each
+    /// delete path (rbp/hbpd/mbpd): a surviving mDisabledBps record would keep
+    /// `bl` printing a DISABLED line for a breakpoint that no longer exists and
+    /// let a later `bpenable` resurrect it, and a surviving mBpHits entry would
+    /// give the next breakpoint at the same address the dead one's count.
+    /// @return true if a disabled record was removed (the delete succeeded even
+    /// though the engine had no physical breakpoint to remove).
+    bool forgetBreakpointState(GleeBug::ptr addr);
+    /// @}
+
     bool evalBpRule(const GleeBug::BreakpointInfo & info, const BpRule* rule); // true = pause normally
     bool evalCondition(RegId reg, int op, uint64_t value); // current thread registers
     static bool parseCondition(const std::string & text, RegId & reg, int & op, uint64_t & value);
@@ -377,6 +455,16 @@ private:
         BpRule rule;
         GleeBug::ptr boundAddr = 0;  // 0 = pending
         uint64_t boundBase = 0;      // module base this binding belongs to
+        // Disabled by the user. Survives module unload/reload and restart:
+        // otherwise a reload would silently re-arm a breakpoint the user
+        // turned off, which is the one thing "disabled" must never do.
+        bool disabled = false;
+        // Where this entry was bound when it was disabled, so enable can
+        // re-claim it by exact address. Re-resolving the symbol instead would
+        // have to handle ambiguity (and would print while doing it), and an
+        // ambiguous symbol would defeat the re-claim entirely. Per-process, so
+        // resetTransientState clears it while `disabled` (user intent) stays.
+        GleeBug::ptr disabledAddr = 0;
     };
     std::vector<LogicalBp> mLogicalBps;
     // Insert or replace a logical entry with the same spec (dedupe).
@@ -416,6 +504,46 @@ private:
     uint64_t mTraceCount = 0;
     bool mTraceLog = false;
 
+    /**
+     * @name Bounded instruction trace (`stepn`)
+     *
+     * Walks a fixed number of instructions on ONE thread, reporting each
+     * instruction and the registers it changed. Distinct from `tgo`, which runs
+     * until a register condition holds, and from `trace <addr>`, which is a
+     * tracepoint - the three are mutually exclusive operations.
+     *
+     * Each line is emitted **after** the instruction retires, so the register
+     * delta belongs to the instruction printed on that line. That requires
+     * carrying the pre-step rip/text/registers over into the next step event,
+     * which is what the mStepNPending* fields hold.
+     * @{
+     */
+    bool mStepNActive = false;
+    uint64_t mStepNLeft = 0;        ///< Instructions still to execute.
+    uint64_t mStepNDone = 0;        ///< Instructions retired so far.
+    uint32_t mStepNTid = 0;         ///< The one thread this operation steps.
+    bool mStepNQuiet = false;       ///< "quiet": report only the final stop.
+    uint64_t mStepNPendingRip = 0;  ///< rip of the instruction now in flight.
+    std::string mStepNPendingText; ///< ...and its disassembly.
+    /// GPR+EFLAGS snapshot, for the register delta of one instruction.
+    struct RegSnapshot
+    {
+        uint64_t gpr[17] = { 0 }; ///< kStepNRegs order (see Control.cpp).
+        uint32_t eflags = 0;
+        bool valid = false;
+    };
+    RegSnapshot mStepNPendingRegs;
+    /// Capture the current thread's GPRs/EFLAGS, or an invalid snapshot.
+    RegSnapshot captureRegs();
+    /// Print "<rip>  <insn>" plus the registers the instruction changed.
+    void reportStepNLine(const RegSnapshot & before, const RegSnapshot & after);
+    /// Arm the next step, or finish when the budget is spent.
+    void stepNTick();
+    void stepNFinish(const char* reason);
+    /// Cancel an in-flight stepn (pause/exception/teardown/new operation).
+    void abortStepN(const char* why);
+    /// @}
+
     // Control.cpp: stepout ("ret") - a core stepping loop with two special
     // cases (ret / call), no stack analysis at all.
     bool mStepOutActive = false;
@@ -445,6 +573,48 @@ private:
     // Symbols.cpp (dbghelp-backed)
     bool ensureSymSession();
     void closeSymSession();
+
+    /**
+     * @name Symbol control (`sympath` / `symload` / `symreload`)
+     *
+     * The recovery path for when dbghelp's automatic, invade-based load did
+     * not find what is needed - a stripped module, a PDB that lives outside
+     * the default search path, or symbols published after the process started.
+     *
+     * All three drop the symbol cache. A cached `"module!symbol"` address is
+     * an answer from the OLD search configuration; keeping it would make a
+     * reload silently return the pre-reload result, which is the exact
+     * opposite of why it was invoked.
+     * @{
+     */
+    /// Print (no argument) or replace the dbghelp symbol search path.
+    void cmdSymPath(const std::string & path, bool set);
+    /// Load symbols for one module explicitly, from its image on disk.
+    void cmdSymLoad(const std::string & moduleName);
+    /// Reload one module's symbols, or rebuild the whole session.
+    void cmdSymReload(const std::string & moduleName);
+    /// Best-effort image path of a loaded module (event-learned, then loader).
+    bool imagePathOf(uint64_t base, const std::string & normalizedName,
+                     std::wstring & out);
+    /// One line of symbol status for a module: kind, PDB path, symbol count.
+    void printSymbolStatus(uint64_t base);
+    /// @}
+
+    /**
+     * @name Module layout (`moduleinfo` / `sections`)
+     *
+     * Read from the image as currently MAPPED in the debuggee, not from the
+     * file on disk: that is what the process will actually execute, and the
+     * difference is the interesting part for a packed or self-modifying
+     * target. A target can rewrite its own headers, so this reports what is
+     * there rather than asserting it is authentic.
+     * @{
+     */
+    /// Path, size, OEP, directories, TLS callbacks, CFG and symbol status.
+    void cmdModuleInfo(const std::string & moduleName);
+    /// The section table: RVA, virtual/raw size and decoded protection.
+    void cmdSections(const std::string & moduleName);
+    /// @}
     void cmdImports(const std::string & moduleName);
     void cmdExports(const std::string & moduleName, const std::string & filter);
     void cmdSym(uint64_t addr);
@@ -706,6 +876,9 @@ private:
     bool mBreakOnDll = false;
     bool mBreakOnThread = false;
     bool mBreakOnException = true;   ///< Matches the historic default.
+    /// Pause on OutputDebugString. Off by default: the content is always
+    /// logged, and a chatty target would otherwise stop constantly.
+    bool mBreakOnDebugString = false;
     /**
      * @brief One-shot OEP breakpoint address (0 = none).
      * @note Armed lazily by applyEntryBreakpoint(): `breakon entry on` usually

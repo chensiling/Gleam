@@ -1281,6 +1281,35 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
         cmdModules();
         return CmdResult::Handled;
     }
+    if(cmd == "peb" && (args.size() == 1 || (args.size() == 2 && args[1] == "env")))
+    {
+        cmdPeb(args.size() == 2);
+        return CmdResult::Handled;
+    }
+    // "teb"/"tls" take an optional tid. A tid is a plain decimal thread id, not
+    // an address expression, so parse it as such - parseAddress would happily
+    // read "1234" as hex and select the wrong thread.
+    if((cmd == "teb" || cmd == "tls") && args.size() <= 2)
+    {
+        uint32_t tid = 0;
+        if(args.size() == 2)
+        {
+            char* end = nullptr;
+            unsigned long parsed = strtoul(args[1].c_str(), &end, 10);
+            if(!end || *end != '\0' || parsed == 0)
+            {
+                printf("usage: %s [tid]   (decimal thread id, see 'threads')\n", cmd.c_str());
+                fflush(stdout);
+                return CmdResult::Handled;
+            }
+            tid = (uint32_t)parsed;
+        }
+        if(cmd == "teb")
+            cmdTeb(tid);
+        else
+            cmdTls(tid);
+        return CmdResult::Handled;
+    }
     if(cmd == "find" && args.size() >= 4 && parseAddress(args[1], a) && parseHex(args[2], b))
     {
         if(args[3] == "ascii" || args[3] == "utf16")

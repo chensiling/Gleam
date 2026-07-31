@@ -32,6 +32,7 @@
  */
 
 #include "GleamDebugger.h"
+#include "Constants.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -66,6 +67,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             return CmdResult::Handled;
         }
         abortStepOut("until"); // no stepout may survive a new run target
+        abortStepN("until");
         if(!mProcess->SetBreakpoint(a, true))
         {
             printf("failed to set breakpoint at 0x%llX\n", a);
@@ -81,9 +83,53 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         if(!thread)
             return CmdResult::Handled;
         abortStepOut("step"); // execution-control state machines are exclusive
+        abortStepN("step");
         mStepArmed = true;
         thread->StepInto();
         return CmdResult::Resume;
+    }
+
+    if(cmd == "stepn" && args.size() >= 2 && args.size() <= 3)
+    {
+        // stepn <count> [quiet]: execute exactly <count> instructions on the
+        // selected thread, reporting each one and the registers it changed.
+        uint64_t count = 0;
+        bool quiet = false;
+        bool badArgs = !parseHex(args[1], count) || count == 0 ||
+                       count > Gleam::Limits::STEPN_MAX;
+        if(!badArgs && args.size() == 3)
+        {
+            if(args[2] == "quiet")
+                quiet = true;
+            else
+                badArgs = true;
+        }
+        if(badArgs)
+        {
+            printf("usage: stepn <count-hex 1..%llX> [quiet]\n",
+                   (unsigned long long)Gleam::Limits::STEPN_MAX);
+            fflush(stdout);
+            return CmdResult::Handled;
+        }
+        Thread* thread = currentThread();
+        if(!thread)
+            return CmdResult::Handled;
+        // Execution-control state machines are exclusive.
+        abortStepOut("stepn");
+        abortStepN("new stepn");
+        mTraceActive = false;
+        mStepNActive = true;
+        mStepNLeft = count;
+        mStepNDone = 0;
+        mStepNQuiet = quiet;
+        mStepNTid = thread->dwThreadId;
+        printf("stepping %llu instructions on tid=%u\n",
+               (unsigned long long)count, mStepNTid);
+        fflush(stdout);
+        stepNTick();
+        // stepNTick may have refused to arm (unreadable rip): then the stop
+        // was already emitted and the debuggee must stay suspended.
+        return mStepNActive ? CmdResult::Resume : CmdResult::Handled;
     }
 
     if(cmd == "tgo" && args.size() >= 2 && args.size() <= 4)
@@ -120,6 +166,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         if(!thread)
             return CmdResult::Handled;
         abortStepOut("tgo"); // tgo and stepout never run concurrently
+        abortStepN("tgo");
         mTraceActive = true;
         mStepArmed = true;
         thread->StepInto();
@@ -141,6 +188,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         // StepOver falls back to StepInto for non-call instructions; arm both
         // pause paths and let cbStep/cbBreakpoint disambiguate.
         abortStepOut("stepover"); // execution-control state machines are exclusive
+        abortStepN("stepover");
         mStepArmed = true;
         mStepOverArmed = true;
         mProcess->StepOver([this]()
@@ -172,6 +220,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         // breakpoint and both re-arm stages first, or a stale int3 (or a
         // re-arm of the OLD operation) would leak.
         abortStepOut("new ret");
+        abortStepN("ret");
         mStepOutActive = true;
         mStepOutSteps = 0;
         mStepOutMax = 0x40000; // every operation starts from the default
@@ -197,6 +246,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     {
         mQuitting = true;
         abortStepOut("detach");
+        abortStepN("detach");
         // Hasten + confirm what can be confirmed right now (non-blocking;
         // a held debug event freezes the whole process, so anything still
         // unconfirmed afterwards CANNOT finish inside this pause).
@@ -232,6 +282,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
     {
         mQuitting = true;
         abortStepOut("quit"); // one abort entry point for every teardown path
+        abortStepN("quit");
         cleanupBreakInStub();
         Stop();
         return CmdResult::Resume;
@@ -255,6 +306,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
         // An in-flight stepout must not survive into the exit events or the
         // next session: same abort entry point as pause/exception/detach/quit.
         abortStepOut("restart");
+        abortStepN("restart");
         cleanupBreakInStub();
         Stop(); // the exit event ends Start(); main.cpp re-Inits
         return CmdResult::Resume;
@@ -497,6 +549,7 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
             { "dll", &mBreakOnDll },
             { "thread", &mBreakOnThread },
             { "exception", &mBreakOnException },
+            { "debugstring", &mBreakOnDebugString },
         };
         if(args.size() == 1)
         {
@@ -534,10 +587,11 @@ GleamDebugger::CmdResult GleamDebugger::tryControlCommand(const std::vector<std:
                     }
                 }
                 else
-                    printf("usage: breakon <entry|dll|thread|exception> [on|off]\n");
+                    printf("usage: breakon <entry|dll|thread|exception|debugstring> [on|off]\n");
             }
             if(!found)
-                printf("unknown switch '%s' (entry|dll|thread|exception)\n", args[1].c_str());
+                printf("unknown switch '%s' (entry|dll|thread|exception|debugstring)\n",
+                       args[1].c_str());
         }
         fflush(stdout);
         return CmdResult::Handled;
@@ -589,6 +643,139 @@ void GleamDebugger::abortStepOut(const char* why)
     mStepArmed = false;
     mStepOverArmed = false;
     printf("stepout aborted (%s)\n", why);
+    fflush(stdout);
+}
+
+// ---- Bounded instruction trace ("stepn") ----
+//
+// The register delta is what makes this more than a loop around "step": it
+// answers "what did THIS instruction actually do" without a regs dump between
+// every step. Only GPRs and EFLAGS are diffed - they cover the arithmetic and
+// control flow a trace is read for, and XMM/DR noise would bury the signal.
+
+namespace
+{
+    // Diffed registers, in output order. RIP is deliberately absent: it changes
+    // on every instruction, and the line already leads with it.
+    struct StepNReg { const char* name; size_t off; };
+    static const StepNReg kStepNRegs[] = {
+        { "rax", offsetof(CONTEXT, Rax) }, { "rbx", offsetof(CONTEXT, Rbx) },
+        { "rcx", offsetof(CONTEXT, Rcx) }, { "rdx", offsetof(CONTEXT, Rdx) },
+        { "rsi", offsetof(CONTEXT, Rsi) }, { "rdi", offsetof(CONTEXT, Rdi) },
+        { "rbp", offsetof(CONTEXT, Rbp) }, { "rsp", offsetof(CONTEXT, Rsp) },
+        { "r8", offsetof(CONTEXT, R8) },   { "r9", offsetof(CONTEXT, R9) },
+        { "r10", offsetof(CONTEXT, R10) }, { "r11", offsetof(CONTEXT, R11) },
+        { "r12", offsetof(CONTEXT, R12) }, { "r13", offsetof(CONTEXT, R13) },
+        { "r14", offsetof(CONTEXT, R14) }, { "r15", offsetof(CONTEXT, R15) },
+    };
+    const size_t kStepNRegCount = sizeof(kStepNRegs) / sizeof(kStepNRegs[0]);
+}
+
+GleamDebugger::RegSnapshot GleamDebugger::captureRegs()
+{
+    RegSnapshot snap;
+    Thread* thread = currentThread();
+    if(!thread)
+        return snap;
+    Registers r(thread->hThread);
+    const CONTEXT* ctx = r.GetContext();
+    if(!ctx)
+        return snap;
+    for(size_t i = 0; i < kStepNRegCount; i++)
+        snap.gpr[i] = *(const uint64_t*)((const char*)ctx + kStepNRegs[i].off);
+    snap.eflags = ctx->EFlags;
+    snap.valid = true;
+    return snap;
+}
+
+// One trace line: the instruction that just retired, then its register delta.
+// Machine-readable key=value, same shape as the stop records.
+void GleamDebugger::reportStepNLine(const RegSnapshot & before, const RegSnapshot & after)
+{
+    std::string deltas;
+    if(before.valid && after.valid)
+    {
+        for(size_t i = 0; i < kStepNRegCount; i++)
+        {
+            if(before.gpr[i] == after.gpr[i])
+                continue;
+            char one[64];
+            sprintf_s(one, " %s=0x%llX", kStepNRegs[i].name,
+                      (unsigned long long)after.gpr[i]);
+            deltas += one;
+        }
+        if(before.eflags != after.eflags)
+        {
+            char one[32];
+            sprintf_s(one, " eflags=0x%08X", after.eflags);
+            deltas += one;
+        }
+    }
+    printf("stepn %llu rip=0x%llX %s |%s\n",
+           (unsigned long long)mStepNDone,
+           (unsigned long long)mStepNPendingRip,
+           mStepNPendingText.c_str(),
+           deltas.empty() ? " (no gpr change)" : deltas.c_str());
+    fflush(stdout);
+}
+
+void GleamDebugger::stepNFinish(const char* reason)
+{
+    char details[96];
+    sprintf_s(details, "%s steps=%llu", reason, (unsigned long long)mStepNDone);
+    mStepNActive = false;
+    mStepNLeft = 0;
+    mStepNTid = 0;
+    mStepNPendingRip = 0;
+    mStepNPendingText.clear();
+    mStepNPendingRegs = RegSnapshot();
+    mStepArmed = false;
+    emitStop("stepn", details);
+    mWantsPause = true;
+}
+
+// Arm the next instruction, recording what is about to execute so the next
+// step event can attribute its register delta to the right instruction.
+void GleamDebugger::stepNTick()
+{
+    if(mStepNLeft == 0)
+    {
+        stepNFinish("done");
+        return;
+    }
+    Thread* thread = currentThread();
+    if(!thread)
+    {
+        stepNFinish("error");
+        return;
+    }
+    Registers r(thread->hThread);
+    mStepNPendingRip = r.Gip();
+    mStepNPendingText = mStepNQuiet ? std::string() : disasmOne(mStepNPendingRip);
+    mStepNPendingRegs = captureRegs();
+    mStepNLeft--;
+    mStepArmed = true; // the trace owns the step; cbStep must not report it
+    thread->StepInto();
+}
+
+// Cancel an in-flight stepn. No internal breakpoint to clean up (the operation
+// is pure single-stepping), so this is bookkeeping only - but the generic step
+// flags must be cleared, or a step event already in flight would surface as a
+// user-visible "stop reason=step" after the abort.
+void GleamDebugger::abortStepN(const char* why)
+{
+    if(!mStepNActive)
+        return;
+    mStepNActive = false;
+    mStepNLeft = 0;
+    mStepNTid = 0;
+    mStepNPendingRip = 0;
+    mStepNPendingText.clear();
+    mStepNPendingRegs = RegSnapshot();
+    mStepArmed = false;
+    mStepOverArmed = false;
+    printf("stepn aborted (%s) after %llu instructions\n",
+           why, (unsigned long long)mStepNDone);
     fflush(stdout);
 }
 

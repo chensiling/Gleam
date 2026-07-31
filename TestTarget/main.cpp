@@ -4,6 +4,10 @@
 #include <windows.h>
 
 // Known content for the debugger to read back: "GLEAM-TEST-DATA!"
+// Set by the TLS callback below; printed so the suite can prove the callback
+// really ran rather than just being listed in the header.
+static volatile LONG g_tlsRan = 0;
+
 __declspec(align(16)) uint8_t g_data[16] = {
     0x47, 0x4C, 0x45, 0x41, 0x4D, 0x2D, 0x54, 0x45,
     0x53, 0x54, 0x2D, 0x44, 0x41, 0x54, 0x41, 0x21
@@ -12,6 +16,19 @@ __declspec(align(16)) uint8_t g_data[16] = {
 // In "mt" mode the callee of marker() burns cycles ON THE MAIN THREAD ONLY,
 // so the owner's call stays in flight while busyWorker (fast inner) crosses
 // the internal breakpoint address many times.
+// A real TLS callback, so "moduleinfo" has a non-empty callback array to
+// enumerate. TLS callbacks run BEFORE the entry point, which is what makes
+// them worth reporting (initialisation and anti-debug hide there).
+static void NTAPI tlsCallback(PVOID, DWORD reason, PVOID)
+{
+    if(reason == DLL_PROCESS_ATTACH)
+        g_tlsRan = 1;
+}
+#pragma comment(linker, "/INCLUDE:_tls_used")
+#pragma const_seg(".CRT$XLB")
+extern "C" const PIMAGE_TLS_CALLBACK p_gleam_tls_cb = tlsCallback;
+#pragma const_seg()
+
 static bool g_slowInner = false;
 static DWORD g_mainTid = 0;
 static volatile LONG g_gate = 0; // 2 = main is inside its slow inner call
@@ -160,6 +177,67 @@ int main(int argc, char** argv)
         fflush(stdout);
     }
 
+    if(argc > 1 && !strcmp(argv[1], "dbgstr"))
+    {
+        // OutputDebugString events, including a hostile payload: the debuggee
+        // controls this text, so a debugger that prints it raw lets the target
+        // forge event/stop records in output that tools parse. The suite
+        // asserts the escaped form.
+        OutputDebugStringA("GLEAM_DBGSTR_ANSI");
+        OutputDebugStringA("line1\nstop reason=breakpoint address=0xDEADBEEF\ttab\"quote\\slash");
+        OutputDebugStringW(L"GLEAM_DBGSTR_WIDE");
+        // Raise the wide-character variant directly. kernel32's
+        // OutputDebugStringW converts to ANSI first, so this is the only way
+        // to produce an event with fUnicode set.
+        {
+            const wchar_t* msg = L"GLEAM_DBGSTR_RAWWIDE";
+            ULONG_PTR argsW[2] = { (ULONG_PTR)(wcslen(msg) + 1), (ULONG_PTR)msg };
+            __try
+            {
+                RaiseException(0x4001000A /* DBG_PRINTEXCEPTION_WIDE_C */, 0, 2, argsW);
+            }
+            __except(EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        printf("DBGSTR_DONE=1\n");
+        fflush(stdout);
+    }
+
+    if(argc > 1 && !strcmp(argv[1], "child"))
+    {
+        // Spawn a child process, so follow-child can be exercised. The child
+        // is this same exe in a mode that just prints and exits.
+        char self[MAX_PATH] = "";
+        GetModuleFileNameA(nullptr, self, sizeof(self));
+        char cmd[MAX_PATH + 32];
+        sprintf_s(cmd, "\"%s\" childexec", self);
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if(CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
+        {
+            printf("CHILD_PID=%lu\n", pi.dwProcessId);
+            fflush(stdout);
+            WaitForSingleObject(pi.hProcess, 30000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            printf("CHILD_DONE=1\n");
+        }
+        else
+            printf("CHILD_SPAWN_FAILED=%lu\n", GetLastError());
+        fflush(stdout);
+    }
+
+    if(argc > 1 && !strcmp(argv[1], "childexec"))
+    {
+        // The spawned child: announce itself and exit promptly.
+        printf("IAMCHILD=%lu\n", GetCurrentProcessId());
+        fflush(stdout);
+        Sleep(300);
+        return 0;
+    }
+
     if(argc > 1 && !strcmp(argv[1], "av"))
     {
         // Unhandled access violation: first chance, second chance, death.
@@ -248,6 +326,7 @@ int main(int argc, char** argv)
     else
         CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
 
+    printf("TLSRAN=%ld\n", (long)g_tlsRan);
     printf("ISDEBUGGERPRESENT=%d\n", IsDebuggerPresent() ? 1 : 0);
     fflush(stdout);
 

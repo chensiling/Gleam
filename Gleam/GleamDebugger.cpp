@@ -565,6 +565,9 @@ void GleamDebugger::cbExitThreadEvent(const EXIT_THREAD_DEBUG_INFO & exitThread,
     // The thread a stepout operation owns is gone: cancel it.
     if(mStepOutActive && mDebugEvent.dwThreadId == mStepOutTid)
         abortStepOut("thread exit");
+    // Same for a bounded trace: its remaining instructions can never execute.
+    if(mStepNActive && mDebugEvent.dwThreadId == mStepNTid)
+        abortStepN("thread exit");
     if(!mBreakOnThread)
         return;
     char details[64];
@@ -618,6 +621,124 @@ void GleamDebugger::cbUnloadDllEvent(const UNLOAD_DLL_DEBUG_INFO & unloadDll)
     mWantsPause = true;
 }
 
+namespace
+{
+    // Render debuggee-controlled text as a single safe, quoted token.
+    //
+    // This is a trust boundary, not cosmetics: the string comes from the
+    // target, and Gleam's output is parsed by tools (and by the test suite,
+    // which greps for "stop reason=..."). A raw newline plus a crafted prefix
+    // would let a debuggee forge stop records and event lines in the
+    // transcript. Escaping every control character and the quote/backslash
+    // pair keeps the payload on one line and inside its quotes.
+    std::string escapeForLog(const std::vector<char> & raw, size_t & droppedOut)
+    {
+        std::string out;
+        droppedOut = 0;
+        out.reserve(raw.size() + 8);
+        for(char ch : raw)
+        {
+            const unsigned char c = (unsigned char)ch;
+            switch(c)
+            {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if(c < 0x20 || c == 0x7F)
+                {
+                    char hex[8];
+                    sprintf_s(hex, "\\x%02X", c);
+                    out += hex;
+                    droppedOut++;
+                }
+                else
+                    out += (char)c;
+                break;
+            }
+        }
+        return out;
+    }
+}
+
+void GleamDebugger::cbDebugStringEvent(const OUTPUT_DEBUG_STRING_INFO & debugString)
+{
+    const bool unicode = debugString.fUnicode != 0;
+    // nDebugStringLength is a BYTE count for both encodings, despite MSDN
+    // describing it as characters. Verified against a wide event: doubling it
+    // for UTF-16 reads past the string and reports the adjacent heap as text.
+    // The value is target-controlled, so it is clamped before it sizes a read.
+    size_t bytes = debugString.nDebugStringLength;
+    bool truncated = false;
+    if(bytes > Gleam::Limits::DEBUGSTRING_MAX_BYTES)
+    {
+        bytes = Gleam::Limits::DEBUGSTRING_MAX_BYTES;
+        truncated = true;
+    }
+
+    std::vector<char> text;
+    bool readOk = false;
+    if(bytes && mProcess && debugString.lpDebugStringData)
+    {
+        std::vector<char> buf(bytes, 0);
+        GleeBug::ptr got = 0;
+        // Partial reads are usable: report what was readable rather than
+        // discarding the whole message because the tail crosses a bad page.
+        readOk = mProcess->MemReadSafe((GleeBug::ptr)debugString.lpDebugStringData,
+                                       buf.data(), bytes, &got) || got > 0;
+        if(got < bytes)
+        {
+            truncated = truncated || readOk;
+            buf.resize((size_t)got);
+        }
+        if(unicode)
+        {
+            // Convert with the byte count actually read; an odd tail byte is
+            // an incomplete code unit and is dropped.
+            const int wchars = (int)(buf.size() / 2);
+            if(wchars > 0)
+            {
+                int need = WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)buf.data(),
+                                               wchars, nullptr, 0, nullptr, nullptr);
+                if(need > 0)
+                {
+                    text.resize((size_t)need);
+                    WideCharToMultiByte(CP_UTF8, 0, (const wchar_t*)buf.data(), wchars,
+                                        text.data(), need, nullptr, nullptr);
+                }
+            }
+        }
+        else
+            text = buf;
+    }
+    // Drop the trailing NUL(s) the sender counted; they are not content.
+    while(!text.empty() && text.back() == '\0')
+        text.pop_back();
+
+    size_t escapes = 0;
+    const std::string safe = escapeForLog(text, escapes);
+    // encoding= reports what the DEBUGGEE sent, which is the anti-debug
+    // relevant fact: OutputDebugStringW is normally converted to ANSI by
+    // kernel32 before the event is raised, so unicode=1 is itself a signal.
+    Gleam::logEvent("debugstring encoding=%s len=%llu%s%s tid=%u text=\"%s\"",
+           unicode ? "unicode" : "ansi",
+           (unsigned long long)text.size(),
+           truncated ? " truncated=1" : "",
+           readOk || !bytes ? "" : " unreadable=1",
+           mDebugEvent.dwThreadId,
+           safe.c_str());
+
+    if(!mBreakOnDebugString)
+        return;
+    char details[64];
+    sprintf_s(details, "encoding=%s len=%llu", unicode ? "unicode" : "ansi",
+              (unsigned long long)text.size());
+    emitStop("debugstring", details);
+    mWantsPause = true;
+}
+
 // Bind pending module-relative breakpoints whose module just loaded.
 // primaryName: authoritative identity (real path / loader list), possibly
 // empty. The export-directory name is tried only as a non-authoritative
@@ -635,7 +756,9 @@ void GleamDebugger::bindModuleBreakpoints(uint64_t moduleBase, const std::string
     for(size_t i = 0; i < mLogicalBps.size(); )
     {
         auto & lb = mLogicalBps[i];
-        if(lb.boundAddr)
+        // A disabled entry keeps its definition but must not be armed - not on
+        // this load, and not on any reload until the user re-enables it.
+        if(lb.boundAddr || lb.disabled)
         {
             i++;
             continue;
@@ -735,6 +858,21 @@ void GleamDebugger::unbindModuleBreakpoints(uint64_t moduleBase)
         return;
     for(auto & lb : mLogicalBps)
     {
+        // A DISABLED entry has no physical breakpoint to remove, but it does
+        // hold a saved spec keyed by the address inside the module that is
+        // going away. Dropping it here is what stops a later bpenable from
+        // writing an int3 into unmapped memory - or into whatever module
+        // loaded at that address next. The entry itself stays disabled, so a
+        // reload leaves it off, which is what the user asked for.
+        if(lb.disabled && lb.disabledAddr && lb.boundBase == moduleBase)
+        {
+            forgetBreakpointState(lb.disabledAddr);
+            Gleam::logEvent("bp unbound module=%s address=0x%llX (disabled)",
+                            lb.module.c_str(), (unsigned long long)lb.disabledAddr);
+            lb.disabledAddr = 0;
+            lb.boundBase = 0;
+            continue;
+        }
         if(!lb.boundAddr || lb.boundBase != moduleBase)
             continue;
         // The DLL is still mapped while the unload event is delivered, but
@@ -766,7 +904,7 @@ void GleamDebugger::rebindPendingBreakpoints()
     std::vector<uint64_t> bases;
     for(const auto & lb : mLogicalBps)
     {
-        if(lb.boundAddr)
+        if(lb.boundAddr || lb.disabled)
             continue;
         uint64_t base = 0;
         if(moduleBaseByName(lb.module, base))
@@ -792,6 +930,14 @@ void GleamDebugger::resetTransientState()
     mStepArmed = false;
     mStepOverArmed = false;
     mTraceActive = false;
+    mStepNActive = false;
+    mStepNLeft = 0;
+    mStepNDone = 0;
+    mStepNTid = 0;
+    mStepNQuiet = false;
+    mStepNPendingRip = 0;
+    mStepNPendingText.clear();
+    mStepNPendingRegs = RegSnapshot();
     // Every PER-OPERATION stepout field returns to its initial value. The old
     // process is gone, so there is no int3 left to delete - only bookkeeping.
     // mStepOutGen is deliberately NOT reset: it is a monotonic counter, and
@@ -809,6 +955,11 @@ void GleamDebugger::resetTransientState()
     mStepOutRearm = 0;
     mIgnoreHits.clear();
     mBpRules.clear();
+    // Saved specs describe breakpoints in the OLD process; the addresses mean
+    // nothing now. The DISABLED state of a LOGICAL entry is user intent and
+    // survives (below) - only these physical records die with the process.
+    mDisabledBps.clear();
+    mBpHits.clear();
     mPdataCache.clear();
     mSymLoadedBases.clear(); // explicit symbol loads die with the old process
     mModulePaths.clear();    // image paths are per-process-session
@@ -844,11 +995,15 @@ void GleamDebugger::resetTransientState()
         Gleam::logInfo(Gleam::Strings::PATCHES_CLEARED);
         mPatches.clear();
     }
-    // Logical breakpoints survive but must re-bind in the new session.
+    // Logical breakpoints survive but must re-bind in the new session. The
+    // `disabled` flag is user intent and survives; disabledAddr is an address
+    // in the process that just died, so it must not survive - a recycled
+    // address in the new process would otherwise be re-claimed by mistake.
     for(auto & lb : mLogicalBps)
     {
         lb.boundAddr = 0;
         lb.boundBase = 0;
+        lb.disabledAddr = 0;
     }
     // Clear caches on restart (new process)
     clearIltCache();
@@ -948,6 +1103,11 @@ void GleamDebugger::cbBreakpoint(const BreakpointInfo & info)
     if(handleStepOutBreakpoint(info))
         return;
 
+    // Hit accounting for `bl`. Counted before any suppression so the number
+    // means "times execution reached here", not "times we stopped" - the
+    // former is what a condition or ignore count is being tuned against.
+    mBpHits[info.address]++;
+
     // Snapshot per-breakpoint state up front. One-shot hits must not leak
     // rules or ignore counts into a later breakpoint at the same address,
     // regardless of which exit path this callback takes.
@@ -1030,6 +1190,28 @@ void GleamDebugger::cbStep()
     if(mStepOutActive && mDebugEvent.dwThreadId == mStepOutTid)
     {
         stepOutTick();
+        return;
+    }
+
+    // Bounded instruction trace ("stepn"): report the instruction that just
+    // retired together with the registers it changed, then arm the next one.
+    // Only the owning thread advances the operation - a step event from any
+    // other thread is not one of the instructions the user asked to walk.
+    if(mStepNActive && mDebugEvent.dwThreadId == mStepNTid)
+    {
+        mStepNDone++;
+        if(!mStepNQuiet)
+            reportStepNLine(mStepNPendingRegs, captureRegs());
+        // Cancellation: consume a pending pause request here rather than
+        // letting cbPostDebugEvent turn it into a break-in stub injection.
+        // The debuggee is already suspended between steps, so stopping the
+        // walk IS the pause - no remote thread and no int3 page needed.
+        if(mPauseAfterResume.exchange(false))
+        {
+            stepNFinish("cancelled");
+            return;
+        }
+        stepNTick();
         return;
     }
 
@@ -1207,6 +1389,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
         }
         emitStop("pause", nullptr);
         abortStepOut("pause");
+        abortStepN("pause");
         mWantsPause = true;
         return;
     }
@@ -1244,6 +1427,7 @@ void GleamDebugger::cbUnhandledException(const EXCEPTION_RECORD & exceptionRecor
               firstChance ? "first" : "second");
     emitStop("exception", details);
     abortStepOut("exception");
+    abortStepN("exception");
     mPausedOnException = true;
     mWantsPause = true;
 }
@@ -1351,6 +1535,7 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
     {
         mQuitting = true;
         abortStepOut("quit");
+        abortStepN("quit");
         cleanupBreakInStub();
         Stop();
         printf("quitting...\n");
@@ -1360,6 +1545,7 @@ void GleamDebugger::cbPostDebugEvent(const DEBUG_EVENT & debugEvent)
     {
         mQuitting = true;
         abortStepOut("detach");
+        abortStepN("detach");
         cleanupBreakInStub();
         if(mBreakInStubThread.load())
         {

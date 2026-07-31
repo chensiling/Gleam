@@ -307,9 +307,33 @@
 
 **推荐实施顺序对照**：1-6、8 已完成；第 7 项（分析工作区 safe 持久化）未开始——restart 先于工作区落地，目前 restart 状态存活只靠 GleamDebugger 对象不析构，无跨进程持久化。
 
-**P1 高价值辅助原语：0/10，全部未开始**
+**P1 高价值辅助原语：9/10 完成（2026-07-31）**
 
-`meminfo`、`moduleinfo/sections`、`peb/teb/tls`、断点启用/禁用/编辑（方案已在会话中讨论过：软件断点真禁用回写 oldbytes，硬件/内存用禁用集合+自动继续，编辑只改 `mBpRules`）、符号控制（`sympath/symload/symreload`）、`OutputDebugString` 事件（引擎回调 `cbDebugStringEvent` 现成）、子进程跟随（引擎 `Debugger.cpp:42` 强制 `DEBUG_ONLY_THIS_PROCESS`，需改引擎）、有界指令跟踪（`stepn/trace n`，可在 tgo 框架上扩）、段前缀地址表达式（`gs:[expr]`=TEB+expr，`ds/es/ss/cs` 基址 0 剥前缀；改 `exprParseUnary` 一处）、段寄存器读写与打印（`regs`/`setreg` 不含 CS-SS/FS/GS；引擎 R 枚举有段项，TEB 在 `Thread::lpThreadLocalBase`）。
+已完成：`meminfo`、`peb/teb/tls`、段前缀地址表达式、段寄存器打印、`moduleinfo`/`sections`、符号控制（`sympath`/`symload`/`symreload` + 模块符号状态）、`OutputDebugString` 事件、有界指令跟踪（`stepn`）、断点启用/禁用/编辑（`bpdisable`/`bpenable`/`bpedit`）。逐项能力与取舍见缺口文档 P1 表。
+
+**未完成：子进程跟随（1 项）**。唯一需要改引擎的一项，`GleeBug/Debugger.cpp:54` 仍无条件 `DEBUG_ONLY_THIS_PROCESS`。不是加 flag 就行：引擎 `mMainProcess`/`mProcess`/`mThread` 是单进程假设，开启后 `CREATE_PROCESS_DEBUG_EVENT` 会为第二个进程再次触发，命令层"当前进程"语义需重新定义。建议独立评审后单独提交。
+
+**实施中偏离原方案的三处（均为刻意选择，理由已写入缺口文档）**：
+
+1. **断点禁用改为物理移除**，而非本文档原先设想的"硬件/内存用禁用集合+自动继续"。留着 int3 的"禁用"断点对自校验目标仍可见、每次命中仍付异常代价，且不交还稀缺的 DR 槽（套件 P1BPE 用"填满 4 槽→禁用 1 个→第 5 个必须装得下"证明了槽确实交还）。代价是重新启用可能失败，此时如实报告并保持 disabled。
+2. **命名用 `bpdisable`/`bpenable`** 而非 `bpd`/`bpe`：`hbpd`/`mbpd` 已表示硬件/内存断点的**删除**，一个含义相反的三字母近邻是陷阱。
+3. **有界跟踪叫 `stepn`** 而非文档原写的 `trace n`：`trace <addr>` 已是 tracepoint，参数形态会相撞。
+
+**段寄存器"写"以"平台不可实现"关闭**：x64 内核在 `SetThreadContext` 时丢弃用户态线程的段选择子，两个 base 又是派生值。`setreg` 明确报错而非假装成功。原表述中"读写"的写一半不是待办。
+
+**自查中发现并修掉的四处状态漂移（`mDisabledBps` 按地址存，`LogicalBp.disabled/disabledAddr` 按条目存，同一事实两份记录会走散）**：
+
+1. **删除路径不清理禁用记录**。`rbp`/`hbpd`/`mbpd` 在引擎断点表里找不到已禁用的断点，于是报「删除失败」并留下保存的规格：`bl` 出现一条只有 restart 才能清掉的幽灵 DISABLED 行，随后一次 `bpenable` 会**复活用户已删除的断点**。新增 `forgetBreakpointState()` 统一丢弃 `mDisabledBps`/`mBpRules`/`mIgnoreHits`/`mBpHits` 四张按地址索引的侧表，三条删除路径都经由它，删除已禁用断点也如实报成功。
+2. **命中计数不随断点消亡**。`mBpHits` 按地址索引且从不在删除时清除，于是在同一地址新建的断点会继承死断点的计数。同上由 `forgetBreakpointState()` 覆盖。
+3. **模块卸载漏掉已禁用条目**。`unbindModuleBreakpoints` 只扫 `boundAddr`，而禁用条目把地址停在 `disabledAddr`，导致保存的规格比模块活得更久——之后 `bpenable` 会把 int3 写进已解除映射的内存，或写进恰好加载到该地址的另一个模块。为此 `disableBreakpointAt` 刻意**保留 `boundBase`**（这是停放条目回到其模块的唯一线索）。逻辑条目的 disabled 状态作为用户意图保留，重载后仍关闭。
+4. **`bpedit` 污染同伴条目**。原判据 `lb.disabled && !physical` 命中列表里**每一个**已禁用逻辑条目，于是编辑一个会改写其余所有条目的规则。改为按地址精确匹配 `lb.disabledAddr == addr`。该污染只在**重新绑定**应用 `lb.rule` 时才显形，故套件用 `restart` 作观测点（restart 清空保存规格但保留逻辑条目及其规则）。
+
+四条都不会被原有断言发现：它们要么让删除少做事，要么让编辑多做事，输出看起来都正常。套件新增 P1BPG/P1BPH/P1BPI/P1BPJ 四个场景专门盯这四条。
+
+**顺带修掉的两处套件缺陷（都属于"悄悄放水"而不是"报错"，比一条挂掉的断言危险）**：
+
+1. **`gleam_drive.py` 的 `RESUME` 集合漏了新命令**。凡是返回 `CmdResult::Resume` 的命令都必须登记，否则驱动不武装暂停闸门，**下一条**命令会在目标仍在跑时被推入并由 `pushCommand` 防线 #1 静默丢弃——命令凭空消失且不报错。`stepn` 正是如此：紧跟其后的 `bl` 完全没有输出，而当时没有断言覆盖它，于是"通过"了。反过来，参数被拒的命令返回 `Handled` 却同样武装了闸门，白等一整个 `--pause-wait`（默认 20s），故参数拒绝类用例单独开会话并传 `-p 2`。
+2. **套件启动时必须清空 `${TDIR}/gleam_*.txt`**。结尾的内部错误扫描按该模式 glob，而 S1 只在失败迭代写 `gleam_S1_fail_<i>.txt` 且无人清理——一次失败的运行会让之后每次运行都因同样的陈旧文件而变红。本次就有 5 个上午留下的残留被读成新的 break-in stub 回归，而 S1 实际 25/25 通过。
 
 **MCP 前置条件：未开始**。当前命令输出是"统一 key=value 风格"但不是结构化协议：无稳定错误码、无分页、无会话状态字段。这是 M3 前必须做的一轮统一。
 

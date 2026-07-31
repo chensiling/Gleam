@@ -51,7 +51,7 @@ RETRIES = 40      # first-command retries before giving up on a batch
 # must end at one of these: anything after it is dropped by Defense #2.
 RESUME = {
     "g", "continue", "until", "step", "tgo", "stepover", "next",
-    "ret", "stepout", "restart", "quit", "detach",
+    "ret", "stepout", "stepn", "restart", "quit", "detach",
 }
 
 # Handled by the REPL thread without touching the command queue, so they are

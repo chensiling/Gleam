@@ -67,6 +67,34 @@ namespace Limits {
      * while still showing that work is happening.
      */
     constexpr int RESOLVE_RETRY_LOG_INTERVAL = 32;
+
+    /**
+     * @brief Upper bound on a single "stepn" request.
+     *
+     * Every instruction costs one debug event plus one line of output, so a
+     * mistyped count is a denial of service against the operator's terminal
+     * rather than a useful request. `tgo` is the tool for long runs.
+     */
+    constexpr uint64_t STEPN_MAX = 0x10000;
+
+    /**
+     * @brief Cap on the bytes read for one OutputDebugString event.
+     *
+     * nDebugStringLength is supplied by the debuggee, so it sizes a read of
+     * debuggee-controlled length. 32 KiB is far above any real diagnostic
+     * message and keeps a hostile length field from turning every event into
+     * a huge allocation plus escape pass.
+     */
+    constexpr size_t DEBUGSTRING_MAX_BYTES = 32 * 1024;
+
+    /**
+     * @brief Cap on the TLS callback array walk in "moduleinfo".
+     *
+     * The array is NUL-terminated in a well-formed image, but the terminator
+     * lives in target memory: a corrupt or deliberately hostile image must not
+     * be able to spin the walk. Real images have single digits of callbacks.
+     */
+    constexpr uint32_t TLS_CALLBACK_MAX = 64;
 }
 
 /**

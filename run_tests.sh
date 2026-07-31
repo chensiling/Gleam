@@ -15,6 +15,13 @@ ATARGET=${ATARGET:-bin/Debug/x64/ArgvTarget.exe}
 BTARGET=${BTARGET:-bin/Debug/x64/BoundaryTarget.exe}
 TDIR=${TDIR:-/tmp}
 mkdir -p "$TDIR"
+# Stale artifacts must not leak into this run. The suite-wide internal-error
+# sweep at the end globs ${TDIR}/gleam_*.txt, and S1 writes
+# gleam_S1_fail_<i>.txt only when an iteration fails - nothing ever removes it.
+# So one failing run would keep every later run red for the same five files,
+# long after the cause was fixed. Clearing the suite's own namespace first is
+# what makes the sweep report THIS run.
+rm -f "${TDIR}"/gleam_*.txt
 
 # gleam <timeout-sec> <gleam-args...> < commands
 #
@@ -86,6 +93,10 @@ chkre() { # chkre <desc> <file> <regex>
 }
 chkcount() { # chkcount <desc> <file> <pattern> <expected-count>
   local n=$(grep -cF "$3" "$2")
+  if [ "$n" -eq "$4" ]; then ok "$1"; else bad "$1 (count=$n, want $4)"; fi
+}
+chkcountre() { # chkcountre <desc> <file> <regex> <expected-count>
+  local n=$(grep -cE "$3" "$2")
   if [ "$n" -eq "$4" ]; then ok "$1"; else bad "$1 (count=$n, want $4)"; fi
 }
 
@@ -164,6 +175,71 @@ chk   "A2: kernel addr fails"  ${TDIR}/gleam_A2.txt "VirtualQueryEx failed for 0
 # that protectText(0) yields would be a wrong answer rather than no answer.
 chk   "A2: no bogus protect"   ${TDIR}/gleam_A2.txt "protect  rw-"
 if grep -q 'protect  ???' ${TDIR}/gleam_A2.txt; then bad "A2: printed ??? protection"; else ok "A2: no ??? protection"; fi
+
+# --- A3: peb / teb / tls ---
+# Offsets are hand-coded, so every one is checked against a source that does
+# NOT share its code path: ClientId against the loader's pid and the event tid,
+# TEB.PEB against "eval gs:[60]" (the expression evaluator), the TEB base
+# against regs' GSBASE (segmentBase), and RSP against the stack bounds.
+run A3 "" <<EOF
+bp $MARKER
+g
+peb
+teb
+tls
+eval gs:[60]
+regs
+teb 999999
+tls 999999
+g
+g
+EOF
+A3PID=$(sed -n 's/^event process op=create pid=\([0-9]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+A3TID=$(sed -n 's/^TEB *[0-9A-F]*  (thread \([0-9]*\)).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+chk   "A3: peb located"        ${TDIR}/gleam_A3.txt "BeingDebugged        1"
+# The loader reported this base on the "event process op=create" line.
+A3BASE=$(sed -n 's/^event process op=create.*base=0x0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+chkre "A3: peb ImageBase=loader base" ${TDIR}/gleam_A3.txt "ImageBaseAddress *0*$A3BASE"
+chk   "A3: peb has cmdline"    ${TDIR}/gleam_A3.txt "CommandLine"
+chkre "A3: peb env counted"    ${TDIR}/gleam_A3.txt "[0-9]+ environment variable"
+# Secrets must not leak by default: values are opt-in via "peb env".
+chk   "A3: env names only"     ${TDIR}/gleam_A3.txt "names only, use 'peb env' for values"
+if grep -qE '^    [A-Za-z_][A-Za-z0-9_]*=' ${TDIR}/gleam_A3.txt; then
+  bad "A3: plain 'peb' printed environment VALUES (secret leak)"
+else
+  ok "A3: plain 'peb' printed no env values"
+fi
+chkre "A3: teb ClientId pid"   ${TDIR}/gleam_A3.txt "ClientId *pid=$A3PID tid=$A3TID"
+chk   "A3: teb no self warning" ${TDIR}/gleam_A3.txt "LastErrorValue"
+if grep -q 'NtTib.Self' ${TDIR}/gleam_A3.txt; then bad "A3: TEB self-ref mismatch"; else ok "A3: TEB self-ref consistent"; fi
+# TEB.PEB (this feature) must equal gs:[60] (the expression evaluator).
+A3TEBPEB=$(sed -n 's/^  PEB *0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+A3GSPEB=$(sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | tail -1)
+if [ -n "$A3TEBPEB" ] && [ "$A3TEBPEB" = "$A3GSPEB" ]; then
+  ok "A3: teb PEB == gs:[60]"
+else
+  bad "A3: teb PEB=$A3TEBPEB != gs:[60]=$A3GSPEB"
+fi
+# TEB base (this feature) must equal GSBASE (segmentBase).
+A3TEB=$(sed -n 's/^TEB *0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+A3GSBASE=$(sed -n 's/.*GSBASE=0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+if [ -n "$A3TEB" ] && [ "$A3TEB" = "$A3GSBASE" ]; then
+  ok "A3: TEB base == GSBASE"
+else
+  bad "A3: TEB=$A3TEB != GSBASE=$A3GSBASE"
+fi
+# RSP must lie inside [StackLimit, StackBase).
+A3SB=$(sed -n 's/^  StackBase *0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+A3SL=$(sed -n 's/^  StackLimit *0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+A3RSP=$(sed -n 's/.*RSP=0*\([0-9A-F]*\).*/\1/p' ${TDIR}/gleam_A3.txt | head -1)
+if [ -n "$A3SB" ] && [ -n "$A3RSP" ] && [ $((0x$A3RSP)) -ge $((0x$A3SL)) ] && [ $((0x$A3RSP)) -lt $((0x$A3SB)) ]; then
+  ok "A3: rsp within stack bounds"
+else
+  bad "A3: rsp=$A3RSP outside [$A3SL,$A3SB)"
+fi
+chkre "A3: tls slot summary"    ${TDIR}/gleam_A3.txt "[0-9]+ of 64 fixed slot"
+chk   "A3: teb bad tid refused" ${TDIR}/gleam_A3.txt "no such thread: 999999"
+chkcount "A3: both bad tids refused" ${TDIR}/gleam_A3.txt "no such thread: 999999" 2
 
 # --- B: one-shot breakpoint ---
 run B "" <<EOF
@@ -2356,6 +2432,360 @@ EOF
 chk "selftest: rangeInImage"     ${TDIR}/gleam_ST.txt "selftest rangeInImage 12/12 ok"
 chk "selftest: excpolicy"        ${TDIR}/gleam_ST.txt "selftest excpolicy 16/16 ok"
 chk "selftest: symdis"           ${TDIR}/gleam_ST.txt "selftest symdis 4/4 ok"
+
+# --- P1-BP: breakpoint enable/disable/edit ---
+# A disabled breakpoint is PHYSICALLY removed, so the proof it worked is
+# behavioural: marker() is called twice, and a breakpoint disabled at the first
+# hit must not stop the second one. Asserting on "bl" alone would pass even if
+# the int3 were still in memory.
+run P1BPA "" <<EOF
+bp $MARKER
+g
+bl
+bpdisable $MARKER
+bl
+g
+EOF
+chk "P1-BP: bl shows enabled + hits"  ${TDIR}/gleam_P1BPA.txt "0x$MARKER  software int3             enabled hits=1"
+chk "P1-BP: bl shows DISABLED"        ${TDIR}/gleam_P1BPA.txt "0x$MARKER  software int3             DISABLED hits=1"
+chkcount "P1-BP: disabled bp does not fire again" ${TDIR}/gleam_P1BPA.txt "stop reason=breakpoint" 1
+chk "P1-BP: target ran past 2nd call" ${TDIR}/gleam_P1BPA.txt "MARKER_RESULT_2="
+
+# Re-enable must restore the breakpoint AND consume the saved record: a stale
+# record would make "bl" list the same address twice, once enabled once
+# DISABLED. Re-arming at the current rip re-hits immediately (documented engine
+# behaviour), so >=2 stops is the expectation.
+run P1BPB "" <<EOF
+bp $MARKER
+g
+bpdisable $MARKER
+bpenable $MARKER
+bl
+g
+g
+quit
+EOF
+chk "P1-BP: enable reports success"   ${TDIR}/gleam_P1BPB.txt "breakpoint enabled at 0x$MARKER"
+chkcount "P1-BP: no stale DISABLED record after enable" ${TDIR}/gleam_P1BPB.txt "DISABLED" 0
+if [ "$(grep -c 'stop reason=breakpoint' ${TDIR}/gleam_P1BPB.txt)" -ge 2 ]; then
+  ok "P1-BP: re-enabled bp fires again"
+else
+  bad "P1-BP: re-enabled bp fires again"
+fi
+
+# The logical (module!symbol) form must round-trip by NAME: the logical entry
+# and the physical breakpoint have to stay in step, or "bl" reports a bound
+# breakpoint as DISABLED and a reload unbinds nothing.
+run P1BPC "" <<EOF
+bp TestTarget!marker
+bpdisable TestTarget!marker
+bl
+bpenable TestTarget!marker
+bl
+g
+quit
+EOF
+chk "P1-BP: logical entry shows DISABLED"  ${TDIR}/gleam_P1BPC.txt "logical module=testtarget symbol=marker DISABLED"
+# Re-enable by NAME must leave the logical entry bound again. Asserted on the
+# second "bl" rather than on cmdBpEnable's own line: "TestTarget!marker"
+# parses as an address, so enable legitimately reports the address form. What
+# matters is that exactly one listing says DISABLED (the first) and exactly one
+# says bound (the second) - a stale record would show both at once.
+chkcount "P1-BP: logical entry re-claimed"  ${TDIR}/gleam_P1BPC.txt "logical module=testtarget symbol=marker bound=0x" 1
+chkcount "P1-BP: no duplicate logical entry" ${TDIR}/gleam_P1BPC.txt "logical module=testtarget symbol=marker DISABLED" 1
+chk "P1-BP: logical bp fires after enable" ${TDIR}/gleam_P1BPC.txt "stop reason=breakpoint type=software"
+
+# Disabling a PENDING logical entry must survive the module load: silently
+# re-arming a breakpoint the user turned off is the one thing disable may
+# never do.
+run P1BPD "dll" <<EOF
+bp version!GetFileVersionInfoSizeW
+bpdisable version!GetFileVersionInfoSizeW
+bl
+g
+EOF
+chk "P1-BP: pending entry disabled"        ${TDIR}/gleam_P1BPD.txt "logical module=version symbol=GetFileVersionInfoSizeW DISABLED"
+chk "P1-BP: the dll really did load"       ${TDIR}/gleam_P1BPD.txt "DLL_LOADED=1"
+chkcount "P1-BP: disabled pending never binds" ${TDIR}/gleam_P1BPD.txt "bp bound module=version" 0
+chkcount "P1-BP: disabled pending never fires" ${TDIR}/gleam_P1BPD.txt "stop reason=breakpoint" 0
+
+# Hardware breakpoints: disable must hand the DR slot BACK. Fill all four,
+# disable one, and a fifth must then fit - the check that distinguishes
+# physical removal from "armed but ignored".
+run P1BPE "" <<EOF
+hbp $GDATA w 1
+hbp $GD2 w 1
+hbp $GD4 w 1
+hbp $GD6 w 1
+hbp $GD8 w 1
+bpdisable $GDATA
+hbp $GD8 w 1
+bpenable $GDATA
+bl
+g
+EOF
+chk "P1-BP: 4 slots exhausted"        ${TDIR}/gleam_P1BPE.txt "no free hardware breakpoint slot (4 max)"
+chk "P1-BP: disable frees a dr slot"  ${TDIR}/gleam_P1BPE.txt "hardware breakpoint set at 0x$GD8"
+# All four are in use again by the time bpenable runs, so it must refuse
+# clearly and leave the entry disabled rather than dropping it.
+chk "P1-BP: re-enable refuses cleanly" ${TDIR}/gleam_P1BPE.txt "cannot re-enable 0x$GDATA: no free hardware breakpoint slot (4 max)"
+
+# bpedit is INCREMENTAL: adding a trace must keep an existing condition, and
+# "bl" must report both (evalBpRule tests the condition before the trace, so
+# hiding it would misreport what happens at the hit).
+run P1BPF "" <<EOF
+bp $MARKER if rcx==29
+bpedit $MARKER trace on
+bl
+bpedit $MARKER ifclear
+bl
+g
+EOF
+chk "P1-BP: bpedit keeps the condition" ${TDIR}/gleam_P1BPF.txt "enabled cond(op0) trace"
+chk "P1-BP: bpedit reports both"        ${TDIR}/gleam_P1BPF.txt "bpedit 0x$MARKER cond=set trace=on"
+chk "P1-BP: ifclear drops the cond"     ${TDIR}/gleam_P1BPF.txt "bpedit 0x$MARKER cond=none trace=on"
+
+# Deleting a DISABLED breakpoint must really delete it. The saved spec lives
+# outside the engine's table, so rbp/hbpd/mbpd find nothing to remove and would
+# report failure while leaving the record behind - after which "bl" prints a
+# phantom DISABLED line and "bpenable" RESURRECTS a breakpoint the user
+# deleted. Also covers the hit count: it is keyed by address, so a fresh
+# breakpoint at a reused address must not inherit the dead one's count.
+run P1BPG "" <<EOF
+bp $MARKER
+g
+bl
+bpdisable $MARKER
+rbp $MARKER
+bl
+bpenable $MARKER
+bp $MARKER
+bl
+g
+quit
+EOF
+chk "P1-BP: delete of a disabled bp succeeds" ${TDIR}/gleam_P1BPG.txt "breakpoint removed at 0x$MARKER"
+chkcount "P1-BP: no phantom DISABLED after delete" ${TDIR}/gleam_P1BPG.txt "DISABLED" 0
+chk "P1-BP: deleted bp cannot be resurrected"  ${TDIR}/gleam_P1BPG.txt "no disabled breakpoint at 0x$MARKER"
+# Exactly once: the first bl (positive control, proves the count is recorded at
+# all), and NOT in the third bl - the re-added breakpoint is a new one and must
+# not inherit the dead breakpoint's count. Asserting only absence would pass if
+# hits were never counted anywhere.
+chkcount "P1-BP: hit count dies with the bp"   ${TDIR}/gleam_P1BPG.txt "hits=" 1
+chk "P1-BP: re-added bp is listed enabled"     ${TDIR}/gleam_P1BPG.txt "0x$MARKER  software int3             enabled"
+
+# Same defect on the hardware path, where the saved spec also holds a DR slot's
+# worth of state.
+run P1BPH "" <<EOF
+hbp $GDATA w 1
+bpdisable $GDATA
+hbpd $GDATA
+bl
+bpenable $GDATA
+g
+quit
+EOF
+chk "P1-BP: hbpd removes a disabled hw bp"  ${TDIR}/gleam_P1BPH.txt "hardware breakpoint removed at 0x$GDATA"
+chkcount "P1-BP: no phantom hw DISABLED"    ${TDIR}/gleam_P1BPH.txt "DISABLED" 0
+chk "P1-BP: deleted hw bp not resurrected"  ${TDIR}/gleam_P1BPH.txt "no disabled breakpoint at 0x$GDATA"
+
+# A DISABLED entry parks its address in disabledAddr, so unbindModuleBreakpoints
+# (which scans boundAddr) used to skip it: the saved spec outlived the module
+# and a later bpenable would write an int3 into whatever occupied that address
+# next. dll3 loads Late.dll, frees it, and loads it again.
+# dll3 falls through to marker(), which is the observation point: it gives a
+# pause AFTER all the load/unload/reload churn, without breakon dll (which would
+# stop on every DLL the process touches).
+run P1BPI "dll3" <<EOF
+bp Late!LateInternal
+bp $MARKER
+g
+bpdisable Late!LateInternal
+g
+bl
+g
+g
+quit
+EOF
+chk "P1-BP: disabled entry unbound on unload" ${TDIR}/gleam_P1BPI.txt "event bp unbound module=late address=0x"
+chk "P1-BP: unbind names it as disabled"      ${TDIR}/gleam_P1BPI.txt "(disabled)"
+chk "P1-BP: the unload really happened"       ${TDIR}/gleam_P1BPI.txt "LATE_UNLOADED=1"
+chk "P1-BP: target reached the reload"        ${TDIR}/gleam_P1BPI.txt "LATE2=1"
+# The saved physical spec must be gone: it described an address inside a module
+# that no longer exists. Matched on the listing's own DISABLED column so the
+# marker breakpoint (also "software int3", but enabled) cannot satisfy it.
+chkcountre "P1-BP: saved spec did not outlive the module" ${TDIR}/gleam_P1BPI.txt "^0x[0-9A-F]+  software int3 +DISABLED" 0
+# User intent survives the reload: bound once (first load) and never re-armed.
+chk "P1-BP: logical entry still disabled"     ${TDIR}/gleam_P1BPI.txt "logical module=late symbol=LateInternal DISABLED"
+chkcount "P1-BP: reload does not re-arm it"   ${TDIR}/gleam_P1BPI.txt "event bp bound module=late" 1
+
+# bpedit on a DISABLED breakpoint must touch only that entry's rule. The
+# contamination is invisible until a RE-BIND applies lb.rule, so restart is the
+# observation point: it clears the saved specs but keeps the logical entries and
+# their rules, and "bpenable all" then re-binds them from lb.rule alone.
+# Two entries, one edited - the other must come back with no rule.
+run P1BPJ "" <<EOF
+bp TestTarget!marker
+bp TestTarget!looper
+bpdisable TestTarget!marker
+bpdisable TestTarget!looper
+bpedit $MBODY trace on
+restart
+bpenable all
+bl
+g
+g
+g
+quit
+EOF
+chk "P1-BP: restart kept both entries off" ${TDIR}/gleam_P1BPJ.txt "enabled 0 breakpoint(s) (pending logical entries re-armed)"
+chk "P1-BP: edited entry re-binds traced"  ${TDIR}/gleam_P1BPJ.txt "0x$MBODY  software int3             enabled trace"
+# Anchored on "enabled" as the end of line: an unanchored match would also be
+# satisfied by the traced line above.
+chkcountre "P1-BP: sibling entry has no rule" ${TDIR}/gleam_P1BPJ.txt "^0x$LADDR  software int3 +enabled\$" 1
+chkcountre "P1-BP: exactly one traced entry"  ${TDIR}/gleam_P1BPJ.txt "^0x[0-9A-F]+  software int3 +enabled trace\$" 1
+
+# --- P1-SYM: sympath / symload / symreload ---
+# symload must be idempotent: dbghelp refuses to load over a module the
+# invaded session already knows, returning 0 with ERROR_SUCCESS. Treating that
+# as failure would break symload on exactly the modules most worth naming.
+run P1SYM "" <<EOF
+sympath
+symload TestTarget
+symreload TestTarget
+eval TestTarget!marker
+symreload
+eval TestTarget!marker
+symload nosuchmodule
+g
+EOF
+chk "P1-SYM: sympath reports a path"   ${TDIR}/gleam_P1SYM.txt "sympath "
+chk "P1-SYM: symload succeeds"         ${TDIR}/gleam_P1SYM.txt "symload base=0x140000000 TestTarget"
+chk "P1-SYM: symbol status is pdb"     ${TDIR}/gleam_P1SYM.txt "symbols: pdb"
+chk "P1-SYM: pdb path reported"        ${TDIR}/gleam_P1SYM.txt "TestTarget.pdb"
+chk "P1-SYM: whole-session rebuild"    ${TDIR}/gleam_P1SYM.txt "symreload: symbol session rebuilt"
+chkcount "P1-SYM: symbol resolves before AND after reload" ${TDIR}/gleam_P1SYM.txt "= 0x$MBODY" 2
+chk "P1-SYM: unknown module refused"   ${TDIR}/gleam_P1SYM.txt "module not found"
+
+# --- P1-MOD: moduleinfo / sections ---
+# TLS callbacks are the reason moduleinfo exists for TLS at all: they run
+# BEFORE the entry point. TestTarget registers one, and TLSRAN proves it ran
+# rather than merely being listed in the header.
+run P1MOD "" <<EOF
+moduleinfo TestTarget
+sections TestTarget
+moduleinfo nosuchmodule
+g
+EOF
+chk "P1-MOD: base and size"        ${TDIR}/gleam_P1MOD.txt "moduleinfo base=0x140000000"
+chk "P1-MOD: image path"           ${TDIR}/gleam_P1MOD.txt "TestTarget.exe"
+chk "P1-MOD: machine x64"          ${TDIR}/gleam_P1MOD.txt "machine: x64 (0x8664)"
+chk "P1-MOD: oep reported"         ${TDIR}/gleam_P1MOD.txt "oep: 0x$OEP"
+chk "P1-MOD: not relocated"        ${TDIR}/gleam_P1MOD.txt "relocated: no"
+chk "P1-MOD: pdata directory"      ${TDIR}/gleam_P1MOD.txt "exception(.pdata): 0x"
+chk "P1-MOD: load-config present"  ${TDIR}/gleam_P1MOD.txt "load-config: 0x"
+chk "P1-MOD: security cookie"      ${TDIR}/gleam_P1MOD.txt "security-cookie: 0x"
+chk "P1-MOD: tls directory"        ${TDIR}/gleam_P1MOD.txt "tls: 0x"
+chk "P1-MOD: tls callback symbolized" ${TDIR}/gleam_P1MOD.txt "callback[0]: 0x"
+chk "P1-MOD: tls callback count"   ${TDIR}/gleam_P1MOD.txt "callbacks: 1"
+chk "P1-MOD: tls callback really ran" ${TDIR}/gleam_P1MOD.txt "TLSRAN=1"
+chk "P1-MOD: sections listed"      ${TDIR}/gleam_P1MOD.txt "sections base=0x140000000"
+chk "P1-MOD: .text is r-x"         ${TDIR}/gleam_P1MOD.txt ".text    0x0000000140071000"
+chk "P1-MOD: unknown module"       ${TDIR}/gleam_P1MOD.txt "module not found"
+
+# --- P1-STEPN: bounded instruction trace ---
+# stepn walks a fixed number of instructions on one thread and attributes each
+# register delta to the instruction that produced it. The first line at MARKER
+# is the ILT thunk's jmp, which changes no GPR - that is the "no gpr change"
+# case, and it must be reported rather than omitted.
+run P1STEPN "" <<EOF
+bp $MARKER
+g
+stepn 5
+bl
+g
+g
+quit
+EOF
+chk "P1-STEPN: announces the walk"   ${TDIR}/gleam_P1STEPN.txt "stepping 5 instructions on tid="
+# Exactly 5 numbered trace lines. Anchored and digit-qualified on purpose: a
+# plain "stepn " search also matches the usage line printed by "stepn 0" and
+# the "stop reason=stepn done" record, which is what made this assertion pass
+# for the wrong reason.
+chkcountre "P1-STEPN: 5 numbered trace lines" ${TDIR}/gleam_P1STEPN.txt "^stepn [0-9]+ rip=0x" 5
+chkcount "P1-STEPN: one done record" ${TDIR}/gleam_P1STEPN.txt "stop reason=stepn done" 1
+chk "P1-STEPN: numbered from 1"      ${TDIR}/gleam_P1STEPN.txt "stepn 1 rip=0x$MARKER jmp "
+chk "P1-STEPN: last line is 5"       ${TDIR}/gleam_P1STEPN.txt "stepn 5 rip=0x"
+chk "P1-STEPN: reports no-change"    ${TDIR}/gleam_P1STEPN.txt "(no gpr change)"
+chk "P1-STEPN: reports a delta"      ${TDIR}/gleam_P1STEPN.txt "| rsp=0x"
+chk "P1-STEPN: stop record"          ${TDIR}/gleam_P1STEPN.txt "stop reason=stepn done steps=5"
+# "bl" must be answered while the walk is parked. It arrives on the queue only
+# because the driver treats stepn as a resuming command; when it did not, the
+# command was pushed while the debuggee still stepped and silently discarded.
+chk "P1-STEPN: bl answered after the walk" ${TDIR}/gleam_P1STEPN.txt "0x$MARKER  software int3             enabled hits=1"
+
+# Bad counts are rejected rather than silently treated as "step forever". Kept
+# in a separate session: a refused stepn returns Handled, not Resume, so the
+# driver's pause gate would wait out its full timeout before the next command.
+#
+# Driven directly rather than through run(): a refused stepn still arms the
+# driver's pause gate, so each one after the first would wait out the default
+# 20s pause-wait and blow the session budget. -p 2 keeps three refusals cheap.
+echo "== P1STEPNB =="
+"$PY" "$DRIVE" -t 30 -p 2 -- "$GLEAM" $TARGET > ${TDIR}/gleam_P1STEPNB.txt 2>&1 <<EOF
+stepn 0
+stepn 10001
+stepn 5 loud
+quit
+EOF
+check_ec P1STEPNB $? ${TDIR}/gleam_P1STEPNB.txt
+chk "P1-STEPN: over-cap rejected"    ${TDIR}/gleam_P1STEPNB.txt "usage: stepn <count-hex 1..10000> [quiet]"
+chkcount "P1-STEPN: three refusals, no walk" ${TDIR}/gleam_P1STEPNB.txt "usage: stepn" 3
+chkcount "P1-STEPN: nothing stepped" ${TDIR}/gleam_P1STEPNB.txt "stepping " 0
+chk "P1-STEPN: zero count rejected"  ${TDIR}/gleam_P1STEPNB.txt "usage: stepn <count-hex 1..10000> [quiet]"
+
+# --- P1-DBGSTR: OutputDebugString ---
+# The text is attacker-controlled and Gleam's output is machine-parsed, so the
+# payload embeds a newline plus a forged "stop reason=" record. It must appear
+# escaped, inside quotes, on ONE line - and must not be counted as a real stop.
+# Each ANSI string is delivered TWICE by the OS (the engine passes
+# DBG_EXCEPTION_NOT_HANDLED, which is a deliberate anti-anti-debug choice), and
+# OutputDebugStringW yields one unicode plus two ansi events. Enough continues
+# to drain them all, or the target never reaches DBGSTR_DONE.
+run P1DBG "dbgstr" <<EOF
+breakon debugstring on
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+g
+EOF
+chk "P1-DBGSTR: ansi event"          ${TDIR}/gleam_P1DBG.txt 'event debugstring encoding=ansi len=17 tid='
+chk "P1-DBGSTR: ansi text"           ${TDIR}/gleam_P1DBG.txt 'text="GLEAM_DBGSTR_ANSI"'
+chk "P1-DBGSTR: unicode decoded"     ${TDIR}/gleam_P1DBG.txt 'encoding=unicode len=17'
+chk "P1-DBGSTR: wide text intact"    ${TDIR}/gleam_P1DBG.txt 'text="GLEAM_DBGSTR_WIDE"'
+chk "P1-DBGSTR: raw wide decoded"    ${TDIR}/gleam_P1DBG.txt 'text="GLEAM_DBGSTR_RAWWIDE"'
+chk "P1-DBGSTR: stops on debugstring" ${TDIR}/gleam_P1DBG.txt "stop reason=debugstring encoding=ansi"
+# The forged record must be escaped: newline as \n, quote as \", inside quotes.
+chk "P1-DBGSTR: payload escaped on one line" ${TDIR}/gleam_P1DBG.txt 'text="line1\nstop reason=breakpoint address=0xDEADBEEF\ttab\"quote\\slash"'
+# ...and must NOT have produced a LINE that parses as a breakpoint stop.
+# Anchored deliberately: the forged text is still present as a substring (the
+# escaping preserves content, it does not censor it), so an unanchored search
+# would always match. What the escaping guarantees is that it can never START
+# a line, which is what a line-oriented parser keys on.
+if grep -qE '^stop reason=breakpoint address=0xDEADBEEF' ${TDIR}/gleam_P1DBG.txt; then
+  bad "P1-DBGSTR: forged stop record was emitted as a real record"
+else
+  ok "P1-DBGSTR: forged stop record cannot start a line"
+fi
+chk "P1-DBGSTR: target completes"    ${TDIR}/gleam_P1DBG.txt "DBGSTR_DONE=1"
 
 # --- suite-wide: no engine internal error in ANY scenario ---
 # cbInternalError is the engine's only channel for "a Windows API we depend on

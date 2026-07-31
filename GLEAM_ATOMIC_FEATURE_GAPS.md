@@ -36,18 +36,20 @@ Gleam 已覆盖启动/附加、执行控制、三类断点、基本寄存器与�
 
 ## P1：高价值辅助原语
 
-| 原子功能 | 最小能力与用途 |
-|---|---|
-| `meminfo <addr>` | 返回 allocation base、region size、state、保护属性、类型和所属模块，避免调用方从完整 `maps` 中自行匹配。 |
-| `moduleinfo/sections` | 返回完整路径、映像大小、OEP、节区、TLS callbacks、异常目录 `.pdata` 和 Load Config/CFG；为入口断点、TLS 分析和栈展开提供基础数据。 |
-| `peb`、`teb [tid]`、`tls [tid]` | 暴露进程/线程环境、TLS、LastError/LastStatus 和反调试相关状态；GleeBug 已保存线程 TEB 基址，但 Gleam 尚未提供查询命令。 |
-| 断点启用/禁用/编辑 | 支持 enable、disable、修改条件/动作、命中计数和逻辑断点状态，不再依赖删除后重建。 |
-| 段前缀地址表达式 | `gs:[expr]`（x64 用户态 = TEB 基址，引擎 `Thread::lpThreadLocalBase` 现成，典型如 `gs:[60]` 取 PEB）、`fs:[expr]`（x64 基址为 0，预留）、`ds:/es:/ss:/cs:[expr]`（平坦模型基址 0，剥掉前缀即可）。当前 `eval gs:[60]` 报 `unknown name 'gs:'`，`ds:[rcx+30]` 同样无法解析。改动集中在 `exprParseUnary` 一处。 |
-| 段寄存器读写与打印 | `regs` 不显示 CS/SS/DS/ES/FS/GS（及 FS/GS base），`setreg` 不支持段寄存器。引擎 `Registers::R` 枚举含段寄存器项（GS/FS/ES/DS/CS/SS），TEB 基址在 `Thread::lpThreadLocalBase`。与上一条配合后可完整回答"指令里段寄存器操作数到底是多少"。 |
-| 符号控制 | 支持 `sympath`、`symload`、`symreload` 和模块符号状态，使 DbgHelp 自动加载失败后可以恢复。 |
-| `OutputDebugString` 事件 | GleeBug 已提供回调；Gleam 应支持记录内容、按需暂停和明确区分 ANSI/Unicode。 |
-| 子进程跟随 | GleeBug 当前强制 `DEBUG_ONLY_THIS_PROCESS`：[Debugger.cpp:42](GleeBug/Debugger.cpp#L42)。应提供可选 follow-child，并在输出中携带 PID，支持启动器、壳和 dropper 场景。 |
-| 有界指令跟踪 | 在现有 `tgo` 上提供 `stepn/trace n`，输出 RIP、指令及寄存器变化，支持上限和取消；不扩展为 TTD。 |
+进度：9/10 完成（截至 2026-07-31）。仅「子进程跟随」未做，它是唯一需要改引擎的一项，见下表备注。
+
+| 原子功能 | 状态 | 最小能力与用途 |
+|---|---|---|
+| `meminfo <addr>` | ✅ | 返回 allocation base、region size、state、保护属性、类型和所属模块，避免调用方从完整 `maps` 中自行匹配。 |
+| `moduleinfo/sections` | ✅ | 返回完整路径、映像大小、OEP、节区、TLS callbacks、异常目录 `.pdata` 和 Load Config/CFG；为入口断点、TLS 分析和栈展开提供基础数据。读的是**当前映射**的镜像而非磁盘文件，因此对加壳/自改码目标反映的是真正会执行的内容；同时给出 `relocated`/slide，便于判断保存的绝对地址是否已失效。 |
+| `peb`、`teb [tid]`、`tls [tid]` | ✅ | 暴露进程/线程环境、TLS、LastError/LastStatus 和反调试相关状态；GleeBug 已保存线程 TEB 基址，但 Gleam 尚未提供查询命令。 |
+| 断点启用/禁用/编辑 | ✅ | `bpdisable`/`bpenable`/`bpedit`，接受地址、`module!symbol`、`module+rva` 或 `all`；`bl` 显示启用状态与命中计数。**禁用是物理移除**（还原 int3、交还 DR 槽、撤销页保护），不是「留着但命中时忽略」——后者对自校验目标仍然可见，且每次命中仍付一次异常代价。代价是重新启用可能失败（无空闲 DR 槽等），此时如实报告原因并保持 disabled，绝不静默丢弃。命中计数在任何抑制（条件/ignore/trace）**之前**累加，因此含义是「执行到达过几次」，而不是「停下来几次」——这才是调条件时要看的数。**删除即彻底删除**：`rbp`/`hbpd`/`mbpd` 一并丢弃保存的禁用记录、命中计数和条件——禁用记录活在引擎断点表之外，不这样做则删除会「失败」并留下一条 `bl` 里的幽灵 DISABLED 行，随后一次 `bpenable` 会**复活用户已删除的断点**；同理模块卸载会丢弃该模块内已禁用断点的记录（否则重新启用会把 int3 写进已解除映射、或写进恰好加载到该地址的另一个模块），但逻辑条目的 disabled 状态作为用户意图保留，重载后仍是关闭的。 |
+| 段前缀地址表达式 | ✅ | `gs:[expr]`（x64 用户态 = TEB 基址，引擎 `Thread::lpThreadLocalBase` 现成，典型如 `gs:[60]` 取 PEB）、`fs:[expr]`（x64 基址为 0，预留）、`ds:/es:/ss:/cs:[expr]`（平坦模型基址 0，剥掉前缀即可）。实现在 `GleamCommands.Expr.cpp` 的 `exprParseUnary`。 |
+| 段寄存器打印（写：平台不可实现） | ✅ | `regs` 显示 CS/SS/DS/ES/FS/GS 以及 FSBASE/GSBASE。**写入是被主动拒绝的，不是待办**：x64 内核在 `SetThreadContext` 时丢弃用户态线程的段选择子字段（写后立即 `GetThreadContext` 读回仍是旧值，中间没有 resume），而两个 base 不在 `CONTEXT` 里、是派生值（GS base = TEB，FS base = 0）。`setreg` 对这两类分别给出明确错误而不是假装成功。原表述「段寄存器读写」中「写」的那一半在此平台上无法实现，故本项以读+打印关闭。 |
+| 符号控制 | ✅ | `sympath`（读/设）、`symload <module>`、`symreload [module]`，外加 `moduleinfo` 中的模块符号状态（`symbols: pdb/export-only/none`、PDB 路径、GUID+age、`unmatched`）。三者都会清空符号缓存——缓存里的 `module!symbol` 是**旧**搜索配置下的答案，留着会让 reload 静默返回 reload 前的结果，正好与调用它的目的相反。`symload` 先无条件 unload 再 load：dbghelp 拒绝在已知模块上重复加载（返回 0 且 `GetLastError()==ERROR_SUCCESS`），不这样做会恰好在最值得指名的模块上失败。 |
+| `OutputDebugString` 事件 | ✅ | 记录内容、区分 ANSI/Unicode、`breakon debugstring` 按需暂停（默认关，内容始终记录）。**内容完全由被调试进程控制**，因此转义后加引号输出：换行/制表/引号/反斜杠转义、其余控制字符转 `\xNN`，使目标无法伪造 `event` 或 `stop` 行去骗过解析工具（套件里有一条专门的载荷断言）。注意 `nDebugStringLength` 实测是**字节数**而非 MSDN 所述的字符数，按字符理解会读出越界堆内容。另：ANSI 字符串会被 OS 投递**两次**（引擎刻意返回 `DBG_EXCEPTION_NOT_HANDLED`，属反反调试既定取舍），`OutputDebugStringW` 会产生一个 unicode 加两个 ansi 事件——如实报告，不去重。 |
+| 子进程跟随 | ❌ **未做** | GleeBug 当前强制 `DEBUG_ONLY_THIS_PROCESS`：[Debugger.cpp:54](GleeBug/Debugger.cpp#L54)。应提供可选 follow-child，并在输出中携带 PID，支持启动器、壳和 dropper 场景。**不是加个 flag 就行**：引擎的 `mMainProcess`/`mProcess`/`mThread` 建立在单进程假设上，开启子进程事件后 `CREATE_PROCESS_DEBUG_EVENT` 会为第二个进程再次触发，命令层「当前进程/当前线程」的语义也需要重新定义（选择哪个进程、`bl` 显示谁的断点）。建议独立评审后单独提交。 |
+| 有界指令跟踪 | ✅ | `stepn <count-hex> [quiet]`：走 n 条指令，逐条输出 RIP、指令和**寄存器变化**（GPR+EFLAGS 差分；XMM/DR 噪声会淹没信号故不含）。每行在指令**退休后**输出，delta 归属于该行的指令。上限 `STEPN_MAX`=0x10000；取消由单步循环内直接消费 pause 请求实现，比注入 break-in stub 干净（步间目标本已暂停，停止行走本身就是暂停）。**未沿用表中的 `trace n` 命名**：`trace <addr>` 已是 tracepoint，参数形态会相撞。 |
 
 ## P2：竞品调研补充层
 
@@ -245,6 +247,6 @@ argv、环境变量和命令历史可能包含密钥或隐私数据，应支持�
 6. 完整线程上下文。
 7. 本地分析工作区的 `safe` 持久化。
 8. 会话重启，并与工作区恢复策略集成。
-9. P1 辅助原语。
+9. ~~P1 辅助原语~~ —— 9/10 完成（2026-07-31），仅剩子进程跟随（需先评审引擎多进程模型）。
 10. 统一结构化结果后进入 MCP 封装。
 11. P2 按 T0→T3 推进：差量扫描 → 通配断点 → maps 分类/字符串扫描 → appcall → 内存快照 → wt 跟踪统计（前三个是性价比之王，可插队在 MCP 封装前；T2/T3 按实际需求）。

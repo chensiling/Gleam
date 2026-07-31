@@ -81,6 +81,7 @@
     <ClCompile Include="GleamCommands.Breakpoints.cpp" />
     <ClCompile Include="GleamCommands.Inspect.cpp" />
     <ClCompile Include="GleamCommands.Control.cpp" />
+    <ClCompile Include="GleamCommands.Env.cpp" />
     <ClCompile Include="GleamCommands.Expr.cpp" />
     <ClCompile Include="GleamCommands.Symbols.cpp" />
     <ClCompile Include="GleamCommands.Hide.cpp" />

@@ -44,6 +44,7 @@
 #include "RaiiUtils.h"
 #include "Performance.h"
 #include "PerfMonitor.h"
+#include "Constants.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -284,6 +285,22 @@ namespace
         IMAGE_DATA_DIRECTORY exceptionDir{};
         IMAGE_DATA_DIRECTORY exportDir{};
         IMAGE_DATA_DIRECTORY debugDir{};
+        // Added for "moduleinfo": TLS analysis, CFG inspection and the
+        // header facts needed to tell a relocated image from a fixed one.
+        IMAGE_DATA_DIRECTORY tlsDir{};
+        IMAGE_DATA_DIRECTORY loadConfigDir{};
+        IMAGE_DATA_DIRECTORY relocDir{};
+        uint16_t machine = 0;
+        uint16_t characteristics = 0;
+        uint16_t subsystem = 0;
+        uint16_t dllCharacteristics = 0;
+        uint16_t sectionCount = 0;
+        uint32_t timeDateStamp = 0;
+        uint32_t sizeOfHeaders = 0;
+        uint32_t sectionAlignment = 0;
+        uint64_t preferredBase = 0;
+        // Where the section table starts, so callers do not re-derive it.
+        uint64_t sectionTableVa = 0;
     };
 
     PeInfo readPeDirectories(Process* process, uint64_t base)
@@ -302,6 +319,13 @@ namespace
         uint64_t optAddr = base + dos.e_lfanew + sizeof(signature) + sizeof(fileHeader);
         if(!readAt(process, optAddr, magic))
             return info;
+        info.machine = fileHeader.Machine;
+        info.characteristics = fileHeader.Characteristics;
+        info.sectionCount = fileHeader.NumberOfSections;
+        info.timeDateStamp = fileHeader.TimeDateStamp;
+        // The section table follows the optional header, whose real length is
+        // SizeOfOptionalHeader - never sizeof() of our own struct.
+        info.sectionTableVa = optAddr + fileHeader.SizeOfOptionalHeader;
         if(magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
         {
             IMAGE_OPTIONAL_HEADER64 opt;
@@ -315,6 +339,14 @@ namespace
             info.exceptionDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
             info.exportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
             info.debugDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+            info.tlsDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+            info.loadConfigDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+            info.relocDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+            info.subsystem = opt.Subsystem;
+            info.dllCharacteristics = opt.DllCharacteristics;
+            info.sizeOfHeaders = opt.SizeOfHeaders;
+            info.sectionAlignment = opt.SectionAlignment;
+            info.preferredBase = opt.ImageBase;
         }
         else if(magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
         {
@@ -329,6 +361,14 @@ namespace
             info.exceptionDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
             info.exportDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
             info.debugDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+            info.tlsDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+            info.loadConfigDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+            info.relocDir = opt.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+            info.subsystem = opt.Subsystem;
+            info.dllCharacteristics = opt.DllCharacteristics;
+            info.sizeOfHeaders = opt.SizeOfHeaders;
+            info.sectionAlignment = opt.SectionAlignment;
+            info.preferredBase = opt.ImageBase;
         }
         else
             return info;
@@ -689,6 +729,579 @@ void GleamDebugger::closeSymSession()
         SymCleanup(mProcess->hProcess);
         mSymInitialized = false;
     }
+}
+
+// ---- Module layout (P1: moduleinfo / sections) ----
+
+namespace
+{
+    const char* machineText(uint16_t m)
+    {
+        switch(m)
+        {
+        case IMAGE_FILE_MACHINE_AMD64: return "x64";
+        case IMAGE_FILE_MACHINE_I386:  return "x86";
+        case IMAGE_FILE_MACHINE_ARM64: return "arm64";
+        case IMAGE_FILE_MACHINE_ARMNT: return "arm";
+        default: return "unknown";
+        }
+    }
+
+    const char* subsystemText(uint16_t s)
+    {
+        switch(s)
+        {
+        case IMAGE_SUBSYSTEM_WINDOWS_GUI: return "gui";
+        case IMAGE_SUBSYSTEM_WINDOWS_CUI: return "console";
+        case IMAGE_SUBSYSTEM_NATIVE:      return "native";
+        default: return "other";
+        }
+    }
+
+    // The DllCharacteristics bits a reverse engineer acts on: they decide
+    // whether addresses are stable (ASLR), whether the stack is executable
+    // (DEP) and whether indirect calls are checked (CFG).
+    std::string dllCharsText(uint16_t c)
+    {
+        struct Bit { uint16_t mask; const char* name; };
+        static const Bit bits[] = {
+            { IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE, "DYNAMIC_BASE" },
+            { IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY, "FORCE_INTEGRITY" },
+            { IMAGE_DLLCHARACTERISTICS_NX_COMPAT, "NX_COMPAT" },
+            { IMAGE_DLLCHARACTERISTICS_NO_ISOLATION, "NO_ISOLATION" },
+            { IMAGE_DLLCHARACTERISTICS_NO_SEH, "NO_SEH" },
+            { IMAGE_DLLCHARACTERISTICS_NO_BIND, "NO_BIND" },
+            { IMAGE_DLLCHARACTERISTICS_APPCONTAINER, "APPCONTAINER" },
+            { IMAGE_DLLCHARACTERISTICS_WDM_DRIVER, "WDM_DRIVER" },
+            { IMAGE_DLLCHARACTERISTICS_GUARD_CF, "GUARD_CF" },
+            { IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE, "TS_AWARE" },
+            { 0x0040 /* HIGH_ENTROPY_VA */, "HIGH_ENTROPY_VA" },
+        };
+        std::string out;
+        for(const auto & b : bits)
+        {
+            if(!(c & b.mask))
+                continue;
+            if(!out.empty())
+                out += ' ';
+            out += b.name;
+        }
+        return out;
+    }
+
+    // "rwx"-style protection from the section characteristics.
+    std::string sectionProt(uint32_t c)
+    {
+        std::string s;
+        s += (c & IMAGE_SCN_MEM_READ) ? 'r' : '-';
+        s += (c & IMAGE_SCN_MEM_WRITE) ? 'w' : '-';
+        s += (c & IMAGE_SCN_MEM_EXECUTE) ? 'x' : '-';
+        if(c & IMAGE_SCN_MEM_SHARED)
+            s += 's';
+        return s;
+    }
+
+    // Read the section table of a mapped image. Bounded by the header size so
+    // a bogus NumberOfSections cannot drive an unbounded read.
+    bool readSections(Process* process, uint64_t base, const PeInfo & pe,
+                      std::vector<IMAGE_SECTION_HEADER> & out)
+    {
+        if(!pe.valid || !pe.sectionCount || pe.sectionCount > 96)
+            return false;
+        const uint64_t tableEnd = pe.sectionTableVa - base +
+                                  (uint64_t)pe.sectionCount * sizeof(IMAGE_SECTION_HEADER);
+        // The whole table must live inside the mapped headers.
+        if(pe.sizeOfHeaders && tableEnd > pe.sizeOfHeaders)
+            return false;
+        out.resize(pe.sectionCount);
+        return process->MemReadSafe(pe.sectionTableVa, out.data(),
+                                    out.size() * sizeof(IMAGE_SECTION_HEADER));
+    }
+
+    // Section names are 8 bytes and NOT necessarily NUL-terminated.
+    std::string sectionName(const IMAGE_SECTION_HEADER & s)
+    {
+        char buf[9] = "";
+        memcpy(buf, s.Name, 8);
+        buf[8] = '\0';
+        return buf;
+    }
+}
+
+void GleamDebugger::cmdSections(const std::string & moduleName)
+{
+    ModuleInfo mod;
+    if(!findModule(mProcess->hProcess, moduleName, mod))
+    {
+        printf("module not found: %s\n", moduleName.c_str());
+        fflush(stdout);
+        return;
+    }
+    auto pe = readPeDirectories(mProcess, mod.base);
+    std::vector<IMAGE_SECTION_HEADER> secs;
+    if(!readSections(mProcess, mod.base, pe, secs))
+    {
+        printf("cannot read the section table of %s\n", moduleName.c_str());
+        fflush(stdout);
+        return;
+    }
+    printf("sections base=0x%llX count=%zu\n", (unsigned long long)mod.base, secs.size());
+    printf("  %-8s %-18s %-10s %-10s %-4s %s\n",
+           "name", "address", "vsize", "rawsize", "prot", "characteristics");
+    for(const auto & s : secs)
+    {
+        printf("  %-8s 0x%016llX 0x%08lX 0x%08lX %-4s 0x%08lX\n",
+               sectionName(s).c_str(),
+               (unsigned long long)(mod.base + s.VirtualAddress),
+               (unsigned long)s.Misc.VirtualSize,
+               (unsigned long)s.SizeOfRawData,
+               sectionProt(s.Characteristics).c_str(),
+               (unsigned long)s.Characteristics);
+    }
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdModuleInfo(const std::string & moduleName)
+{
+    ModuleInfo mod;
+    if(!findModule(mProcess->hProcess, moduleName, mod))
+    {
+        printf("module not found: %s\n", moduleName.c_str());
+        fflush(stdout);
+        return;
+    }
+    const std::string norm = normalizeModuleName(mod.name.empty() ? moduleName : mod.name);
+    printf("moduleinfo base=0x%llX size=0x%lX\n",
+           (unsigned long long)mod.base, (unsigned long)mod.size);
+    std::wstring path;
+    if(imagePathOf(mod.base, norm, path))
+    {
+        char narrow[MAX_PATH * 2] = "";
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, narrow, sizeof(narrow), nullptr, nullptr);
+        printf("  path: %s\n", narrow);
+    }
+    else
+        printf("  path: (unknown)\n");
+
+    auto pe = readPeDirectories(mProcess, mod.base);
+    if(!pe.valid)
+    {
+        printf("  headers: unreadable or not a PE image\n");
+        printSymbolStatus(mod.base);
+        fflush(stdout);
+        return;
+    }
+    printf("  machine: %s (0x%04X)  subsystem: %s  timestamp: 0x%08lX\n",
+           machineText(pe.machine), pe.machine, subsystemText(pe.subsystem),
+           (unsigned long)pe.timeDateStamp);
+    // A relocated image is the reason a saved absolute address goes stale, so
+    // state the delta rather than leaving it to be computed.
+    const int64_t slide = (int64_t)(mod.base - pe.preferredBase);
+    printf("  preferred-base: 0x%llX  relocated: %s",
+           (unsigned long long)pe.preferredBase, slide ? "yes" : "no");
+    if(slide)
+        printf(" (slide %s0x%llX)", slide < 0 ? "-" : "+",
+               (unsigned long long)(slide < 0 ? -slide : slide));
+    printf("\n");
+    printf("  image-size: 0x%lX  sections: %u  section-alignment: 0x%lX\n",
+           (unsigned long)pe.sizeOfImage, pe.sectionCount,
+           (unsigned long)pe.sectionAlignment);
+    // OEP: the entry-breakpoint target. An RVA of 0 means "no entry point",
+    // which is legal for a resource-only DLL - do not print a bogus address.
+    if(pe.entryPointRva)
+        printf("  oep: 0x%llX (rva 0x%lX)\n",
+               (unsigned long long)(mod.base + pe.entryPointRva),
+               (unsigned long)pe.entryPointRva);
+    else
+        printf("  oep: none (rva 0)\n");
+    const std::string chars = dllCharsText(pe.dllCharacteristics);
+    printf("  dll-characteristics: 0x%04X%s%s\n", pe.dllCharacteristics,
+           chars.empty() ? "" : " ", chars.c_str());
+
+    // Exception directory: the .pdata unwind records "frames" walks.
+    if(pe.exceptionDir.VirtualAddress && pe.exceptionDir.Size)
+        printf("  exception(.pdata): 0x%llX size=0x%lX entries=%lu\n",
+               (unsigned long long)(mod.base + pe.exceptionDir.VirtualAddress),
+               (unsigned long)pe.exceptionDir.Size,
+               (unsigned long)(pe.exceptionDir.Size / sizeof(RUNTIME_FUNCTION)));
+    else
+        printf("  exception(.pdata): none (leaf-only or non-x64 unwind)\n");
+    if(pe.relocDir.VirtualAddress && pe.relocDir.Size)
+        printf("  relocations: 0x%llX size=0x%lX\n",
+               (unsigned long long)(mod.base + pe.relocDir.VirtualAddress),
+               (unsigned long)pe.relocDir.Size);
+
+    // TLS: the callbacks run before the entry point, so they are where
+    // initialisation (and anti-debug) hides.
+    if(pe.tlsDir.VirtualAddress && pe.tlsDir.Size &&
+       rangeInImage(pe.tlsDir.VirtualAddress, pe.tlsDir.Size, pe.sizeOfImage))
+    {
+        printf("  tls: 0x%llX size=0x%lX\n",
+               (unsigned long long)(mod.base + pe.tlsDir.VirtualAddress),
+               (unsigned long)pe.tlsDir.Size);
+        // AddressOfCallBacks is a VA, already relocated by the loader in the
+        // mapped copy, pointing at a NULL-terminated array of VAs.
+        uint64_t callbackArray = 0, indexVa = 0;
+        bool haveDir = false;
+        if(pe.pe64)
+        {
+            IMAGE_TLS_DIRECTORY64 tls{};
+            if(readAt(mProcess, mod.base + pe.tlsDir.VirtualAddress, tls))
+            {
+                callbackArray = tls.AddressOfCallBacks;
+                indexVa = tls.AddressOfIndex;
+                haveDir = true;
+                printf("    raw-data: 0x%llX..0x%llX  zero-fill: 0x%lX\n",
+                       (unsigned long long)tls.StartAddressOfRawData,
+                       (unsigned long long)tls.EndAddressOfRawData,
+                       (unsigned long)tls.SizeOfZeroFill);
+            }
+        }
+        else
+        {
+            IMAGE_TLS_DIRECTORY32 tls{};
+            if(readAt(mProcess, mod.base + pe.tlsDir.VirtualAddress, tls))
+            {
+                callbackArray = tls.AddressOfCallBacks;
+                indexVa = tls.AddressOfIndex;
+                haveDir = true;
+            }
+        }
+        if(haveDir)
+        {
+            printf("    index-at: 0x%llX\n", (unsigned long long)indexVa);
+            if(!callbackArray)
+                printf("    callbacks: none\n");
+            else
+            {
+                // Bounded walk: the array is NUL-terminated, but a corrupt or
+                // hostile image must not spin here.
+                uint32_t n = 0;
+                bool readFailed = false;
+                for(; n < Gleam::Limits::TLS_CALLBACK_MAX; n++)
+                {
+                    uint64_t cb = 0;
+                    if(pe.pe64)
+                    {
+                        if(!readAt(mProcess, callbackArray + n * 8, cb))
+                        {
+                            readFailed = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        uint32_t cb32 = 0;
+                        if(!readAt(mProcess, callbackArray + n * 4, cb32))
+                        {
+                            readFailed = true;
+                            break;
+                        }
+                        cb = cb32;
+                    }
+                    if(!cb)
+                        break;
+                    std::string sym = symNameByAddr(cb);
+                    printf("    callback[%u]: 0x%llX%s%s\n", n, (unsigned long long)cb,
+                           sym.empty() ? "" : " ", sym.c_str());
+                }
+                if(readFailed)
+                    printf("    callbacks: truncated (array at 0x%llX unreadable at index %u)\n",
+                           (unsigned long long)callbackArray, n);
+                else if(n == 0)
+                    printf("    callbacks: none (empty array)\n");
+                else
+                    printf("    callbacks: %u\n", n);
+            }
+        }
+    }
+    else
+        printf("  tls: none\n");
+
+    // Load Config / CFG. The directory Size field decides which fields exist:
+    // the struct grew across SDK versions, so anything beyond the declared
+    // size is not present in THIS image and must not be read as if it were.
+    if(pe.loadConfigDir.VirtualAddress && pe.loadConfigDir.Size &&
+       rangeInImage(pe.loadConfigDir.VirtualAddress, pe.loadConfigDir.Size, pe.sizeOfImage))
+    {
+        printf("  load-config: 0x%llX size=0x%lX\n",
+               (unsigned long long)(mod.base + pe.loadConfigDir.VirtualAddress),
+               (unsigned long)pe.loadConfigDir.Size);
+        if(pe.pe64)
+        {
+            IMAGE_LOAD_CONFIG_DIRECTORY64 lc{};
+            const size_t want = (std::min)((size_t)pe.loadConfigDir.Size, sizeof(lc));
+            if(mProcess->MemReadSafe(mod.base + pe.loadConfigDir.VirtualAddress, &lc, want))
+            {
+                // Offset of the last byte each field needs, compared against
+                // the size the image actually declares.
+                const uint32_t declared = pe.loadConfigDir.Size;
+                auto has = [declared](size_t endOffset) { return declared >= endOffset; };
+                if(has(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) + 8) &&
+                   lc.SecurityCookie)
+                    printf("    security-cookie: 0x%llX\n",
+                           (unsigned long long)lc.SecurityCookie);
+                if(has(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SEHandlerTable) + 8) &&
+                   lc.SEHandlerTable)
+                    printf("    safeseh-table: 0x%llX count=%llu\n",
+                           (unsigned long long)lc.SEHandlerTable,
+                           (unsigned long long)lc.SEHandlerCount);
+                if(has(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardCFCheckFunctionPointer) + 8) &&
+                   lc.GuardCFCheckFunctionPointer)
+                    printf("    guard-check-fptr: 0x%llX\n",
+                           (unsigned long long)lc.GuardCFCheckFunctionPointer);
+                if(has(offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, GuardFlags) + 4))
+                    printf("    guard-cf-table: 0x%llX count=%llu flags=0x%08lX\n",
+                           (unsigned long long)lc.GuardCFFunctionTable,
+                           (unsigned long long)lc.GuardCFFunctionCount,
+                           (unsigned long)lc.GuardFlags);
+            }
+            else
+                printf("    (unreadable)\n");
+        }
+    }
+    else
+        printf("  load-config: none\n");
+
+    printSymbolStatus(mod.base);
+    fflush(stdout);
+}
+
+// ---- Symbol control (P1: sympath / symload / symreload) ----
+
+// Image path of a loaded module. The path learned from the DLL load event's
+// file handle is preferred over the loader list: it is the authoritative
+// identity (see cbLoadDllEvent), and it is available for modules whose loader
+// record is not linked yet.
+bool GleamDebugger::imagePathOf(uint64_t base, const std::string & normalizedName,
+                                std::wstring & out)
+{
+    if(!normalizedName.empty())
+    {
+        auto found = mModulePaths.find(normalizedName);
+        if(found != mModulePaths.end() && !found->second.empty())
+        {
+            out = found->second;
+            return true;
+        }
+    }
+    if(!mProcess)
+        return false;
+    wchar_t wpath[MAX_PATH * 2] = L"";
+    if(GetModuleFileNameExW(mProcess->hProcess, (HMODULE)base, wpath, ARRAYSIZE(wpath)) && *wpath)
+    {
+        out = wpath;
+        return true;
+    }
+    return false;
+}
+
+// Report what dbghelp actually has for a module. SymType is the answer to
+// "why does module!symbol not resolve": SymPdb/SymDia mean real symbols,
+// SymExport means dbghelp fell back to the export table (function names only,
+// no statics and no private symbols), SymNone means nothing at all.
+void GleamDebugger::printSymbolStatus(uint64_t base)
+{
+    if(!ensureSymSession())
+    {
+        printf("  symbols: unavailable (no dbghelp session)\n");
+        return;
+    }
+    IMAGEHLP_MODULE64 mi{};
+    mi.SizeOfStruct = sizeof(mi);
+    // NOTE: with SYMOPT_DEFERRED_LOADS this call forces the pending load, so
+    // it is deliberately NOT used in list-all commands like "modules".
+    if(!SymGetModuleInfo64(mProcess->hProcess, (DWORD64)base, &mi))
+    {
+        printf("  symbols: none (module not known to dbghelp, error %lu)\n", GetLastError());
+        return;
+    }
+    const char* kind = "unknown";
+    switch(mi.SymType)
+    {
+    case SymNone:    kind = "none"; break;
+    case SymCoff:    kind = "coff"; break;
+    case SymCv:      kind = "codeview"; break;
+    case SymPdb:     kind = "pdb"; break;
+    case SymExport:  kind = "export-only"; break;
+    case SymDeferred:kind = "deferred"; break;
+    case SymSym:     kind = "sym"; break;
+    case SymDia:     kind = "dia"; break;
+    case SymVirtual: kind = "virtual"; break;
+    default: break;
+    }
+    printf("  symbols: %s%s\n", kind,
+           mSymLoadedBases.count(base) ? " (explicitly loaded)" : "");
+    if(mi.LoadedPdbName[0])
+        printf("  pdb: %s\n", mi.LoadedPdbName);
+    else if(mi.LoadedImageName[0])
+        printf("  symbol-image: %s\n", mi.LoadedImageName);
+    if(mi.SymType == SymPdb || mi.SymType == SymDia)
+    {
+        // PdbSig70 (a GUID) is the modern identity; the old 32-bit PdbSig is 0
+        // for every PDB 7.0 file, which is all of them in practice. This is the
+        // same GUID+Age pair verifyModuleIdentity() compares.
+        printf("  pdb-guid: %08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X age=%lu unmatched=%d\n",
+               mi.PdbSig70.Data1, mi.PdbSig70.Data2, mi.PdbSig70.Data3,
+               mi.PdbSig70.Data4[0], mi.PdbSig70.Data4[1], mi.PdbSig70.Data4[2],
+               mi.PdbSig70.Data4[3], mi.PdbSig70.Data4[4], mi.PdbSig70.Data4[5],
+               mi.PdbSig70.Data4[6], mi.PdbSig70.Data4[7],
+               mi.PdbAge, mi.PdbUnmatched ? 1 : 0);
+    }
+}
+
+void GleamDebugger::cmdSymPath(const std::string & path, bool set)
+{
+    if(!ensureSymSession())
+    {
+        printf("symbol session unavailable\n");
+        fflush(stdout);
+        return;
+    }
+    if(!set)
+    {
+        std::vector<char> buf(4096, 0);
+        if(SymGetSearchPath(mProcess->hProcess, buf.data(), (DWORD)buf.size() - 1))
+            printf("sympath %s\n", buf.data());
+        else
+            printf("sympath unavailable (error %lu)\n", GetLastError());
+        fflush(stdout);
+        return;
+    }
+    if(!SymSetSearchPath(mProcess->hProcess, path.c_str()))
+    {
+        printf("sympath failed (error %lu)\n", GetLastError());
+        fflush(stdout);
+        return;
+    }
+    // The new path governs FUTURE loads only; modules dbghelp already resolved
+    // keep their symbols. Cached resolutions came from the old configuration.
+    clearSymbolCache();
+    printf("sympath set: %s\n", path.c_str());
+    printf("note: applies to modules loaded from now on; use 'symreload' to "
+           "re-resolve modules already loaded\n");
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdSymLoad(const std::string & moduleName)
+{
+    if(!ensureSymSession())
+    {
+        printf("symbol session unavailable\n");
+        fflush(stdout);
+        return;
+    }
+    ModuleInfo mod;
+    if(!findModule(mProcess->hProcess, moduleName, mod))
+    {
+        printf("module not found: %s\n", moduleName.c_str());
+        fflush(stdout);
+        return;
+    }
+    const std::string norm = normalizeModuleName(mod.name.empty() ? moduleName : mod.name);
+    std::wstring path;
+    if(!imagePathOf(mod.base, norm, path))
+    {
+        printf("symload failed: cannot determine the image path of %s\n", moduleName.c_str());
+        fflush(stdout);
+        return;
+    }
+    // Unload first, unconditionally. dbghelp refuses to load over a module it
+    // already knows, and after the invaded SymInitialize it knows most of them
+    // - so without this, symload would fail on exactly the modules the user is
+    // most likely to name. Not being loaded is not an error here.
+    SymUnloadModule64(mProcess->hProcess, (DWORD64)mod.base);
+    mSymLoadedBases.erase(mod.base);
+    SetLastError(ERROR_SUCCESS);
+    if(!SymLoadModuleExW(mProcess->hProcess, NULL, path.c_str(), NULL,
+                         mod.base, 0 /* size from image */, NULL, 0))
+    {
+        // Documented quirk: a zero return with ERROR_SUCCESS means "already
+        // loaded", which is a no-op success rather than a failure.
+        const DWORD err = GetLastError();
+        if(err != ERROR_SUCCESS)
+        {
+            printf("symload failed for %s (error %lu)\n", moduleName.c_str(), err);
+            fflush(stdout);
+            return;
+        }
+        printf("symload base=0x%llX %s (already loaded)\n",
+               (unsigned long long)mod.base, moduleName.c_str());
+        clearSymbolCache();
+        printSymbolStatus(mod.base);
+        fflush(stdout);
+        return;
+    }
+    mSymLoadedBases.insert(mod.base);
+    clearSymbolCache(); // previously-failed lookups must be retried
+    printf("symload base=0x%llX %s\n", (unsigned long long)mod.base, moduleName.c_str());
+    printSymbolStatus(mod.base);
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdSymReload(const std::string & moduleName)
+{
+    if(!mProcess)
+    {
+        printf("no process\n");
+        fflush(stdout);
+        return;
+    }
+    if(moduleName.empty())
+    {
+        // Whole-session rebuild: tear the dbghelp session down and re-invade.
+        // This is the recovery path when the initial invade raced the loader
+        // or the search path has since changed.
+        closeSymSession();
+        clearSymbolCache();
+        if(!ensureSymSession())
+        {
+            printf("symreload failed: cannot re-create the symbol session\n");
+            fflush(stdout);
+            return;
+        }
+        printf("symreload: symbol session rebuilt\n");
+        fflush(stdout);
+        return;
+    }
+    if(!ensureSymSession())
+    {
+        printf("symbol session unavailable\n");
+        fflush(stdout);
+        return;
+    }
+    ModuleInfo mod;
+    if(!findModule(mProcess->hProcess, moduleName, mod))
+    {
+        printf("module not found: %s\n", moduleName.c_str());
+        fflush(stdout);
+        return;
+    }
+    SymUnloadModule64(mProcess->hProcess, (DWORD64)mod.base);
+    mSymLoadedBases.erase(mod.base);
+    clearSymbolCache();
+    const std::string norm = normalizeModuleName(mod.name.empty() ? moduleName : mod.name);
+    std::wstring path;
+    bool loaded = false;
+    if(imagePathOf(mod.base, norm, path))
+    {
+        loaded = SymLoadModuleExW(mProcess->hProcess, NULL, path.c_str(), NULL,
+                                  mod.base, 0, NULL, 0) != 0;
+        if(loaded)
+            mSymLoadedBases.insert(mod.base);
+    }
+    if(!loaded)
+    {
+        // Fall back to dbghelp's own view: without an explicit load the module
+        // is still reachable through the invaded session's refresh.
+        SymRefreshModuleList(mProcess->hProcess);
+        printf("symreload base=0x%llX %s (via module-list refresh)\n",
+               (unsigned long long)mod.base, moduleName.c_str());
+    }
+    else
+        printf("symreload base=0x%llX %s\n", (unsigned long long)mod.base, moduleName.c_str());
+    printSymbolStatus(mod.base);
+    fflush(stdout);
 }
 
 void GleamDebugger::cmdImports(const std::string & moduleName)
@@ -1598,6 +2211,41 @@ GleamDebugger::CmdResult GleamDebugger::trySymbolCommand(const std::vector<std::
     if(cmd == "imports" && args.size() <= 2)
     {
         cmdImports(args.size() == 2 ? args[1] : std::string());
+        return CmdResult::Handled;
+    }
+    if(cmd == "moduleinfo" && args.size() == 2)
+    {
+        cmdModuleInfo(args[1]);
+        return CmdResult::Handled;
+    }
+    if(cmd == "sections" && args.size() == 2)
+    {
+        cmdSections(args[1]);
+        return CmdResult::Handled;
+    }
+    if(cmd == "sympath" && args.size() <= 2)
+    {
+        // A search path may contain spaces; the tokenizer split them, so
+        // rejoin rather than silently using only the first fragment.
+        cmdSymPath(args.size() == 2 ? args[1] : std::string(), args.size() == 2);
+        return CmdResult::Handled;
+    }
+    if(cmd == "sympath" && args.size() > 2)
+    {
+        std::string joined = args[1];
+        for(size_t i = 2; i < args.size(); i++)
+            joined += ' ' + args[i];
+        cmdSymPath(joined, true);
+        return CmdResult::Handled;
+    }
+    if(cmd == "symload" && args.size() == 2)
+    {
+        cmdSymLoad(args[1]);
+        return CmdResult::Handled;
+    }
+    if(cmd == "symreload" && args.size() <= 2)
+    {
+        cmdSymReload(args.size() == 2 ? args[1] : std::string());
         return CmdResult::Handled;
     }
     if(cmd == "exports" && (args.size() == 2 || args.size() == 3))
