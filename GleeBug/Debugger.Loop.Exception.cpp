@@ -28,6 +28,9 @@ namespace GleeBug
                 {
                     Registers(mThread->hThread, CONTEXT_CONTROL).Gip = exceptionAddress;
                     mContinueStatus = DBG_CONTINUE;
+                    // GB-8: erase the entry once consumed so the set does not grow
+                    //       without bound over a long debugging session.
+                    deletedBps.erase(foundIt);
                 }
             }
             return;

@@ -98,6 +98,12 @@ namespace GleeBug
                 breakpoints.find({ BreakpointType::Hardware, address }) != breakpoints.end())
             return false;
 
+        // GB-5: reject if the requested slot is already occupied.  The caller is
+        //       expected to use GetFreeHardwareBreakpointSlot, but passing a slot
+        //       explicitly must not silently clobber an in-use DR register.
+        if(hardwareBreakpoints[int(slot)].internal.hardware.enabled)
+            return false;
+
         //attempt to set the hardware breakpoint in every thread
         bool success = true;
         for(auto & thread : threads)

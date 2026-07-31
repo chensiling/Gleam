@@ -111,6 +111,9 @@ namespace GleeBug
 
         // Check if we're currently stepping on a pushf instruction
         auto isPushf = false;
+        // GB-4: capture the mnemonic outside the inner scope so we can compute
+        //       the correct pushed size (PUSHF=2 / PUSHFD=4 / PUSHFQ=8) below.
+        ZydisMnemonic pushfMnemonic = ZYDIS_MNEMONIC_PUSHFD;
         {
             auto gip = registers.Gip();
             unsigned char data[16];
@@ -131,6 +134,7 @@ namespace GleeBug
                     case ZYDIS_MNEMONIC_PUSHFD:
                     case ZYDIS_MNEMONIC_PUSHFQ:
                         isPushf = true;
+                        pushfMnemonic = instruction.info.mnemonic;
                         break;
                     default:
                         break;
@@ -141,15 +145,20 @@ namespace GleeBug
 
         if(isPushf)
         {
-            thread->cbInternalStep = [this, cbStep]()
+            // GB-4: PUSHF pushes only 2 bytes; PUSHFD/PUSHFQ push sizeof(ptr).
+            //       The old code always read/wrote sizeof(ptr) bytes, which on
+            //       32-bit would corrupt the 2 stack bytes above a PUSHF frame.
+            const size_t pushedSize = (pushfMnemonic == ZYDIS_MNEMONIC_PUSHF) ? 2 : sizeof(ptr);
+
+            thread->cbInternalStep = [this, cbStep, pushedSize]()
             {
-                // Remove the trap flag from the stack
+                // Remove the trap flag from the stack value that PUSHF/D/Q put there.
                 auto gsp = Registers(this->thread->hThread).Gsp();
-                GleeBug::ptr data;
-                if(MemReadUnsafe(gsp, &data, sizeof(data)))
+                uint64_t data = 0;
+                if(MemReadUnsafe(gsp, &data, pushedSize))
                 {
-                    data &= ~(int)Registers::F::Trap;
-                    MemWriteUnsafe(gsp, &data, sizeof(data));
+                    data &= ~uint64_t(Registers::F::Trap);
+                    MemWriteUnsafe(gsp, &data, pushedSize);
                 }
 
                 cbStep();

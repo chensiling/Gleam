@@ -11,7 +11,7 @@ namespace GleeBug
 
     Debugger::Debugger()
     {
-        mProcesses.clear();
+        // mProcesses is default-constructed empty; no clear needed.
     }
 
     Debugger::~Debugger()
@@ -123,7 +123,12 @@ retry_no_aslr:
 
     bool Debugger::Stop() const
     {
-        return !!TerminateProcess(mMainProcess.hProcess, 0);
+        // GB-6: use mProcess->hProcess when available (Attach() zeroes mMainProcess
+        //       before the first CREATE_PROCESS_DEBUG_EVENT fills it in).
+        auto hProcess = mProcess ? mProcess->hProcess : mMainProcess.hProcess;
+        if(!hProcess)
+            return false;
+        return !!TerminateProcess(hProcess, 0);
     }
 
     bool Debugger::UnsafeDetach()
@@ -381,8 +386,9 @@ retry_no_aslr:
             }
         }
 
-        // Free the copy of the image
-        VirtualFree(imageCopy, imageSize, MEM_DECOMMIT);
+        // GB-2: MEM_DECOMMIT only releases physical pages but keeps the address
+        //       range reserved; use MEM_RELEASE (with size=0) to free both.
+        VirtualFree(imageCopy, 0, MEM_RELEASE);
 
         return success;
     }

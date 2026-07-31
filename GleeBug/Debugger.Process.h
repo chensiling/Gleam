@@ -62,7 +62,7 @@ namespace GleeBug
         {
             if(safe)
                 return MemReadSafe(address, buffer, size, bytesRead);
-            return MemRead(address, buffer, size, bytesRead);
+            return MemReadUnsafe(address, buffer, size, bytesRead); // GB-1: was MemRead (infinite recursion)
         }
 
         /**

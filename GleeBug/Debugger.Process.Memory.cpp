@@ -48,7 +48,10 @@ namespace GleeBug
                     if(curAddress + j >= start && curAddress + j < end)
                         ((uint8*)buffer)[curAddress + j - start] = info.internal.software.oldbytes[j];
                 }
-                i += info.internal.software.size - 1;
+                // GB-3: pin i to the last byte of this breakpoint so the outer i++
+                //       lands exactly one past it.  The old "i += size-1" was wrong:
+                //       the inner loop already advanced i by size, giving 2*size total.
+                i = curAddress + info.internal.software.size - 1;
             }
         }
 

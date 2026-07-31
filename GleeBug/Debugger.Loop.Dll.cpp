@@ -30,12 +30,16 @@ namespace GleeBug
         if(GPDP)
         {
             //If you use mProcess->hProcess GetProcessDEPPolicy will put garbage in bPermanent.
+            // GB-7: check that OpenProcess succeeded before use.
             auto hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, mProcess->dwProcessId);
-            DWORD lpFlags;
-            BOOL bPermanent;
-            if(GPDP(hProcess, &lpFlags, &bPermanent))
-                mProcess->permanentDep = lpFlags != 0 && bPermanent;
-            CloseHandle(hProcess);
+            if(hProcess)
+            {
+                DWORD lpFlags;
+                BOOL bPermanent;
+                if(GPDP(hProcess, &lpFlags, &bPermanent))
+                    mProcess->permanentDep = lpFlags != 0 && bPermanent;
+                CloseHandle(hProcess);
+            }
         }
 #else
         mProcess->permanentDep = true;
