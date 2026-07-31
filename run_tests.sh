@@ -5,11 +5,33 @@ set -u
 cd "$(dirname "$0")"
 
 GLEAM=${GLEAM:-./bin/Debug/x64/Gleam.exe}
+# Session driver (batch-per-pause transport); see the gleam() helper below.
+PY=${PY:-python}
+DRIVE=${DRIVE:-./gleam_drive.py}
+command -v "$PY" > /dev/null 2>&1 || { echo "FATAL: python not found (set PY=)"; exit 1; }
+[ -f "$DRIVE" ] || { echo "FATAL: driver not found: $DRIVE"; exit 1; }
 TARGET=${TARGET:-bin/Debug/x64/TestTarget.exe}
 ATARGET=${ATARGET:-bin/Debug/x64/ArgvTarget.exe}
 BTARGET=${BTARGET:-bin/Debug/x64/BoundaryTarget.exe}
 TDIR=${TDIR:-/tmp}
 mkdir -p "$TDIR"
+
+# gleam <timeout-sec> <gleam-args...> < commands
+#
+# Command transport for every scenario AND for the address probes below, so it
+# must be defined before the first probe runs. Commands CANNOT simply be piped
+# into Gleam any more: since commit 72eb8c1 the debugger discards commands that
+# arrive while the debuggee runs (pushCommand Defense #1) and clears the queue
+# on every resume (commandLoop Defense #2), so a piped script is drained by the
+# REPL thread before the first pause and thrown away. gleam_drive.py feeds one
+# batch per pause instead. See its docstring for the protocol.
+#
+# Scripts may contain "#sleep N" to hold between batches (replaces the old
+# shell-side `sleep` between printf calls).
+gleam() {
+  local t=$1; shift
+  "$PY" "$DRIVE" -t "$t" -- "$GLEAM" "$@"
+}
 # Target addresses are resolved at runtime: clean rebuilds shift the layout,
 # so fixed RVAs are forbidden (review gate). TestTarget prints the three base
 # addresses itself; the marker body and OEP come from a gleam probe session.
@@ -17,13 +39,13 @@ PROBE=$(timeout 30 "$TARGET" | grep -E '^(MARKER|INNER|GDATA)=')
 MARKER=$(printf '%s\n' "$PROBE" | sed -n 's/^MARKER=0*\([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F')
 INNER=$(printf '%s\n' "$PROBE" | sed -n 's/^INNER=0*\([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F')
 GDATA=$(printf '%s\n' "$PROBE" | sed -n 's/^GDATA=0*\([0-9A-Fa-f]*\).*/\1/p' | tr 'a-f' 'A-F')
-OUT=$(printf 'eval TestTarget!marker\neval TestTarget!looper\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
+OUT=$(printf 'eval TestTarget!marker\neval TestTarget!looper\nquit\n' | gleam 30 $TARGET 2>&1)
 MBODY=$(printf '%s\n' "$OUT" | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | head -1)
 LADDR=$(printf '%s\n' "$OUT" | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | sed -n '2p')
 OEP=$(printf '%s\n' "$OUT" | sed -n 's/^event process.*start=0x0*\([0-9A-F]*\).*/\1/p' | head -1)
 # The ret instruction and the instruction after "call inner" inside marker,
 # located by disassembly (never by fixed offsets).
-OUT2=$(printf 'disasm TestTarget!marker 40\nquit\n' | timeout 30 "$GLEAM" $TARGET 2>&1)
+OUT2=$(printf 'disasm TestTarget!marker 40\nquit\n' | gleam 30 $TARGET 2>&1)
 MRET=$(printf '%s\n' "$OUT2" | sed -n 's/^0000000\([0-9A-F]*\)  ret.*$/\1/p' | head -1)
 CALLA=$(printf '%s\n' "$OUT2" | sed -n 's/^0000000\([0-9A-F]*\)  call 0x0000000'$INNER'$/\1/p' | head -1)
 MCALLNEXT=$(printf '%X' $((0x$CALLA + 5)))
@@ -43,10 +65,10 @@ GD8=$(printf '%X' $((0x$GDATA + 8)))
 # printed INNER (the ILT thunk) through its jmp to the real body, and
 # require the slow loop's cmp against 10000000 (0x989680) in the listing as
 # proof the right function was found.
-OUT3=$(printf 'disasm 0x%s 2\nquit\n' "$INNER" | timeout 30 "$GLEAM" $TARGET 2>&1)
+OUT3=$(printf 'disasm 0x%s 2\nquit\n' "$INNER" | gleam 30 $TARGET 2>&1)
 IBODY=$(printf '%s\n' "$OUT3" | sed -n 's/^0000000[0-9A-F]*  jmp 0x0000000\([0-9A-F]*\).*$/\1/p' | head -1)
 [ -z "$IBODY" ] && IBODY=$INNER
-OUT4=$(printf 'disasm 0x%s 60\nquit\n' "$IBODY" | timeout 30 "$GLEAM" $TARGET 2>&1)
+OUT4=$(printf 'disasm 0x%s 60\nquit\n' "$IBODY" | gleam 30 $TARGET 2>&1)
 ILOOP=$(printf '%s\n' "$OUT4" | awk '$1 ~ /^0000000[0-9A-F]+$/ && $2 ~ /^j/ && $3 ~ /^0x0000000[0-9A-F]+$/ { a = strtonum("0x" $1); t = strtonum("0x" substr($3, 3)); if (t < a) { printf "%X", t; exit } }')
 printf '%s\n' "$OUT4" | grep -q '989680' || { echo "FATAL: ILOOP probe lost the slow loop (IBODY=$IBODY)"; exit 1; }
 for v in MARKER INNER GDATA MBODY LADDR OEP MRET MCALLNEXT GD2 GD4 GD6 GD8 ILOOP; do
@@ -70,7 +92,7 @@ chkcount() { # chkcount <desc> <file> <pattern> <expected-count>
 run() { # run <name> <target-args> < commands
   local name=$1; shift
   local args=$1; shift
-  timeout 60 "$GLEAM" $TARGET $args > ${TDIR}/gleam_$name.txt 2>&1
+  gleam 60 $TARGET $args > ${TDIR}/gleam_$name.txt 2>&1
   local ec=$?
   echo "== $name =="
   # A scenario that hangs or crashes after printing expected text must NOT
@@ -115,6 +137,33 @@ chk "A: result1 modified by rcx" ${TDIR}/gleam_A.txt "MARKER_RESULT_1=106"
 chk "A: result2 normal"          ${TDIR}/gleam_A.txt "MARKER_RESULT_2=13"
 chk "A: gdata self-write wins b0" ${TDIR}/gleam_A.txt "GDATA_AFTER=58ADBEEF0102030408090A0B0C0D0E0F"
 chk "A: exit code 0"             ${TDIR}/gleam_A.txt "stop reason=exit code=0x00000000"
+
+# --- A2: meminfo across every region class ---
+# Committed image (module base), committed private (stack via rsp), reserved
+# (the stack's uncommitted tail, where Protect is 0 and only AllocationProtect
+# answers), free (below the 64K no-access hole) and a kernel address that
+# VirtualQueryEx refuses outright.
+run A2 "" <<EOF
+bp $MARKER
+g
+meminfo 0x$MARKER
+meminfo rsp
+meminfo 0x10
+meminfo 0xFFFFF80000000000
+g
+g
+EOF
+chk   "A2: image state"        ${TDIR}/gleam_A2.txt "state    commit"
+chk   "A2: image type"         ${TDIR}/gleam_A2.txt "type     image"
+chkre "A2: image module+off"   ${TDIR}/gleam_A2.txt "module   TestTarget\.exe\+0x[0-9A-F]+"
+chk   "A2: stack is private"   ${TDIR}/gleam_A2.txt "type     private"
+chk   "A2: free region"        ${TDIR}/gleam_A2.txt "state    free"
+chk   "A2: free has no alloc"  ${TDIR}/gleam_A2.txt "unmapped (no allocation at this address)"
+chk   "A2: kernel addr fails"  ${TDIR}/gleam_A2.txt "VirtualQueryEx failed for 0xFFFFF80000000000"
+# A free region must not claim a protection: Protect is 0 there, so the "???"
+# that protectText(0) yields would be a wrong answer rather than no answer.
+chk   "A2: no bogus protect"   ${TDIR}/gleam_A2.txt "protect  rw-"
+if grep -q 'protect  ???' ${TDIR}/gleam_A2.txt; then bad "A2: printed ??? protection"; else ok "A2: no ??? protection"; fi
 
 # --- B: one-shot breakpoint ---
 run B "" <<EOF
@@ -465,7 +514,9 @@ check_ec() { # check_ec <desc> <code> <outfile>
 REL=bin/Release/x64
 if [ -f "$REL/Gleam.exe" ] && [ -f "$REL/TestTarget.exe" ]; then
   echo "== R4 =="
-  timeout 30 "$REL/Gleam.exe" "$REL/TestTarget.exe" > ${TDIR}/gleam_R4.txt 2>&1 <<EOF
+  # Release Gleam, so this cannot use the gleam() helper (which is bound to
+  # $GLEAM); it drives the same transport with GLEAM overridden.
+  GLEAM="$REL/Gleam.exe" gleam 30 "$REL/TestTarget.exe" > ${TDIR}/gleam_R4.txt 2>&1 <<EOF
 bp TestTarget!marker
 g
 step
@@ -500,7 +551,7 @@ chk "R5: bridged originals kept" ${TDIR}/gleam_R5.txt "47 4C 45 41"
 echo "== S1 =="
 S1OK=0
 for i in $(seq 1 25); do
-  out=$(printf 'g\npause\ndetach\n' | timeout 20 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
+  out=$(printf 'g\npause\ndetach\n' | gleam 20 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S1OK=$((S1OK+1)); else printf '%s' "$out" > ${TDIR}/gleam_S1_fail_$i.txt; fi
@@ -513,7 +564,7 @@ if [ "$S1OK" -eq 25 ]; then ok "S1: 25/25 pause injections"; else bad "S1: $S1OK
 
 # --- T1: argv quoting matrix ---
 echo "== T1 =="
-timeout 20 "$GLEAM" "$ATARGET" "" "a b" "$(printf 'x\ty')" "quote\"in" 'trail\' > ${TDIR}/gleam_T1.txt 2>&1 <<EOF
+gleam 20 "$ATARGET" "" "a b" "$(printf 'x\ty')" "quote\"in" 'trail\' > ${TDIR}/gleam_T1.txt 2>&1 <<EOF
 g
 EOF
 check_ec T1 $? ${TDIR}/gleam_T1.txt
@@ -526,7 +577,7 @@ chk "T1: trailing backslash"     ${TDIR}/gleam_T1.txt 'ARGV[5]=[trail\]'
 
 # --- T1c: argv backslash parity ---
 echo "== T1c =="
-timeout 20 "$GLEAM" "$ATARGET" 'a\\' 'x\\"y' > ${TDIR}/gleam_T1c.txt 2>&1 <<EOF
+gleam 20 "$ATARGET" 'a\\' 'x\\"y' > ${TDIR}/gleam_T1c.txt 2>&1 <<EOF
 g
 EOF
 check_ec T1c $? ${TDIR}/gleam_T1c.txt
@@ -535,7 +586,7 @@ chk "T1c: 2x backslash + quote"  ${TDIR}/gleam_T1c.txt 'ARGV[2]=[x\\"y]'
 
 # --- T1b: argv unicode + backslash-before-quote ---
 echo "== T1b =="
-timeout 20 "$GLEAM" "$ATARGET" "中文路径" 'a\"b' > ${TDIR}/gleam_T1b.txt 2>&1 <<EOF
+gleam 20 "$ATARGET" "中文路径" 'a\"b' > ${TDIR}/gleam_T1b.txt 2>&1 <<EOF
 g
 EOF
 check_ec T1b $? ${TDIR}/gleam_T1b.txt
@@ -547,7 +598,7 @@ chk "T1b: backslash before quote" ${TDIR}/gleam_T1b.txt 'ARGV[2]=[a\"b]'
 
 # --- T2: cross-chunk instruction scan ---
 echo "== T2 =="
-timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_T2.txt 2>&1 <<EOF
+gleam 30 "$BTARGET" > ${TDIR}/gleam_T2.txt 2>&1 <<EOF
 g
 xref 60000000
 xref 60100040
@@ -644,7 +695,7 @@ chk "T5c: loop result correct"   ${TDIR}/gleam_T5c.txt "LOOP_RESULT=4999950000"
 echo "== S2 =="
 S2OK=0
 for i in $(seq 1 100); do
-  out=$(printf 'g\npause\ndetach\n' | timeout 30 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
+  out=$(printf 'g\npause\ndetach\n' | gleam 30 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S2OK=$((S2OK+1)); else printf '%s' "$out" > ${TDIR}/gleam_S2_fail_$i.txt; fi
@@ -660,25 +711,31 @@ if [ "$S2OK" -eq 100 ]; then ok "S2: 100/100 pause injections"; else bad "S2: $S
 echo "== S3 =="
 S3OK=0
 for i in $(seq 1 100); do
-  printf 'quit\n' | timeout 10 "$GLEAM" "$TARGET" > /dev/null 2>&1
+  printf 'quit\n' | gleam 10 "$TARGET" > /dev/null 2>&1
   [ $? -eq 0 ] && S3OK=$((S3OK+1))
 done
 if [ "$S3OK" -eq 100 ]; then ok "S3: 100/100 sessions exited"; else bad "S3: $S3OK/100 sessions exited"; fi
 
 # --- S3b: REPL stdin-open lifecycle (natural exit / detach / quit, with artifacts) ---
 echo "== S3b =="
-out=$({ printf 'g\n'; sleep 2; } | timeout 15 "$GLEAM" "$TARGET" 2>&1); ec=$?
+# The trailing "#sleep 2" keeps Gleam's stdin open while the target runs, which
+# is the point of S3b: EOF must not end a session (main.cpp replThread).
+# A shell-side `sleep` cannot do this any more - the driver reads its whole
+# script up front, so a shell sleep would only delay the driver's start.
+out=$({ printf 'g\n'; printf '#sleep 2\n'; } | gleam 15 "$TARGET" 2>&1); ec=$?
 [ $ec -eq 0 ] && ok "S3b: natural exit with stdin open" || { printf '%s' "$out" > ${TDIR}/gleam_S3b_exit.txt; bad "S3b: natural exit (code $ec)"; }
-out=$({ printf 'bp $MARKER\ng\ndetach\n'; sleep 2; } | timeout 15 "$GLEAM" "$TARGET" 2>&1); ec=$?
+out=$({ printf 'bp $MARKER\ng\ndetach\n'; printf '#sleep 2\n'; } | gleam 15 "$TARGET" 2>&1); ec=$?
 [ $ec -eq 0 ] && ok "S3b: detach with stdin open" || { printf '%s' "$out" > ${TDIR}/gleam_S3b_detach.txt; bad "S3b: detach (code $ec)"; }
-out=$({ printf 'quit\n'; sleep 2; } | timeout 15 "$GLEAM" "$TARGET" 2>&1); ec=$?
+out=$({ printf 'quit\n'; printf '#sleep 2\n'; } | gleam 15 "$TARGET" 2>&1); ec=$?
 [ $ec -eq 0 ] && ok "S3b: quit with stdin open" || { printf '%s' "$out" > ${TDIR}/gleam_S3b_quit.txt; bad "S3b: quit (code $ec)"; }
 
 # --- S4: runtime pause (delayed writer; pause sent while target RUNS free) ---
 echo "== S4 =="
 S4OK=0
 for i in $(seq 1 100); do
-  out=$(( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
+  # "#sleep 1" (driver-side) replaces the old shell-side sleep between printfs:
+  # pause must still arrive while the target runs FREE, which is what S4 tests.
+  out=$(printf 'g\n#sleep 1\npause\n#sleep 1\ndetach\n' | gleam 20 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   if [ "$n" -eq 1 ] && [ $ec -eq 0 ]; then S4OK=$((S4OK+1)); else printf '%s' "$out" > ${TDIR}/gleam_S4_fail_$i.txt; fi
@@ -695,7 +752,7 @@ if [ "$S4OK" -eq 100 ]; then ok "S4: 100/100 runtime pauses"; else bad "S4: $S4O
 echo "== S5 =="
 S5OK=0
 for i in $(seq 1 100); do
-  out=$(( printf 'hide\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 "$GLEAM" 'C:\Windows\notepad.exe' 2>&1)
+  out=$(printf 'hide\ng\n#sleep 1\npause\n#sleep 1\ndetach\n' | gleam 20 'C:\Windows\notepad.exe' 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   f=$(printf '%s' "$out" | grep -c 'breakin fail=')
@@ -971,7 +1028,10 @@ chk "V3: slot decoded"           ${TDIR}/gleam_V3.txt "raw-hardware slot=0"
 # V4a: baseline handle count (pure measurement; runtime pause->detach is
 # proven by V4e). The two g's leave gleam paused at the second marker hit
 # until the delayed detach, so the sample window is deterministic.
-( printf "bp $MARKER\ng\ng\n"; sleep 2; printf 'pause\n'; sleep 7; printf 'detach\n' ) | timeout 60 "$GLEAM" "$TARGET" > "${TDIR}/gleam_V4a.txt" 2>&1 &
+# The sleeps are driver-side ("#sleep"): they must hold BETWEEN batches so
+# gleam stays alive across the outer handle-count sample below. A shell-side
+# sleep would only delay the driver's start (it reads its script up front).
+printf "bp $MARKER\ng\ng\n#sleep 2\npause\n#sleep 7\ndetach\n" | gleam 60 "$TARGET" > "${TDIR}/gleam_V4a.txt" 2>&1 &
 V4APID=$!
 sleep 6
 HC0=$(powershell -NoProfile -Command "(Get-Process -Name gleam -ErrorAction SilentlyContinue).HandleCount")
@@ -980,7 +1040,7 @@ V4AEC=$?
 if [ "$V4AEC" -ne 0 ]; then bad "V4a: abnormal exit (code $V4AEC)"; fi
 # V4b: 20 restarts. HandleCount is sampled mid-loop (gleam is always alive
 # while restart commands flow); detach ends it after the sample.
-( for i in $(seq 1 20); do printf 'restart\n'; done; sleep 14; printf 'detach\n' ) | timeout 90 "$GLEAM" $TARGET > ${TDIR}/gleam_V4b.txt 2>&1 &
+( for i in $(seq 1 20); do printf 'restart\n'; done; printf '#sleep 14\ndetach\n' ) | gleam 90 $TARGET > ${TDIR}/gleam_V4b.txt 2>&1 &
 V4BPID=$!
 sleep 12
 HC1=$(powershell -NoProfile -Command "(Get-Process -Name gleam -ErrorAction SilentlyContinue).HandleCount")
@@ -998,7 +1058,7 @@ fi
 NPID=$(powershell -NoProfile -Command "(Start-Process 'C:\Windows\notepad.exe' -PassThru).Id")
 V4COK=0
 for i in $(seq 1 5); do
-  out=$(printf 'pause\ndetach\n' | timeout 15 "$GLEAM" -a $NPID 2>&1)
+  out=$(printf 'pause\ndetach\n' | gleam 15 -a $NPID 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=attach\|stop reason=pause')
   printf '%s\n' "$out" > ${TDIR}/gleam_V4c_$i.txt
@@ -1008,7 +1068,7 @@ done
 # Cleanup: kill only if the pid still maps to the expected image.
 powershell -NoProfile -Command "\$p = Get-Process -Id $NPID -ErrorAction SilentlyContinue; if(\$p -and \$p.Path -eq 'C:\Windows\notepad.exe') { Stop-Process -Id $NPID -Force }" > /dev/null 2>&1
 if [ "$V4COK" -eq 5 ]; then ok "V4c: 5/5 attach-detach cycles"; else bad "V4c: $V4COK/5 attach-detach cycles"; fi
-timeout 10 "$GLEAM" C:\definitely\missing\target.exe > ${TDIR}/gleam_V4d.txt 2>&1
+gleam 10 C:\definitely\missing\target.exe > ${TDIR}/gleam_V4d.txt 2>&1
 ec=$?
 if [ $ec -eq 1 ]; then ok "V4d: Init failure exits 1"; else bad "V4d: Init failure exit code $ec"; fi
 
@@ -1024,7 +1084,8 @@ chkcount "V5: once logical gone" ${TDIR}/gleam_V5.txt "logical module=testtarget
 chk "V5: rva out of image"       ${TDIR}/gleam_V5.txt "out of image for module testtarget"
 
 # --- V6: stepout abort on pause (S0-1) ---
-( printf 'bp TestTarget!looper\ng\nret 100000\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 30 "$GLEAM" $TARGET > ${TDIR}/gleam_V6.txt 2>&1
+# Driver-side sleeps: pause must reach the stepout while it is STILL stepping.
+printf 'bp TestTarget!looper\ng\nret 100000\n#sleep 1\npause\n#sleep 1\ndetach\n' | gleam 30 $TARGET > ${TDIR}/gleam_V6.txt 2>&1
 ec=$?
 echo "== V6 =="
 if [ $ec -ne 0 ]; then bad "V6: abnormal exit (code $ec)"; fi
@@ -1129,7 +1190,7 @@ chk "W7: bound at load event"    ${TDIR}/gleam_W7.txt "event bp bound module=lat
 chk "W7: first call hit"         ${TDIR}/gleam_W7.txt "stop reason=breakpoint"
 
 # --- W9: frames source labels (P0-2) ---
-timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W9.txt 2>&1 <<EOF
+gleam 30 "$BTARGET" > ${TDIR}/gleam_W9.txt 2>&1 <<EOF
 g
 write 60000000 10 00 00 60 00 00 00 00
 setreg rsp 60000000
@@ -1147,7 +1208,7 @@ chk "W9: non-module marked"      ${TDIR}/gleam_W9.txt "module=?"
 # The SAME page-tail address must read consistently via read u16 and read
 # utf16: next page is committed in BoundaryTarget, so the code unit is
 # assembled across the boundary. No false "cannot read" error.
-timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W8.txt 2>&1 <<EOF
+gleam 30 "$BTARGET" > ${TDIR}/gleam_W8.txt 2>&1 <<EOF
 g
 read u16 60000FFF
 read utf16 60000FFF 1
@@ -1183,7 +1244,7 @@ fi
 echo "== V4e =="
 V4EOK=0
 for i in $(seq 1 30); do
-  out=$(( printf 'bp TestTarget!looper\ng\nret 100000\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) | timeout 20 "$GLEAM" "$TARGET" 2>&1)
+  out=$(printf 'bp TestTarget!looper\ng\nret 100000\n#sleep 1\npause\n#sleep 1\ndetach\n' | gleam 20 "$TARGET" 2>&1)
   ec=$?
   n=$(printf '%s' "$out" | grep -c 'stop reason=pause')
   TPID=$(printf '%s' "$out" | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
@@ -1209,7 +1270,7 @@ else
 fi
 
 # --- W10: new ret after abort leaves no stale internal bp ---
-( printf 'bp TestTarget!looper\ng\nret 100000\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'bl\ng\nret 1000000\ng\nquit\n' ) | timeout 60 "$GLEAM" "$TARGET" > ${TDIR}/gleam_W10.txt 2>&1
+printf 'bp TestTarget!looper\ng\nret 100000\n#sleep 1\npause\n#sleep 1\nbl\ng\nret 1000000\ng\nquit\n' | gleam 60 "$TARGET" > ${TDIR}/gleam_W10.txt 2>&1
 ec=$?
 echo "== W10 =="
 if [ $ec -ne 0 ]; then bad "W10: abnormal exit (code $ec)"; fi
@@ -1239,7 +1300,7 @@ chk "W11b: session still clean"    ${TDIR}/gleam_W11b.txt "stop reason=exit"
 # --- W13: UTF-16 boundary matrix (P0-5) ---
 # Single block: the full matrix. An earlier, shorter duplicate wrote the same
 # log file and was overwritten by this one - assertions must count once.
-timeout 30 "$GLEAM" "$BTARGET" > ${TDIR}/gleam_W13.txt 2>&1 <<EOF
+gleam 30 "$BTARGET" > ${TDIR}/gleam_W13.txt 2>&1 <<EOF
 g
 read utf16 602FFFFF 2
 read utf16 602FFFFE 2
@@ -1273,7 +1334,7 @@ chkcount "W13: restored -> readable"     ${TDIR}/gleam_W13.txt "string at 0x6000
 echo "== W14 =="
 W14OK=0
 for i in $(seq 1 10); do
-  timeout 30 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14_$i.txt 2>&1 <<EOF
+  gleam 30 $TARGET mt > ${TDIR}/gleam_W14_$i.txt 2>&1 <<EOF
 bp TestTarget!marker once
 g
 ret
@@ -1327,7 +1388,7 @@ w14b() { # w14b <tag> <expected-pattern> <follow-up commands...>
   local f=${TDIR}/gleam_W14b_$tag.txt
   { printf 'bp TestTarget!marker once\ng\nret\n'
     printf '%s\n' "$@"
-    printf 'bl\nquit\n'; } | timeout 40 "$GLEAM" $TARGET mt > $f 2>&1
+    printf 'bl\nquit\n'; } | gleam 40 $TARGET mt > $f 2>&1
   local ec=$?
   if [ $ec -ne 0 ]; then bad "W14b/$tag: abnormal exit (code $ec; see $f)"; return; fi
   if grep -qF "hit by non-owner" $f; then
@@ -1373,7 +1434,7 @@ w14b_user() { # w14b_user <tag> <bp-addr> <bp-suffix>
   local f=${TDIR}/gleam_W14c_$tag.txt
   { printf 'bp TestTarget!marker once\ng\nret\n'
     printf 'bp %s %s\nbl\nstep\nbl\nquit\n' "$addr" "$suffix"; } |
-    timeout 40 "$GLEAM" $TARGET mt > $f 2>&1
+    gleam 40 $TARGET mt > $f 2>&1
   local ec=$?
   if [ $ec -ne 0 ]; then bad "W14c/$tag: abnormal exit (code $ec; see $f)"; return; fi
   if ! grep -qF "hit by non-owner" $f; then
@@ -1397,7 +1458,7 @@ w14b_user once   "$INNER"     "once"
 # Same address as the internal one-shot: after the non-owner consumed it,
 # physical ownership is gone (mStepOutBpOurs=false), so a user "once" there
 # must hit as a NORMAL user breakpoint - never claimed as internal (C2).
-timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14c_sameaddr.txt 2>&1 <<EOF
+gleam 40 $TARGET mt > ${TDIR}/gleam_W14c_sameaddr.txt 2>&1 <<EOF
 bp TestTarget!marker once
 g
 ret
@@ -1450,7 +1511,7 @@ chkcount "W14c/sameaddr: no leftover once" ${TDIR}/gleam_W14c_sameaddr.txt " onc
 
 # Abort path with a user once at the internal address: abortStepOut must NOT
 # delete it (ownership was lost at the non-owner hit), it must still fire.
-timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14c_abort.txt 2>&1 <<EOF
+gleam 40 $TARGET mt > ${TDIR}/gleam_W14c_abort.txt 2>&1 <<EOF
 bp TestTarget!marker once
 g
 ret
@@ -1502,7 +1563,7 @@ fi
 # detach; the old operation may not re-arm, print or delete anything after it.
 echo "== W14d =="
 printf 'bp TestTarget!marker once\ng\nret\nquit\n' |
-  timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14d_quit.txt 2>&1
+  gleam 40 $TARGET mt > ${TDIR}/gleam_W14d_quit.txt 2>&1
 ec=$?
 if [ $ec -ne 0 ]; then bad "W14d/quit: abnormal exit (code $ec)"; fi
 chk      "W14d/quit: non-owner stop reached" ${TDIR}/gleam_W14d_quit.txt "hit by non-owner"
@@ -1510,7 +1571,7 @@ chkcount "W14d/quit: single unified abort"   ${TDIR}/gleam_W14d_quit.txt "stepou
 chkcount "W14d/quit: no re-arm after abort"  ${TDIR}/gleam_W14d_quit.txt "stepout internal bp re-armed" 0
 
 printf 'bp TestTarget!marker once\ng\nret\nrestart\nbl\ng\nquit\n' |
-  timeout 60 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14d_restart.txt 2>&1
+  gleam 60 $TARGET mt > ${TDIR}/gleam_W14d_restart.txt 2>&1
 ec=$?
 if [ $ec -ne 0 ]; then bad "W14d/restart: abnormal exit (code $ec)"; fi
 chk      "W14d/restart: non-owner stop reached" ${TDIR}/gleam_W14d_restart.txt "hit by non-owner"
@@ -1523,7 +1584,7 @@ chk      "W14d/restart: target completes"       ${TDIR}/gleam_W14d_restart.txt "
 
 # Owner thread dies inside the callee while the internal bp is armed (mtx).
 printf 'bp TestTarget!exiter once\ng\nret\ng\nquit\n' |
-  timeout 40 "$GLEAM" $TARGET mtx > ${TDIR}/gleam_W14d_ownerexit.txt 2>&1
+  gleam 40 $TARGET mtx > ${TDIR}/gleam_W14d_ownerexit.txt 2>&1
 ec=$?
 if [ $ec -ne 0 ]; then bad "W14d/ownerexit: abnormal exit (code $ec)"; fi
 chkcount "W14d/ownerexit: aborted on thread exit" ${TDIR}/gleam_W14d_ownerexit.txt "stepout aborted (thread exit)" 1
@@ -1540,7 +1601,7 @@ chk      "W14d/ownerexit: clean exit"             ${TDIR}/gleam_W14d_ownerexit.t
 # one-shot. Both the owner and the non-owner hit must survive it.
 echo "== W14e =="
 printf 'bp TestTarget!marker once\ng\nignore %s 1\nret\nbl\ng\ng\n' "$MCALLNEXT" |
-  timeout 40 "$GLEAM" $TARGET > ${TDIR}/gleam_W14e_owner.txt 2>&1
+  gleam 40 $TARGET > ${TDIR}/gleam_W14e_owner.txt 2>&1
 ec=$?
 if [ $ec -ne 0 ]; then bad "W14e/owner: abnormal exit (code $ec)"; fi
 chkcount "W14e/owner: stepout still returns"    ${TDIR}/gleam_W14e_owner.txt "stop reason=stepout return" 1
@@ -1561,7 +1622,7 @@ for i in $(seq 1 5); do
   { printf 'bp TestTarget!marker once\ng\nignore %s 1\nret\n' "$MCALLNEXT"
     for k in $(seq 1 16); do printf 'g\n'; done
     printf 'quit\n'; } |
-    timeout 40 "$GLEAM" $TARGET mt > ${TDIR}/gleam_W14e_mt_$i.txt 2>&1
+    gleam 40 $TARGET mt > ${TDIR}/gleam_W14e_mt_$i.txt 2>&1
   ec=$?
   f=${TDIR}/gleam_W14e_mt_$i.txt
   r=$(grep -cF "stop reason=stepout return" $f)
@@ -1603,7 +1664,7 @@ fi
 # bases differ, and no bind/hit that exists while the decoy is loaded falls in
 # the decoy's range.
 W15F=${TDIR}/gleam_W15.txt
-timeout 60 "$GLEAM" $TARGET dll4 > $W15F 2>&1 <<EOF
+gleam 60 $TARGET dll4 > $W15F 2>&1 <<EOF
 bp Late!LateInternal
 breakon dll on
 g
@@ -1930,7 +1991,7 @@ fi
 rlLog=""
 for rlTry in 1 2 3; do
   printf "selftest failapi replylater\nbp 0x$ILOOP\nignore 0x$ILOOP 200000000\nbp 0x$INNER\nignore 0x$INNER 200000000\ng\n" |
-    timeout 10 "$GLEAM" $TARGET mtl > ${TDIR}/gleam_W16_replylater.txt 2>&1
+    gleam 10 $TARGET mtl > ${TDIR}/gleam_W16_replylater.txt 2>&1
   if grep -qE 'ContinueDebugEvent\(DBG_REPLY_LATER\) failed' ${TDIR}/gleam_W16_replylater.txt; then
     rlLog="yes"
     break
@@ -1995,7 +2056,7 @@ if [ -z "$ATT_PID" ]; then
   bad "W16/attach: cannot resolve target pid"
 else
   printf 'selftest failapi resume always\nbp kernel32!GetTickCount once\ng\nstep\ndetach\nselftest failapi off\ndetach\n' |
-    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_attach.txt 2>&1
+    gleam 60 -a "$ATT_PID" > ${TDIR}/gleam_W16_attach.txt 2>&1
   ec=$?
   echo "== W16/attach =="
   if [ $ec -ne 0 ]; then bad "W16/attach: abnormal exit (code $ec; see ${TDIR}/gleam_W16_attach.txt)"; fi
@@ -2104,8 +2165,10 @@ w17_target
 if [ -z "$ATT_PID" ]; then
   bad "W17/stubresume: cannot resolve target pid"
 else
-  ( printf 'selftest failapi stubresume\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'detach\n' ) |
-    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_stubresume.txt 2>&1
+  # Driver-side #sleep, not a shell-side one: the driver reads all of stdin up
+  # front, so a `sleep` between printfs would not space the batches at all.
+  printf 'selftest failapi stubresume\ng\n#sleep 1\npause\n#sleep 1\ndetach\n' |
+    gleam 60 -a "$ATT_PID" > ${TDIR}/gleam_W16_stubresume.txt 2>&1
   ec=$?
   echo "== W17/stubresume =="
   if [ $ec -ne 0 ]; then bad "W17/stubresume: abnormal exit (code $ec)"; fi
@@ -2129,15 +2192,21 @@ w17_target
 if [ -z "$ATT_PID" ]; then
   bad "W17/terminate: cannot resolve target pid"
 else
-  ( printf 'selftest failapi terminate\ng\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'g\ndetach\n' ) |
-    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_terminate.txt 2>&1
+  printf 'selftest failapi terminate\ng\n#sleep 1\npause\n#sleep 1\ng\ndetach\n' |
+    gleam 60 -a "$ATT_PID" > ${TDIR}/gleam_W16_terminate.txt 2>&1
   ec=$?
   echo "== W17/terminate =="
   if [ $ec -ne 0 ]; then bad "W17/terminate: abnormal exit (code $ec)"; fi
   chk      "W17/terminate: armed"               ${TDIR}/gleam_W16_terminate.txt "selftest failapi armed terminate"
   chkre    "W17/terminate: precise error"       ${TDIR}/gleam_W16_terminate.txt '^event error msg="Gleam: TerminateThread failed for break-in stub tid [0-9]+ \(error 5\)"'
   chkcount "W17/terminate: exactly 1 error"     ${TDIR}/gleam_W16_terminate.txt 'event error msg=' 1
-  chkcount "W17/terminate: retried at next int3" ${TDIR}/gleam_W16_terminate.txt "stop reason=pause" 2
+  # Count only the pauses the SCENARIO causes, i.e. those after the arming
+  # line: the stub's first int3 (where TerminateThread fails) and the next one
+  # (where the retry succeeds). An attach session needs one stop before it can
+  # accept any command at all, so a raw total would also count the transport's
+  # opening pause and say 3 - which is about the transport, not this behaviour.
+  n=$(sed -n '/selftest failapi armed terminate/,$p' ${TDIR}/gleam_W16_terminate.txt | grep -c "stop reason=pause")
+  if [ "$n" -eq 2 ]; then ok "W17/terminate: retried at next int3"; else bad "W17/terminate: retried at next int3 (count=$n, want 2)"; fi
   chk      "W17/terminate: stub freed"          ${TDIR}/gleam_W16_terminate.txt "event breakin stub freed"
   chk      "W17/terminate: detached"            ${TDIR}/gleam_W16_terminate.txt "detaching..."
   chk      "W17/terminate: controlled exit"     ${TDIR}/gleam_W16_terminate.txt "[gleam] session finished"
@@ -2155,8 +2224,8 @@ w17_target
 if [ -z "$ATT_PID" ]; then
   bad "W17/vfree: cannot resolve target pid"
 else
-  ( printf 'g\n'; sleep 1; printf 'pause\n'; sleep 1; printf 'selftest failapi vfree\ndetach\ndetach\n' ) |
-    timeout 60 "$GLEAM" -a "$ATT_PID" > ${TDIR}/gleam_W16_vfree.txt 2>&1
+  printf 'g\n#sleep 1\npause\n#sleep 1\nselftest failapi vfree\ndetach\ndetach\n' |
+    gleam 60 -a "$ATT_PID" > ${TDIR}/gleam_W16_vfree.txt 2>&1
   ec=$?
   echo "== W17/vfree =="
   if [ $ec -ne 0 ]; then bad "W17/vfree: abnormal exit (code $ec)"; fi
@@ -2192,11 +2261,11 @@ fi
 # while unambiguous symbols keep working end to end.
 echo "== SYM =="
 ZTARGET=ZombieTarget/fixtures/ZombieTarget.exe
-ZAADDR=$(printf 'eval ZombieTarget!innerA\nquit\n' | timeout 30 "$GLEAM" $ZTARGET 2>&1 | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | head -1)
+ZAADDR=$(printf 'eval ZombieTarget!innerA\nquit\n' | gleam 30 $ZTARGET 2>&1 | sed -n 's/^= 0x\([0-9A-F]*\).*/\1/p' | head -1)
 if [ -z "$ZAADDR" ]; then
   bad "SYM: cannot resolve innerA in the fixture"
 else
-  timeout 40 "$GLEAM" $ZTARGET > ${TDIR}/gleam_SYM.txt 2>&1 <<EOF
+  gleam 40 $ZTARGET > ${TDIR}/gleam_SYM.txt 2>&1 <<EOF
 eval ZombieTarget!inner
 bp ZombieTarget!inner
 bl
@@ -2232,7 +2301,7 @@ fi
 # An ambiguous symbol eval must not cause a subsequent unrelated breakpoint
 # to be refused. mAddrError is per-parse; ambiguity is per-symbol.
 echo "== SYM-2 (cross-command pollution) =="
-timeout 30 "$GLEAM" $ZTARGET > ${TDIR}/gleam_SYM2.txt 2>&1 <<EOF
+gleam 30 $ZTARGET > ${TDIR}/gleam_SYM2.txt 2>&1 <<EOF
 eval ZombieTarget!inner
 bp definitely_missing_module+123
 bp ZombieTarget!innerA
@@ -2256,7 +2325,7 @@ fi
 # A pending "bp Late!ambig" registered BEFORE the DLL loads must be refused
 # when the DLL loads (in bindModuleBreakpoints), not silently pick a record.
 echo "== SYM-1 (pending DLL ambiguous PDB fallback) =="
-timeout 30 "$GLEAM" $TARGET dll2 > ${TDIR}/gleam_SYM1.txt 2>&1 <<EOF
+gleam 30 $TARGET dll2 > ${TDIR}/gleam_SYM1.txt 2>&1 <<EOF
 bp Late!ambig
 bp Late!LateInternal
 g

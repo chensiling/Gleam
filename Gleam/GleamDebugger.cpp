@@ -94,8 +94,9 @@ namespace
 bool GleamDebugger::pushCommand(const std::string & cmd)
 {
     // Defense #1: Discard commands typed while the debuggee is running or
-    // the session is shutting down. pause/quit/detach use request*() methods,
-    // and help is handled in the REPL thread -- all bypass pushCommand entirely.
+    // the session is shutting down. pause and help are handled in the REPL
+    // thread and bypass this entirely; quit/detach try here FIRST and fall back
+    // to their request*() flag only when this rejects (see main.cpp).
     // Everything else is stale and should not silently execute at the next stop.
     if(!mIsPaused.load() || mQuitting.load())
     {
@@ -104,14 +105,12 @@ bool GleamDebugger::pushCommand(const std::string & cmd)
         fflush(stdout);
         return false;
     }
-    bool wasEmpty;
     {
         std::lock_guard<std::mutex> lock(mCmdMutex);
-        wasEmpty = mCmdQueue.empty();
         mCmdQueue.push(cmd);
     }
     mCmdCv.notify_one();
-    return wasEmpty;
+    return true;
 }
 
 void GleamDebugger::requestPause()
@@ -294,8 +293,23 @@ bool GleamDebugger::cleanupBreakInStub()
     {
         // C3-R6 FIX: Keep trying to terminate until confirmed dead or we give up.
         // Don't limit to 16 INT3s - keep the thread tracked until death is confirmed.
+        //
+        // ...but only where waiting can actually work. While a debug event is
+        // held the whole target is frozen, so the terminated thread cannot run
+        // its own death and WaitForSingleObject below times out every single
+        // time - by construction, as this function's own contract note and the
+        // "non-blocking" comment at the detach call site both say. Spinning the
+        // full budget there burned MAX_TERMINATE_RETRIES * (SHORT_THREAD_WAIT_MS
+        // + TERMINATE_RETRY_DELAY_MS) ~= 11s per call and then logged an error
+        // for the deferral that was the expected outcome all along.
+        //
+        // So inside a held event: hasten once and leave. The thread stays
+        // tracked, and its EXIT_THREAD event (cbExitThreadEvent ->
+        // finishDeferredDetach) is what confirms the death once the target is
+        // running again. That is the designed path, not a fallback.
+        const bool eventHeld = mInDebugEvent.load();
         int retries = 0;
-        const int maxRetries = Gleam::Limits::MAX_TERMINATE_RETRIES;
+        const int maxRetries = eventHeld ? 1 : Gleam::Limits::MAX_TERMINATE_RETRIES;
         while(retries < maxRetries)
         {
             if(!TerminateThread(hThread, 0))
@@ -306,8 +320,11 @@ bool GleamDebugger::cleanupBreakInStub()
                 Sleep(Gleam::Limits::TERMINATE_RETRY_DELAY_MS);
                 continue;
             }
-            // Termination call succeeded, check if thread is dead
-            if(WaitForSingleObject(hThread, Gleam::Limits::SHORT_THREAD_WAIT_MS) == WAIT_OBJECT_0)
+            // Termination call succeeded, check if thread is dead. Skip the wait
+            // entirely while the event is held: it cannot succeed, and burning
+            // SHORT_THREAD_WAIT_MS on it is the bulk of the old stall.
+            if(!eventHeld &&
+               WaitForSingleObject(hThread, Gleam::Limits::SHORT_THREAD_WAIT_MS) == WAIT_OBJECT_0)
             {
                 CloseHandle(hThread);
                 mBreakInStubThread.store(nullptr);
@@ -319,7 +336,11 @@ bool GleamDebugger::cleanupBreakInStub()
             if(retries < maxRetries)
                 Sleep(Gleam::Limits::TERMINATE_RETRY_DELAY_MS);
         }
-        if(retries >= maxRetries)
+        // Only a genuine give-up is an error. Inside a held event, leaving the
+        // thread tracked for its EXIT_THREAD event is the designed outcome, so
+        // reporting it as an error would be crying wolf on the normal path -
+        // and the exact-error-count gates in the suite would fail on it.
+        if(retries >= maxRetries && !eventHeld)
         {
             Gleam::logEvent("error msg=\"Gleam: break-in stub thread %u could not be terminated after %d retries (handle+page kept)\"",
                    mBreakInStubTid.load(), maxRetries);

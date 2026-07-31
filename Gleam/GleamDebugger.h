@@ -129,8 +129,10 @@ public:
 
     /**
      * @brief Queue a command line for execution. **REPL thread.**
-     * @return true if the queue was empty before this push, i.e. the debuggee
-     *         is likely running free and the caller should consider a pause.
+     * @return true if the command was queued; false if it was rejected because
+     *         the debuggee is running or the session is ending (Defense #1).
+     *         quit/detach rely on this to tell "queued, will run at this stop"
+     *         from "rejected, must use the request*() flag instead".
      */
     bool pushCommand(const std::string & cmd);
 
@@ -318,6 +320,9 @@ private:
 
     // Inspect.cpp
     static bool registerByName(const std::string & name, RegId & reg);
+    /// Segment base of the current thread: GS = TEB, FS = 0 (user-mode x64).
+    /// The bases are not part of CONTEXT; used by "regs gsbase" and "gs:[expr]".
+    bool segmentBase(bool gs, uint64_t & out);
     bool setRegisterExtended(const std::string & name, const std::string & valueText);
     void cmdPrintRegister(const std::string & name);
     // Raw DR mode, per thread (P0-6): TIDs whose DRs were written directly.
@@ -332,6 +337,9 @@ private:
     void cmdThreads();
     void cmdDisasm(uint64_t addr, uint64_t count);
     void cmdMaps();
+    /// Report the region containing @p addr: allocation base, size, state,
+    /// protection, type and owning module (see GLEAM_ATOMIC_FEATURE_GAPS P1).
+    void cmdMemInfo(uint64_t addr);
     void cmdModules();
     void cmdFind(uint64_t addr, uint64_t size, const std::string & pattern);
     void cmdFindString(uint64_t addr, uint64_t size, const std::string & text, bool utf16);
@@ -556,6 +564,7 @@ private:
     bool evalExpression(const std::string & s, uint64_t & out, std::string & err);
     bool exprParseSum(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
     bool exprParseUnary(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
+    bool exprParseBracket(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
     bool exprParseAtom(const std::string & s, size_t & pos, uint64_t & out, std::string & err);
     bool exprReadPointer(uint64_t addr, uint64_t & out);
     // Best-effort symbol name for an address (empty on failure).

@@ -60,6 +60,22 @@ bool GleamDebugger::registerByName(const std::string & name, RegId & reg)
     return false;
 }
 
+// Segment base for the current thread (x64 user mode).
+//
+// The bases are not in CONTEXT: GS base is the TEB, which the engine already
+// recorded from the CREATE_THREAD debug event (Thread::lpThreadLocalBase), and
+// FS base is 0 for user-mode x64 code. DS/ES/SS/CS are 0 by architecture in the
+// flat model. This is the single source of truth for both "regs gsbase" and the
+// "gs:[expr]" expression prefix.
+bool GleamDebugger::segmentBase(bool gs, uint64_t & out)
+{
+    Thread* thread = currentThread();
+    if(!thread)
+        return false;
+    out = gs ? (uint64_t)thread->lpThreadLocalBase : 0;
+    return true;
+}
+
 // ---- Register target resolution (P0-6 contract) ----
 // Direct Get/SetThreadContext access. Sub-register writes are
 // debugger-slice read-modify-write: untouched bits are preserved (the
@@ -67,16 +83,35 @@ bool GleamDebugger::registerByName(const std::string & name, RegId & reg)
 
 namespace
 {
-    enum class RegKind { Gpr, EFlags, Dr, Mxcsr, Xmm };
+    enum class RegKind { Gpr, EFlags, Dr, Mxcsr, Xmm, Seg, SegBase };
 
     struct RegTarget
     {
         RegKind kind;
-        size_t off = 0;    // CONTEXT field offset (Gpr)
+        size_t off = 0;    // CONTEXT field offset (Gpr/Seg)
         int width = 8;     // slice width in bytes (Gpr)
         bool high = false; // high half of the 16-bit word (ah..dh)
         int index = 0;     // Dr/Xmm index
     };
+
+    // Segment selectors live in CONTEXT as 16-bit fields. In the x64 flat model
+    // only FS/GS have a non-zero base, and that base is not in CONTEXT at all:
+    // GS base is the TEB (from the debug event), FS base is 0 in user mode.
+    // SegBase targets ("fsbase"/"gsbase") are read-only and resolved by the
+    // caller, which is the only place that knows the thread.
+    struct SegEntry { const char* name; size_t off; };
+    static const SegEntry kSegs[] = {
+        { "cs", offsetof(CONTEXT, SegCs) }, { "ss", offsetof(CONTEXT, SegSs) },
+        { "ds", offsetof(CONTEXT, SegDs) }, { "es", offsetof(CONTEXT, SegEs) },
+        { "fs", offsetof(CONTEXT, SegFs) }, { "gs", offsetof(CONTEXT, SegGs) },
+    };
+
+    uint16_t segRead(const CONTEXT & ctx, const RegTarget & t)
+    {
+        return *(const uint16_t*)((const char*)&ctx + t.off);
+    }
+    // There is deliberately no segWrite: see setRegisterExtended for why
+    // selector writes are refused rather than attempted.
 
     bool resolveRegTarget(const std::string & name, RegTarget & t)
     {
@@ -132,6 +167,21 @@ namespace
         }
         if(_stricmp(name.c_str(), "eflags") == 0) { t.kind = RegKind::EFlags; return true; }
         if(_stricmp(name.c_str(), "mxcsr") == 0) { t.kind = RegKind::Mxcsr; return true; }
+        for(const auto & s : kSegs)
+        {
+            if(_stricmp(name.c_str(), s.name) == 0)
+            {
+                t.kind = RegKind::Seg;
+                t.off = s.off;
+                return true;
+            }
+        }
+        if(_stricmp(name.c_str(), "fsbase") == 0 || _stricmp(name.c_str(), "gsbase") == 0)
+        {
+            t.kind = RegKind::SegBase;
+            t.index = (name[0] == 'g' || name[0] == 'G') ? 1 : 0; // 1 = gs (TEB)
+            return true;
+        }
         if(name.size() == 3 && (name[0] == 'd' || name[0] == 'D') &&
            (name[1] == 'r' || name[1] == 'R') && name[2] >= '0' && name[2] <= '7')
         {
@@ -210,6 +260,15 @@ void GleamDebugger::cmdRegs()
     printf("R12=%016llX R13=%016llX R14=%016llX R15=%016llX\n", r.R12(), r.R13(), r.R14(), r.R15());
     printf("RIP=%016llX EFLAGS=%08X\n", r.Rip(), r.Eflags());
     const CONTEXT* ctx = r.GetContext();
+    // Segment selectors, plus the two bases that are not in CONTEXT: GS base is
+    // the TEB, FS base is 0 in user-mode x64 (see segmentBase).
+    printf("CS=%04X SS=%04X DS=%04X ES=%04X FS=%04X GS=%04X\n",
+           ctx->SegCs, ctx->SegSs, ctx->SegDs, ctx->SegEs, ctx->SegFs, ctx->SegGs);
+    uint64_t fsBase = 0, gsBase = 0;
+    segmentBase(false, fsBase);
+    segmentBase(true, gsBase);
+    printf("FSBASE=%016llX GSBASE=%016llX\n",
+           (unsigned long long)fsBase, (unsigned long long)gsBase);
     printf("DR0=%016llX DR1=%016llX DR2=%016llX DR3=%016llX\n",
            (unsigned long long)ctx->Dr0, (unsigned long long)ctx->Dr1,
            (unsigned long long)ctx->Dr2, (unsigned long long)ctx->Dr3);
@@ -256,12 +315,38 @@ bool GleamDebugger::setRegisterExtended(const std::string & name, const std::str
     {
         if(!parseHex(valueText, v) ||
            (t.kind == RegKind::Gpr && t.width < 8 && v >= (1ull << (t.width * 8))) ||
+           (t.kind == RegKind::Seg && v > 0xFFFF) ||
            ((t.kind == RegKind::EFlags || t.kind == RegKind::Mxcsr) && v > 0xFFFFFFFF))
         {
             printf("bad value '%s' for %s\n", valueText.c_str(), name.c_str());
             fflush(stdout);
             return false;
         }
+    }
+
+    // The segment bases are derived, not stored in CONTEXT: GS base belongs to
+    // the kernel's TEB mapping and FS base is architecturally 0 here. There is
+    // nothing to write.
+    if(t.kind == RegKind::SegBase)
+    {
+        printf("setreg rejected: %s is read-only (gs base = TEB, fs base = 0 in user-mode x64)\n",
+               name.c_str());
+        fflush(stdout);
+        return false;
+    }
+
+    // Selector writes do not survive SetThreadContext for a user-mode x64
+    // thread: the kernel discards the segment fields, and a GetThreadContext
+    // read-back with no resume in between still returns the old selector
+    // (measured for ds/es/fs). Attempting the write would give a command that
+    // always reports "verify failed", so refuse it with the real reason.
+    // Unlike the DR case, this is not "wiped on continue" - it never lands.
+    if(t.kind == RegKind::Seg)
+    {
+        printf("setreg rejected: %s is not writable (the x64 kernel discards segment "
+               "selectors on SetThreadContext for user-mode threads)\n", name.c_str());
+        fflush(stdout);
+        return false;
     }
 
     // Raw DR writes desync the engine's hardware breakpoint table; refuse
@@ -296,6 +381,8 @@ bool GleamDebugger::setRegisterExtended(const std::string & name, const std::str
         ctx.FltSave.XmmRegisters[t.index].High = hi;
         ctx.FltSave.XmmRegisters[t.index].Low = lo;
         break;
+    case RegKind::Seg:
+    case RegKind::SegBase: break; // refused above
     }
     if(!SetThreadContext(thread->hThread, &ctx))
     {
@@ -326,6 +413,8 @@ bool GleamDebugger::setRegisterExtended(const std::string & name, const std::str
             verified = back.FltSave.XmmRegisters[t.index].High == hi &&
                        back.FltSave.XmmRegisters[t.index].Low == lo;
             break;
+        case RegKind::Seg:
+        case RegKind::SegBase: break; // refused above
         }
     }
     if(!verified)
@@ -357,6 +446,8 @@ bool GleamDebugger::setRegisterExtended(const std::string & name, const std::str
                (unsigned long long)back.FltSave.XmmRegisters[t.index].High,
                (unsigned long long)back.FltSave.XmmRegisters[t.index].Low);
         break;
+    case RegKind::Seg:
+    case RegKind::SegBase: break; // refused above
     }
     fflush(stdout);
     return true;
@@ -393,6 +484,14 @@ void GleamDebugger::cmdPrintRegister(const std::string & name)
     case RegKind::EFlags: printf("eflags = 0x%08X\n", ctx.EFlags); break;
     case RegKind::Mxcsr: printf("mxcsr = 0x%08X\n", ctx.FltSave.MxCsr); break;
     case RegKind::Dr: printf("%s = 0x%016llX\n", name.c_str(), drRead(ctx, t.index)); break;
+    case RegKind::Seg: printf("%s = 0x%04X\n", name.c_str(), segRead(ctx, t)); break;
+    case RegKind::SegBase:
+    {
+        uint64_t base = 0;
+        segmentBase(t.index == 1, base);
+        printf("%s = 0x%016llX\n", name.c_str(), (unsigned long long)base);
+        break;
+    }
     case RegKind::Xmm:
         printf("xmm%d = %016llX%016llX\n", t.index,
                (unsigned long long)ctx.FltSave.XmmRegisters[t.index].High,
@@ -722,6 +821,90 @@ void GleamDebugger::cmdMaps()
         addr = next;
     }
     printf("%zu committed regions\n", count);
+    fflush(stdout);
+}
+
+void GleamDebugger::cmdMemInfo(uint64_t addr)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    if(!VirtualQueryEx(mProcess->hProcess, (LPCVOID)addr, &mbi, sizeof(mbi)))
+    {
+        // Fails for kernel-space and other non-queryable addresses; the caller
+        // wants to know that, so report it instead of printing an empty region.
+        printf("VirtualQueryEx failed for 0x%llX (%lu)\n",
+               (unsigned long long)addr, GetLastError());
+        fflush(stdout);
+        return;
+    }
+
+    uint64_t base = (uint64_t)mbi.BaseAddress;
+    uint64_t size = (uint64_t)mbi.RegionSize;
+    const char* stateText =
+        mbi.State == MEM_COMMIT ? "commit" :
+        mbi.State == MEM_RESERVE ? "reserve" : "free";
+
+    printf("address  0x%llX\n", (unsigned long long)addr);
+    printf("region   %016llX-%016llX (0x%llX bytes)\n",
+           (unsigned long long)base,
+           (unsigned long long)(base + size),
+           (unsigned long long)size);
+    printf("state    %s\n", stateText);
+
+    // Free regions have no allocation and no meaningful protection: BaseAddress
+    // is only the start of the free hole and every other field reads 0. Stop
+    // here rather than printing zeros that look like real data.
+    if(mbi.State == MEM_FREE)
+    {
+        printf("unmapped (no allocation at this address)\n");
+        fflush(stdout);
+        return;
+    }
+
+    printf("alloc    %016llX\n", (unsigned long long)(uintptr_t)mbi.AllocationBase);
+    // Protect is 0 on a reserved region (nothing is committed yet), so the
+    // protection it WILL get - AllocationProtect - is the only real answer.
+    if(mbi.State == MEM_COMMIT)
+        printf("protect  %s%s%s (0x%lX)\n",
+               protectText(mbi.Protect),
+               (mbi.Protect & PAGE_GUARD) ? " guard" : "",
+               (mbi.Protect & PAGE_NOCACHE) ? " nocache" : "",
+               (unsigned long)mbi.Protect);
+    else
+        printf("protect  %s (0x%lX, from allocation; nothing committed)\n",
+               protectText(mbi.AllocationProtect),
+               (unsigned long)mbi.AllocationProtect);
+    printf("type     %s\n",
+           mbi.Type == MEM_IMAGE ? "image" :
+           mbi.Type == MEM_MAPPED ? "mapped" :
+           mbi.Type == MEM_PRIVATE ? "private" : "unknown");
+
+    // Owning module: containment against [base, base+SizeOfImage). Matching
+    // AllocationBase alone would miss nothing for a clean image mapping, but
+    // containment also answers correctly when the query address is in a
+    // MEM_MAPPED or private region that still falls inside an image range.
+    HMODULE modules[1024];
+    DWORD needed = 0;
+    if(EnumProcessModules(mProcess->hProcess, modules, sizeof(modules), &needed))
+    {
+        DWORD count = (DWORD)(std::min)(needed / sizeof(HMODULE),
+                                        sizeof(modules) / sizeof(HMODULE));
+        for(DWORD i = 0; i < count; i++)
+        {
+            MODULEINFO mi;
+            if(!GetModuleInformation(mProcess->hProcess, modules[i], &mi, sizeof(mi)))
+                continue;
+            uint64_t mbase = (uint64_t)(uintptr_t)mi.lpBaseOfDll;
+            if(addr < mbase || addr >= mbase + mi.SizeOfImage)
+                continue;
+            char name[MAX_PATH] = "";
+            GetModuleBaseNameA(mProcess->hProcess, modules[i], name, sizeof(name));
+            printf("module   %s+0x%llX (base %016llX)\n",
+                   name,
+                   (unsigned long long)(addr - mbase),
+                   (unsigned long long)mbase);
+            break;
+        }
+    }
     fflush(stdout);
 }
 
@@ -1086,6 +1269,11 @@ GleamDebugger::CmdResult GleamDebugger::tryInspectCommand(const std::vector<std:
     if(cmd == "maps")
     {
         cmdMaps();
+        return CmdResult::Handled;
+    }
+    if(cmd == "meminfo" && args.size() >= 2 && parseAddress(args[1], a))
+    {
+        cmdMemInfo(a);
         return CmdResult::Handled;
     }
     if(cmd == "modules")

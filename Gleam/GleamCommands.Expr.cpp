@@ -5,12 +5,16 @@
 /// @section grammar Supported grammar (spaces not required)
 /// @code
 ///   expr  := unary (('+'|'-') unary)*
-///   unary := '-' unary | '[' expr ']' | '(' expr ')' | atom
+///   unary := '-' unary | seg ':' '[' expr ']' | '[' expr ']' | '(' expr ')' | atom
+///   seg   := 'gs' | 'fs' | 'ds' | 'es' | 'ss' | 'cs'
 ///   atom  := hex literal | register | module | module!symbol
 /// @endcode
 ///
 /// @note
 ///   - <tt>[expr]</tt> dereferences a pointer (8 bytes) from the debuggee.
+///   - <tt>seg:[expr]</tt> adds the segment base first. In the x64 flat model
+///     only GS has a non-zero base (the TEB), so <tt>gs:[60]</tt> is the PEB
+///     pointer; the other prefixes are accepted and document intent.
 ///   - A bare module name evaluates to its load base, so
 ///     <tt>kernel32+1234</tt> means module_base + RVA.
 ///   - All arithmetic is unsigned and wraps, matching debugger convention.
@@ -102,6 +106,25 @@ bool GleamDebugger::exprParseAtom(const std::string & s, size_t & pos, uint64_t 
     return false;
 }
 
+// Parse "[expr]" and return the *address* (no dereference). Shared by the plain
+// '[' case and the segment-prefixed one, which only adds a base.
+// On entry s[pos] must be '['.
+bool GleamDebugger::exprParseBracket(const std::string & s, size_t & pos, uint64_t & out, std::string & err)
+{
+    pos++; // '['
+    if(!exprParseSum(s, pos, out, err))
+        return false;
+    while(pos < s.size() && (s[pos] == ' ' || s[pos] == '\t'))
+        pos++;
+    if(pos >= s.size() || s[pos] != ']')
+    {
+        err = "missing ']'";
+        return false;
+    }
+    pos++;
+    return true;
+}
+
 bool GleamDebugger::exprParseUnary(const std::string & s, size_t & pos, uint64_t & out, std::string & err)
 {
     // skip whitespace
@@ -116,20 +139,57 @@ bool GleamDebugger::exprParseUnary(const std::string & s, size_t & pos, uint64_t
         out = 0 - out;
         return true;
     }
+    // Segment-prefixed memory operand: "gs:[expr]", "ds:[expr]", ...
+    // Only the segment base differs from a plain "[expr]"; in the x64 flat model
+    // that base is 0 for every selector except GS (the TEB). Recognized before
+    // the bare '[' case because the prefix is part of the same operand.
+    if(pos + 3 < s.size() && s[pos + 2] == ':' && s[pos + 3] == '[' &&
+       isalpha((unsigned char)s[pos]) && isalpha((unsigned char)s[pos + 1]))
+    {
+        const char seg[3] = { (char)tolower((unsigned char)s[pos]),
+                              (char)tolower((unsigned char)s[pos + 1]), '\0' };
+        uint64_t base = 0;
+        bool known = true;
+        if(strcmp(seg, "gs") == 0)
+        {
+            if(!segmentBase(true, base))
+            {
+                err = "no current thread";
+                return false;
+            }
+            if(!base)
+            {
+                err = "gs base unknown (no TEB recorded for this thread)";
+                return false;
+            }
+        }
+        else if(strcmp(seg, "fs") == 0 || strcmp(seg, "ds") == 0 || strcmp(seg, "es") == 0 ||
+                strcmp(seg, "ss") == 0 || strcmp(seg, "cs") == 0)
+            base = 0; // flat model: base 0, the prefix only documents intent
+        else
+            known = false;
+
+        if(known)
+        {
+            pos += 3; // consume "xx:", leaving '[' for the shared path below
+            uint64_t off = 0;
+            if(!exprParseBracket(s, pos, off, err))
+                return false;
+            if(!exprReadPointer(base + off, out))
+            {
+                char buf[96];
+                sprintf_s(buf, "cannot read memory at 0x%llX", (unsigned long long)(base + off));
+                err = buf;
+                return false;
+            }
+            return true;
+        }
+    }
     if(pos < s.size() && s[pos] == '[')
     {
-        pos++;
         uint64_t addr = 0;
-        if(!exprParseSum(s, pos, addr, err))
+        if(!exprParseBracket(s, pos, addr, err))
             return false;
-        while(pos < s.size() && (s[pos] == ' ' || s[pos] == '\t'))
-            pos++;
-        if(pos >= s.size() || s[pos] != ']')
-        {
-            err = "missing ']'";
-            return false;
-        }
-        pos++;
         if(!exprReadPointer(addr, out))
         {
             char buf[96];

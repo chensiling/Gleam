@@ -105,9 +105,20 @@ static void replThread(GleamDebugger* dbg)
             if(line == "pause")
                 dbg->requestPause(); // deferral handled internally
             else if(line == "quit")
-                dbg->requestQuit(); // processed at next debug event
+            {
+                // When paused: pushCommand queues it for executeCommand, which
+                // calls Stop() synchronously and returns Resume - the command
+                // loop exits immediately and the request is consumed.
+                // When running: pushCommand rejects (Defense #1), so fall back
+                // to the flag path (consumed at the next debug event).
+                if(!dbg->pushCommand(line))
+                    dbg->requestQuit();
+            }
             else if(line == "detach")
-                dbg->requestDetach(); // processed at next debug event
+            {
+                if(!dbg->pushCommand(line))
+                    dbg->requestDetach();
+            }
             else if(line == "help")
                 GleamDebugger::cmdHelp(); // static, prints immediately
             else
