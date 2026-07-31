@@ -17,3 +17,8 @@ CMakerLists.txt
 CMakeLists.txt.user
 CMakeUserPresets.json
 ci_logs/
+
+GLEAM_ATOMIC_FEATURE_GAPS.md
+GLEAM_CODE_REVIEW.md
+PROGRESS.md
+PROJECT.md
