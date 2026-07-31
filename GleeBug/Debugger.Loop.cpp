@@ -61,18 +61,17 @@ namespace GleeBug
         // debugger-owned suspend count actually balanced out.
         const auto resumeSuspendedThreads = [this, &SuspendedThreads, &ThreadBeingProcessed]() -> size_t
         {
+            // GI-2: build a flat tid-set once (O(Σ threads across all processes)) so the
+            // per-entry liveness check below is O(1) instead of O(n_processes), turning
+            // the overall loop from O(n_suspended × n_processes) to O(Σ threads + n_suspended).
+            std::unordered_set<DWORD> knownTids;
+            for(const auto & process : mProcesses)
+                for(const auto & thread : process.second->threads)
+                    knownTids.insert(thread.first);
+
             for(auto itr = SuspendedThreads.begin(); itr != SuspendedThreads.end(); )
             {
-                bool stillKnown = false;
-                for(const auto & process : mProcesses)
-                {
-                    if(process.second->threads.count(itr->first) != 0)
-                    {
-                        stillKnown = true;
-                        break;
-                    }
-                }
-                if(!stillKnown)
+                if(knownTids.count(itr->first) == 0)
                 {
                     itr = SuspendedThreads.erase(itr);
                     continue;

@@ -23,16 +23,11 @@ namespace GleeBug
     void Thread::StepInto(const StepCallback & cbStep)
     {
         StepInto();
-
-        auto target = cbStep.target<void()>();
-        for(const auto & cb : stepCallbacks)
-        {
-            if(target == cb.target<void()>())
-            {
-                puts("duplicate StepInto callback detected!");
-                return;
-            }
-        }
+        // GI-1: target<void()>() returns nullptr for every lambda (each lambda has a
+        // unique anonymous type and is never a plain void(*)()).  Two distinct lambdas
+        // both produce nullptr, so the old duplicate check fired on every second lambda
+        // and silently dropped it.  std::function has no portable equality test; callers
+        // are responsible for not registering the same callback twice.
         stepCallbacks.push_back(cbStep);
     }
 

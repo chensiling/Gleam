@@ -481,4 +481,34 @@ retry_no_aslr:
 
         return success;
     }
+
+    // GI-3: shared helper so createProcessEvent and loadDllEvent do not each carry
+    // a copy of the typedef, static GPDP lookup, and handle lifecycle.
+    void Debugger::queryDep()
+    {
+#ifndef _WIN64
+        typedef BOOL(WINAPI * GETPROCESSDEPPOLICY)(
+            _In_  HANDLE  /*hProcess*/,
+            _Out_ LPDWORD /*lpFlags*/,
+            _Out_ PBOOL   /*lpPermanent*/
+        );
+        static auto GPDP = GETPROCESSDEPPOLICY(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDEPPolicy"));
+        if(GPDP)
+        {
+            // Using mProcess->hProcess directly makes GetProcessDEPPolicy put garbage
+            // in bPermanent; open a fresh QUERY handle instead.
+            auto hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, mProcess->dwProcessId);
+            if(hProcess)
+            {
+                DWORD lpFlags;
+                BOOL bPermanent;
+                if(GPDP(hProcess, &lpFlags, &bPermanent))
+                    mProcess->permanentDep = lpFlags != 0 && bPermanent;
+                CloseHandle(hProcess);
+            }
+        }
+#else
+        mProcess->permanentDep = true;
+#endif //_WIN64
+    }
 };

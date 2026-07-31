@@ -4,46 +4,11 @@ namespace GleeBug
 {
     void Debugger::loadDllEvent(const LOAD_DLL_DEBUG_INFO & loadDll)
     {
-        //get process DEP policy (right opportunity)
-        /*
-        PspUserThreadStartup->
-        DbgkCreateThread->PS_PROCESS_FLAGS_CREATE_REPORTED->DbgkpSendApiMessage->DbgkpQueueMessage
-        PspInitializeThunkContext->PspSetContextThreadInternal->PspGetSetContextSpecialApc->KeContextToKframes
-
-        DbgkpQueueMessage->
-            ntdll.WaitForDebugEvent->NtWaitForDebugEvent->DbgUiConvertStateChangeStructure->CREATE_PROCESS_DEBUG_EVENT
-
-        KeContextToKframes->
-            ntdll.LdrInitializeThunk->
-                ntdll.LdrpInitialize->
-                    ntdll.LdrpInitializeProcess->
-                        ntdll.RtlQueryImageFileKeyOption->
-                            ntdll.ZwSetInformationProcess(0x22) dep flags
-        */
-#ifndef _WIN64
-        typedef BOOL(WINAPI * GETPROCESSDEPPOLICY)(
-            _In_  HANDLE  /*hProcess*/,
-            _Out_ LPDWORD /*lpFlags*/,
-            _Out_ PBOOL   /*lpPermanent*/
-        );
-        static auto GPDP = GETPROCESSDEPPOLICY(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDEPPolicy"));
-        if(GPDP)
-        {
-            //If you use mProcess->hProcess GetProcessDEPPolicy will put garbage in bPermanent.
-            // GB-7: check that OpenProcess succeeded before use.
-            auto hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, mProcess->dwProcessId);
-            if(hProcess)
-            {
-                DWORD lpFlags;
-                BOOL bPermanent;
-                if(GPDP(hProcess, &lpFlags, &bPermanent))
-                    mProcess->permanentDep = lpFlags != 0 && bPermanent;
-                CloseHandle(hProcess);
-            }
-        }
-#else
-        mProcess->permanentDep = true;
-#endif //_WIN64
+        // Query DEP policy here: ntdll has already called ZwSetInformationProcess(0x22)
+        // by the time the first DLL-load event fires, so this is the first reliable
+        // opportunity.  (createProcessEvent fires before ntdll runs; that reading is
+        // provisional and will be overwritten here with the definitive value.)
+        queryDep();
 
         //call the debug event callback
         cbLoadDllEvent(loadDll);

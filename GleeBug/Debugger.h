@@ -324,6 +324,8 @@ namespace GleeBug
 
     private:
         bool HollowProcessWithoutASLR(const wchar_t* szFileName, PROCESS_INFORMATION & pi);
+        /** \brief Queries and caches the DEP policy for mProcess. No-op on x64. GI-3. */
+        void queryDep();
         ULONG_PTR mDebugModuleImageBase = 0;
     };
 };

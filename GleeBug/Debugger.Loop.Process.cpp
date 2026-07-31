@@ -34,30 +34,7 @@ namespace GleeBug
         mThread = mProcess->thread = mProcess->threads.find(mDebugEvent.dwThreadId)->second.get();
 
         //get process DEP policy
-#ifndef _WIN64
-        typedef BOOL(WINAPI * GETPROCESSDEPPOLICY)(
-            _In_  HANDLE  /*hProcess*/,
-            _Out_ LPDWORD /*lpFlags*/,
-            _Out_ PBOOL   /*lpPermanent*/
-        );
-        static auto GPDP = GETPROCESSDEPPOLICY(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcessDEPPolicy"));
-        if(GPDP)
-        {
-            //If you use mProcess->hProcess GetProcessDEPPolicy will put garbage in bPermanent.
-            // GB-7: check that OpenProcess succeeded before use.
-            auto hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, mProcess->dwProcessId);
-            if(hProcess)
-            {
-                DWORD lpFlags;
-                BOOL bPermanent;
-                if(GPDP(hProcess, &lpFlags, &bPermanent))
-                    mProcess->permanentDep = lpFlags != 0 && bPermanent;
-                CloseHandle(hProcess);
-            }
-        }
-#else
-        mProcess->permanentDep = true;
-#endif //_WIN64
+        queryDep();
 
         //call the debug event callback
         cbCreateProcessEvent(createProcess, *mProcess);
