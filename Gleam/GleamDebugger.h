@@ -13,10 +13,10 @@
  *
  * - **Debugger thread** - the thread that called Init()/Attach() and Start().
  *   The GleeBug event loop runs here, so every `cb*` callback, commandLoop(),
- *   and every command implementation executes on it. The debuggee is suspended
- *   whenever this thread is inside a callback, which is what makes it the only
- *   thread allowed to touch `mProcess`/`mThread` and the engine's breakpoint
- *   tables.
+ *   cbOnTimeout(), and every command implementation executes on it. The
+ *   debuggee is suspended whenever this thread is inside a normal callback;
+ *   cbOnTimeout() fires while the debuggee is *running*, but execution is
+ *   still single-threaded on the debugger thread.
  * - **REPL thread** - created by main.cpp, reads stdin. It may only call
  *   pushCommand(), requestPause(), pauseAfterResume(), and isPaused().
  *
@@ -25,6 +25,7 @@
  * | State                        | Guard                                    |
  * |------------------------------|------------------------------------------|
  * | mCmdQueue                    | mCmdMutex + mCmdCv                       |
+ * | mRunningCmdQueue             | mRunningCmdMutex                         |
  * | mBreakInStub{Thread,Page,Tid}| std::atomic, plus mBreakInMutex for the  |
  * |                              | inject-vs-cleanup critical sections      |
  * | mIsPaused, mInDebugEvent     | std::atomic (published by the debugger    |
@@ -34,11 +35,12 @@
  *
  * @subsection invariants Invariants
  *
- * - Commands execute only while the debuggee is suspended, i.e. only from
- *   commandLoop(), i.e. only with `mIsPaused == true`.
+ * - Most commands execute only from commandLoop() (mIsPaused == true).
+ * - Running-safe commands (see isRunningCommand()) additionally execute from
+ *   cbOnTimeout() while mIsPaused is false; they must not attempt to resume
+ *   the debuggee and must not depend on the debuggee being suspended.
  * - `mProcess` and `mThread` (engine members) are read on the debugger thread
- *   only. The REPL thread must never dereference them - that is the reason
- *   `pause` is the only command not routed through the queue.
+ *   only. The REPL thread must never dereference them.
  * - Stub injection (forceBreakIn) and stub teardown (cleanupBreakInStub) are
  *   serialized by mBreakInMutex and both check `mQuitting`, so a stub can
  *   never be injected into a session that is tearing down.
@@ -279,6 +281,7 @@ protected:
     void cbDetachRefused(const std::string & info) override;
     void cbPreDebugEvent(const DEBUG_EVENT & debugEvent) override;
     void cbPostDebugEvent(const DEBUG_EVENT & debugEvent) override;
+    void cbOnTimeout() override;
     /// @}
 
 private:
@@ -365,6 +368,9 @@ private:
     /// Print a thread's TLS: the implicit-TLS module array plus the non-zero
     /// fixed TlsSlots. @p tid 0 means the current thread.
     void cmdTls(uint32_t tid);
+    /// Print a thread's CPU time (kernel/user/total) and creation time.
+    /// @p tid 0 means the current thread.
+    void cmdThreadTime(uint32_t tid);
     void cmdFind(uint64_t addr, uint64_t size, const std::string & pattern);
     void cmdFindString(uint64_t addr, uint64_t size, const std::string & text, bool utf16);
     void cmdExceptionInfo();
@@ -803,6 +809,24 @@ private:
     std::condition_variable mCmdCv;         ///< Signals a newly queued command.
     std::atomic<bool> mIsPaused{ false };   ///< Debugger thread is in commandLoop().
     std::atomic<bool> mInDebugEvent{ false }; ///< Between event delivery and ContinueDebugEvent.
+    /// @}
+
+    /**
+     * @name Running-command queue (cross-thread)
+     *
+     * A subset of commands that are safe to execute on the debugger thread
+     * even while the debuggee is running (not paused). The REPL thread
+     * enqueues them via pushCommand(); the debugger thread drains them inside
+     * cbOnTimeout() (fired every ~100 ms by the GleeBug loop). All execution
+     * stays on the debugger thread, so mProcess/mThread access is safe.
+     * @{
+     */
+    std::queue<std::string> mRunningCmdQueue; ///< Guarded by mRunningCmdMutex.
+    std::mutex mRunningCmdMutex;              ///< Guards mRunningCmdQueue.
+    /// Returns true if cmdLine's first token is a command safe while running.
+    static bool isRunningCommand(const std::string & cmdLine);
+    /// Drain mRunningCmdQueue; called from cbOnTimeout() on the debugger thread.
+    void processRunningCommands();
     /// @}
 
     /**

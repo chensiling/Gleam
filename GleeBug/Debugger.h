@@ -210,6 +210,17 @@ namespace GleeBug
         */
         virtual void cbBreakpoint(const BreakpointInfo & info) {}
 
+        /**
+        \brief Periodic timeout callback. Called from the debug loop whenever
+               WaitForDebugEvent times out (~100ms while the debuggee is
+               running). The target is NOT suspended when this fires; the
+               callback runs on the debugger thread. Implementations may read
+               and modify debugger-internal state and call engine APIs (e.g.
+               WriteProcessMemory via SetBreakpoint) but must not assume the
+               debuggee is paused. The default implementation is a no-op.
+        */
+        virtual void cbOnTimeout() {}
+
     protected: //core debug event handlers
         /**
         \brief Process creation debug event. Do not override this unless you know what you are doing!

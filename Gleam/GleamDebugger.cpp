@@ -91,18 +91,61 @@ namespace
     }
 }
 
+/*static*/ bool GleamDebugger::isRunningCommand(const std::string & cmdLine)
+{
+    // Extract the verb (first whitespace-delimited token).
+    const size_t sep = cmdLine.find_first_of(" \t");
+    const std::string verb = (sep == std::string::npos) ? cmdLine : cmdLine.substr(0, sep);
+
+    // Safe-while-running set: commands that only touch debugger-internal state
+    // or call engine APIs (e.g. WriteProcessMemory via SetBreakpoint) that
+    // work regardless of whether the debuggee is suspended.
+    // Note: "help" is handled directly in main.cpp before reaching pushCommand.
+    static const char* const kRunnable[] = {
+        // Informational (read-only views of debugger-owned data)
+        "threads", "modules", "bl", "patches", "info", "thread",
+        // Breakpoint management (WriteProcessMemory is safe while running)
+        "bp", "bc", "bd", "be", "bm",
+        // Configuration flags (no debuggee memory access)
+        "breakon", "hide", "ignoreexc", "excfilter",
+    };
+    for(const char* c : kRunnable)
+        if(verb == c)
+            return true;
+    return false;
+}
+
 bool GleamDebugger::pushCommand(const std::string & cmd)
 {
     // Defense #1: Discard commands typed while the debuggee is running or
     // the session is shutting down. pause and help are handled in the REPL
-    // thread and bypass this entirely; quit/detach try here FIRST and fall back
+    // thread before reaching here; quit/detach try here FIRST and fall back
     // to their request*() flag only when this rejects (see main.cpp).
-    // Everything else is stale and should not silently execute at the next stop.
+    //
+    // Running-safe commands bypass the paused check: they are parked in
+    // mRunningCmdQueue and executed on the debugger thread inside
+    // cbOnTimeout() (~100 ms latency), so mProcess access stays single-
+    // threaded even while the debuggee is running.
     if(!mIsPaused.load() || mQuitting.load())
     {
-        printf("(command ignored: %s)\n",
-               mQuitting.load() ? "session ending" : "process running");
-        fflush(stdout);
+        // Running-safe path: enqueue for cbOnTimeout() on the debugger thread.
+        if(!mQuitting.load() && isRunningCommand(cmd))
+        {
+            {
+                std::lock_guard<std::mutex> lock(mRunningCmdMutex);
+                mRunningCmdQueue.push(cmd);
+            }
+            return true;
+        }
+        // quit/detach rejection is silent: the caller immediately falls back to
+        // requestQuit()/requestDetach(), so this is expected flow, not an error.
+        bool isQuitOrDetach = (cmd == "quit" || cmd == "detach");
+        if(!isQuitOrDetach)
+        {
+            printf("(command ignored: %s)\n",
+                   mQuitting.load() ? "session ending" : "process running");
+            fflush(stdout);
+        }
         return false;
     }
     {
@@ -111,6 +154,30 @@ bool GleamDebugger::pushCommand(const std::string & cmd)
     }
     mCmdCv.notify_one();
     return true;
+}
+
+void GleamDebugger::processRunningCommands()
+{
+    // Drain mRunningCmdQueue on the debugger thread (called from cbOnTimeout).
+    // mProcess is valid here, but mIsPaused is false. The safe-while-running
+    // commands never return CmdResult::Resume, so we ignore the return value.
+    for(;;)
+    {
+        std::string cmd;
+        {
+            std::lock_guard<std::mutex> lock(mRunningCmdMutex);
+            if(mRunningCmdQueue.empty())
+                break;
+            cmd = std::move(mRunningCmdQueue.front());
+            mRunningCmdQueue.pop();
+        }
+        executeCommand(cmd);
+    }
+}
+
+void GleamDebugger::cbOnTimeout()
+{
+    processRunningCommands();
 }
 
 void GleamDebugger::requestPause()
@@ -711,10 +778,44 @@ void GleamDebugger::cbDebugStringEvent(const OUTPUT_DEBUG_STRING_INFO & debugStr
             }
         }
         else
-            text = buf;
+        {
+            // Convert ANSI bytes using the system code page so non-ASCII
+            // characters (e.g. GBK Chinese) display as valid UTF-8 rather
+            // than appearing as mojibake.
+            const int ansiLen = (int)buf.size();
+            if(ansiLen > 0)
+            {
+                const int wneeded = MultiByteToWideChar(CP_ACP, 0, buf.data(),
+                                                        ansiLen, nullptr, 0);
+                if(wneeded > 0)
+                {
+                    std::vector<wchar_t> wide(wneeded);
+                    MultiByteToWideChar(CP_ACP, 0, buf.data(), ansiLen,
+                                        wide.data(), wneeded);
+                    const int u8needed = WideCharToMultiByte(CP_UTF8, 0,
+                                                             wide.data(), wneeded,
+                                                             nullptr, 0, nullptr, nullptr);
+                    if(u8needed > 0)
+                    {
+                        text.resize((size_t)u8needed);
+                        WideCharToMultiByte(CP_UTF8, 0, wide.data(), wneeded,
+                                            text.data(), u8needed, nullptr, nullptr);
+                    }
+                    else
+                        text = buf; // purely-ASCII fallback (safe either way)
+                }
+                else
+                    text = buf; // conversion refused; keep raw bytes
+            }
+        }
     }
     // Drop the trailing NUL(s) the sender counted; they are not content.
     while(!text.empty() && text.back() == '\0')
+        text.pop_back();
+    // Strip trailing CR/LF: OutputDebugString callers often append "\r\n" or
+    // "\n" as a line terminator, but the event already occupies its own line
+    // in the log so escaping them adds visual noise rather than information.
+    while(!text.empty() && (text.back() == '\r' || text.back() == '\n'))
         text.pop_back();
 
     size_t escapes = 0;

@@ -2,8 +2,6 @@
 
 无界面、命令驱动的 Windows 调试器，基于 [GleeBug](https://github.com/x64dbg/GleeBug) 引擎（x64dbg 官方调试引擎）。
 
-Gleam 的定位类似 idalib 之于 IDA：调试能力以库/命令的形式存在，没有图形界面，完全由命令驱动，供脚本和自动化系统（LLM / MCP）使用。适用于逆向分析场景。
-
 ## 特性
 
 - 启动 / 附加进程调试（`gleam <exe>` / `gleam -a <pid>`），`restart` 会话重启
@@ -44,7 +42,12 @@ gleam -a <pid>                 :: 附加到运行中的进程
 命令从标准输入读取（可交互、可管道脚本化）。命令协议要点：
 
 - 目标程序因事件挂起时（断点命中、单步完成、异常等）进入暂停态，此时逐条执行队列中的命令
-- 只有 `pause` 能在目标运行时生效（注入远程 int3 stub 线程断入）
+- **运行态命令支持**：以下命令可在目标运行时执行（~100ms 响应延迟）：
+  - 查询类：`threads`、`modules`、`bl`、`patches`、`info`、`thread`
+  - 配置类：`breakon`、`hide`、`ignoreexc`、`excfilter`
+  - 断点管理：`bp`、`bc`、`bd`、`be`、`bm`
+- `pause` 能在目标运行时生效（注入远程 int3 stub 线程断入）
+- `help` 在 REPL 线程立即响应（零延迟）
 - `detach`/`quit` 对运行中的目标不立即生效，先 `pause` 再执行
 - 目标与调试器共享控制台输出，便于脚本断言
 - `pause` 通过注入远程 int3 stub 线程实现（不用 `DebugBreakProcess`——它会检查 PEB.BeingDebugged，与 `hide` 冲突）
@@ -187,7 +190,7 @@ Gleam/
 └── GleamCommands.Scan.cpp         代码扫描（xref/findasm）
 ```
 
-线程模型：调试循环在主线程；REPL 线程读 stdin 入队；命令统一由调试线程在目标挂起时执行。
+线程模型：调试循环在主线程；REPL 线程读 stdin 入队；命令统一由调试线程执行（暂停态立即执行，运行态由 `cbOnTimeout` 每 ~100ms 刷新队列）。
 
 ## 许可
 

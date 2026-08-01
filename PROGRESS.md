@@ -3,7 +3,27 @@
 > 交接用：让下一个 AGENT 不用翻聊天记录就能继续。每次完成有意义的工作后更新本文件。
 > 目标与验证标准见 `PROJECT.md`（总纲），本文件只记录"做到哪了、怎么继续"。
 
-## 当前状态：第八轮复审 SYM-1/SYM-2/C3-R5-R/C3-R6 修复完成并通过全部测试
+## 当前状态：Running-state 命令支持完成
+
+最后更新：2026-08-01
+
+**实现运行态命令执行机制**，用户可在目标运行时查询状态或修改配置，无需暂停。提交 `[pending]`。
+
+- **架构**：扩展 GleeBug 引擎 `cbOnTimeout()` 虚回调（`WaitForDebugEvent` 100ms 超时时触发），Gleam 实现 `mRunningCmdQueue`（REPL 线程入队 → 调试线程出队执行），所有命令实现保持在调试线程单线程执行，`mProcess`/`mThread` 访问安全性零降级
+- **Safe-while-running 集合**：
+  - 查询类（只读调试器内部数据）：`threads`、`modules`、`bl`、`patches`、`info`、`thread`
+  - 配置类（修改调试器行为标志）：`breakon`、`hide`、`ignoreexc`、`excfilter`
+  - 断点管理（`WriteProcessMemory` 对运行目标有效）：`bp`、`bc`、`bd`、`be`、`bm`
+- **延迟与用户体验**：命令响应延迟最大 100ms（下一个超时周期），实测交互无感知卡顿；`help` 已由 `main.cpp` 在 REPL 线程直接处理（零延迟），无需纳入队列
+- **线程模型文档更新**：`GleamDebugger.h` 头部明确"cbOnTimeout 在 mIsPaused=false 时调用"+ mRunningCmdQueue 守卫表 + invariant 扩展（running-safe 命令可从 cbOnTimeout 执行，但不得尝试 resume）
+
+**测试结果**：**PASS=510 FAIL=0**（Debug×3 + Release，原有全部断言通过，未引入回归）
+
+**累计提交**：待提交
+
+---
+
+## 第八轮复审 SYM-1/SYM-2/C3-R5-R/C3-R6 修复完成并通过全部测试
 
 最后更新：2026-07-30
 

@@ -165,6 +165,7 @@ namespace GleeBug
                     consecutiveTimeouts++;
                     if(consecutiveTimeouts >= 2 && ThreadBeingProcessed == 0 && SuspendedThreads.empty() && DeferredExceptionThreads.empty() && mProcess)
                         mProcess->recentlyDeletedSwbp.clear();
+                    cbOnTimeout();
                     continue;
                 }
             }
